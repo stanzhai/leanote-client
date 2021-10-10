@@ -1,7 +1,17 @@
 {
-  "name": "Leanote-Desktop",
+  "name": "Leanote",
   "version": "1.0.0",
   "main": "main.js",
+  "scripts": {
+    "dev": "electron .",
+    "build": "electron-builder"
+  },
+  "build": {
+    "appId": "site.stanzhai.leanote",
+    "mac": {
+      "icon": "icon.icns"
+    }
+  },
   "dependencies": {
     "@electron/remote": "^1.0.4",
     "adm-zip": ">=0.4.11",
@@ -13,5 +23,9 @@
     "node-getmac": "1.0.3",
     "validator": ">=3.22.1",
     "xml2js": "0.4.6"
+  },
+  "devDependencies": {
+    "electron": "^12.2.1",
+    "electron-builder": "^22.13.1"
   }
 }
