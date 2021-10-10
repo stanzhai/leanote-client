@@ -1,39 +1,58 @@
 // var app = require('electron').app;  // Module to control application life.
-const {app, BrowserWindow, crashReporter} = require('electron');
-var ipc = require('electron').ipcMain;
-const electron = require('electron');
-const Menu = electron.Menu
-const Tray = electron.Tray
-var pdfMain = require('pdf_main');
+const {app, BrowserWindow, crashReporter, Tray, Menu, ipcMain: ipc} = require('electron');
+var pdfMain = require('./src/pdf_main');
 var appIcon;
 
 // Report crashes to our server.
 crashReporter.start({
-  productName: 'YourName',
-  companyName: 'YourCompany',
-  submitURL: 'https://your-domain.com/url-to-submit',
+  productName: 'Leanote',
+  companyName: 'Leanote',
+  submitURL: 'https://leanote.com/leanote-desktop/crash-reporter',
   autoSubmit: true
 });
 
+require('@electron/remote/main').initialize()
 
 // Keep a global reference of the window object, if you don't, the window will
 // be closed automatically when the javascript object is GCed.
 var mainWindow = null;
 
-// single instance
-const shouldQuit = app.makeSingleInstance((commandLine, workingDirectory) => {
-  // Someone tried to run a second instance, we should focus our window.
-  if (mainWindow) {
-    mainWindow.show();
-    if (mainWindow.isMinimized()) {
-      mainWindow.restore();
-    }
-    mainWindow.focus();
-  }
-})
+if (!app.makeSingleInstance) {
+  app.allowRendererProcessReuse = true
 
-if (shouldQuit) {
-  app.quit()
+  // single instance
+  const gotTheLock = app.requestSingleInstanceLock()
+  if (!gotTheLock) {
+    console.log("gotTheLock is false, another instance is running")
+    app.quit()
+  } else {
+    app.on('second-instance', (event, commandLine, workingDirectory) => {
+      if (mainWindow) {
+        mainWindow.show();
+        if (mainWindow.isMinimized()) {
+          mainWindow.restore();
+        }
+        mainWindow.focus();
+      }
+    })
+  }
+}
+else {
+  // single instance
+  const shouldQuit = app.makeSingleInstance((commandLine, workingDirectory) => {
+    // Someone tried to run a second instance, we should focus our window.
+    if (mainWindow) {
+      mainWindow.show();
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
+      mainWindow.focus();
+    }
+  })
+
+  if (shouldQuit) {
+    app.quit()
+  }
 }
 
 // Quit when all windows are closed.
@@ -74,7 +93,7 @@ app.on('activate', function() {
 var DB = {
   init: function () {
     var me = this;
-    var db = require('db_main');
+    var db = require('./src/db_main');
 
     // 前端发来消息
     // m = {token: token, method: 'insert, findOne', dbname: 'notes', params: {username: "life"}};
@@ -173,7 +192,7 @@ function openIt() {
   DB.init();
 
   // 协议
-  var leanoteProtocol = require('leanote_protocol');
+  var leanoteProtocol = require('./src/leanote_protocol');
   leanoteProtocol.init();
 
   // Create the browser window.
@@ -181,7 +200,13 @@ function openIt() {
       width: 1050, 
       height: 595, 
       frame: process.platform != 'darwin', 
-      transparent: false
+      transparent: false,
+      autoHideMenuBar: true,
+      webPreferences: {
+        nodeIntegration: true,
+        contextIsolation: false, // https://github.com/electron/electron/issues/27961
+        enableRemoteModule: true
+      }
     }
   );
 
@@ -207,8 +232,20 @@ function openIt() {
   ipc.on('openUrl', function(event, arg) {
     console.log('openUrl', arg);
 
+    // if (appIcon) {
+    //     appIcon.destroy()
+    // }
+
+    arg.webPreferences = arg.webPreferences === undefined ? {} : arg.webPreferences;
+    arg.webPreferences.nodeIntegration = true;
+    arg.webPreferences.contextIsolation = false;
+    arg.webPreferences.enableRemoteModule = true;
+
     var html = arg.html;
     var everWindow = mainWindow;
+    if (arg.icon) {
+        arg.icon = new Tray(__dirname + arg.icon)
+    }
     var win2 = new BrowserWindow(arg);
     win2.loadURL('file://' + __dirname + '/' + html);
     mainWindow = win2;
@@ -235,6 +272,8 @@ function openIt() {
     }
   }
 
+  // tray只要实例化一次
+  // tray在windows下可能会有两个, 原因不明, 当注销后再启动
   var trayShowed = false;
   ipc.on('show-tray', function(event, arg) {
     if (trayShowed) {
@@ -245,6 +284,8 @@ function openIt() {
     if (process.platform == 'linux') {
       return;
     }
+
+    console.log('show tray')
 
     appIcon = new Tray(__dirname + '/public/images/tray/' + ( process.platform == 'darwin' ? 'trayTemplate.png' : 'tray.png'))
     var contextMenu = Menu.buildFromTemplate([
@@ -265,7 +306,7 @@ function openIt() {
 
     appIcon.on('click', function (e) {
       show();
-      e.preventDefault();
+      // e.preventDefault();
     });
     appIcon.on('right-click', function () {
       appIcon.popUpContextMenu(contextMenu);

@@ -453,7 +453,7 @@ function _setEditorContent(content, isMarkdown, preview, callback) {
 
 // 复制图片
 // 在web端得到图片
-const {clipboard} = require('electron');
+const clipboard= electron.clipboard;
 function pasteImage(e) {
 	var image = clipboard.readImage();
 	if(image) {
@@ -466,8 +466,9 @@ function pasteImage(e) {
 			insertImage(url);
 		});
 		e && e.preventDefault();
+		return true
 	}
-	return;
+	return false;
 
 	// 以下是node-webkit版
 
@@ -510,39 +511,41 @@ function insertLocalImage() {
 	gui.dialog.showOpenDialog(gui.getCurrentWindow(), 
 		{
 			properties: ['openFile', 'multiSelections'],
-			defaultPath: gui.app.getPath('userDesktop'),
+			defaultPath: Api.getDefaultPath(),
 			filters: [
 				{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'bmp'] }
 			]
-		},
-		function(paths) {
-			if(!paths) {
-				return;
-			}
-
-			for(var i = 0; i < paths.length; ++i) {
-				(function(k) {
-					var imagePath = paths[k];
-					// var imagePath = file.path;
-					// 上传之
-					FileService.uploadImage(imagePath, function(newImage, msg) {
-						if(newImage) {
-							var note = Note.getCurNote();
-							var url = EvtService.getImageLocalUrl(newImage.FileId);
-							if(!note.IsMarkdown) {
-								tinymce.activeEditor.insertContent('<img src="' + url + '">');
-							} else {
-								// TODO markdown insert Image
-								MD.insertLink(url, '', true);
-							}
-						} else {
-							alert(msg || "error");
-						}
-					});
-				})(i);
-			}
 		}
-	);
+	).then(res => {
+        let paths = res.filePaths
+        if(!paths || !paths.length) {
+            return;
+        }
+
+        Api.saveLastPath(null, paths[0])
+
+        for(var i = 0; i < paths.length; ++i) {
+            (function(k) {
+                var imagePath = paths[k];
+                // var imagePath = file.path;
+                // 上传之
+                FileService.uploadImage(imagePath, function(newImage, msg) {
+                    if(newImage) {
+                        var note = Note.getCurNote();
+                        var url = EvtService.getImageLocalUrl(newImage.FileId);
+                        if(!note.IsMarkdown) {
+                            tinymce.activeEditor.insertContent('<img src="' + url + '">');
+                        } else {
+                            // TODO markdown insert Image
+                            MD.insertLink(url, '', true);
+                        }
+                    } else {
+                        alert(msg || "error");
+                    }
+                });
+            })(i);
+        }
+    });
 }
 
 // 插入图片(链接)
@@ -1510,16 +1513,14 @@ function goToMainPage() {
 	// var BrowserWindow = gui.remote.BrowserWindow;
 	// var win = new BrowserWindow(getMainWinParams());
 	// win.loasdURL('file://' + __dirname + '/note.html?from=login');
-	const {ipcRenderer} = require('electron');
-	var ipc = ipcRenderer;
+	const ipc = electron.ipcRenderer;
 	var params = getMainWinParams();
 	params.html = 'note.html?from=login';
 	ipc.send('openUrl', params);
 }
 
 function toLogin() {
-	const {ipcRenderer} = require('electron');
-	var ipc = ipcRenderer;
+	const ipc = electron.ipcRenderer;
 	// var BrowserWindow = gui.remote.BrowserWindow;
 	if(isMac()) {
 		ipc.send('openUrl', {html: 'login.html', width: 278, height: 370, show: true, frame: false, resizable: false })
@@ -1578,7 +1579,7 @@ function isMac() {
 function getMainWinParams() {
 	if(isMac()) {
 		return {
-			"icon": "public/images/logo/leanote_icon_blue.png",
+			// "icon": "/public/images/logo/leanote.png",
 			frame: false,
 			transparent: false,
 			width: 258,
@@ -1588,7 +1589,7 @@ function getMainWinParams() {
 		};
 	}
 	return {
-		"icon": "public/images/logo/leanote_icon_blue.png",
+		// "icon": "/public/images/logo/leanote.png",
 		frame: true,
 		transparent: false,
 		width: 1100,
@@ -1793,7 +1794,7 @@ function isURL(str_url) {
 }
 
 function isOtherSiteUrl(url) {
-	return url.indexOf('http://127.0.0.1') < 0 && isURL(url);
+	return url && url.indexOf('http://127.0.0.1') < 0 && isURL(url);
 }
 
 function reloadApp() {

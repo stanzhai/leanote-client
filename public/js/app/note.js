@@ -597,7 +597,7 @@ Note.curChangedSaveIt = function(force, callback) {
                 Pjax.changeNote(ret);
             }
 
-            me.setNoteDirty(hasChanged.NoteId, true);
+            ret && me.setNoteDirty(hasChanged.NoteId, ret.IsDirty);
 
             callback && callback(ret);
         }, force);
@@ -1175,9 +1175,9 @@ Note._getNoteHtmlObjct = function(note, isShared) {
 
             var tmp;
             if (note.ImgSrc) {
-                tmp = tt(Note.getItemTpl(), classes, i, note.NoteId, Note.fixImageSrc(note.ImgSrc), note.Title || getMsg('UnTitled'), Notebook.getNotebookTitle(note.NotebookId), goNowToDatetime(note.UpdatedTime), note.Desc || '');
+                tmp = tt(Note.getItemTpl(), classes, i, note.NoteId, Note.fixImageSrc(note.ImgSrc), trimTitle(note.Title) || getMsg('UnTitled'), Notebook.getNotebookTitle(note.NotebookId), goNowToDatetime(note.UpdatedTime), note.Desc || '');
             } else {
-                tmp = tt(Note.getItemTplNoImg(), classes, i, note.NoteId, note.Title || getMsg('UnTitled'), Notebook.getNotebookTitle(note.NotebookId), goNowToDatetime(note.UpdatedTime), note.Desc || '');
+                tmp = tt(Note.getItemTplNoImg(), classes, i, note.NoteId, trimTitle(note.Title) || getMsg('UnTitled'), Notebook.getNotebookTitle(note.NotebookId), goNowToDatetime(note.UpdatedTime), note.Desc || '');
             }
 
             Note.noteItemListO.append(tmp);
@@ -2600,8 +2600,10 @@ var Attach = {
             var attachId = $li.data("id");
             var title = $li.find('.attach-title').text();
 
-            gui.dialog.showSaveDialog(gui.getCurrentWindow(), { title: title, defaultPath: gui.app.getPath('userDesktop') + '/' + title }, function(targetPath) {
+            gui.dialog.showSaveDialog(gui.getCurrentWindow(), { title: title, defaultPath: Api.getDefaultPath() + '/' + title }).then((res) => {
+                let targetPath = res.filePath
                 if (targetPath) {
+                    Api.saveLastPath(null, targetPath)
                     var curAttach = me.getAttach(attachId);
                     if (curAttach) {
                         FileService.download(curAttach.Path, targetPath, function(ok, msg) {
@@ -2636,28 +2638,28 @@ var Attach = {
 
         // 添加Attach
         $('#chooseFile').click(function() {
-            gui.dialog.showOpenDialog(gui.getCurrentWindow(), {
-                    defaultPath: gui.app.getPath('userDesktop'),
-                    properties: ['openFile', 'multiSelections']
-                },
-                function(paths) {
-                    if (!paths) {
-                        return;
-                    }
-
-                    // 如果是新建的笔记, 必须先保存note
-                    var note = Note.getCurNote();
-                    if (note && note.IsNew) {
-                        Note.curChangedSaveIt(true);
-                    }
-
-                    FileService.addAttach(paths, Note.curNoteId, function(files) {
-                        if (files) {
-                            me.addAttachs(files);
-                        }
-                    });
+            let pr = gui.dialog.showOpenDialog(gui.getCurrentWindow(), {
+                defaultPath: Api.getDefaultPath(),
+                properties: ['openFile', 'multiSelections']
+            }).then((re) => {
+                if(re.canceled !== false || re.filePaths.length < 1){
+                    return;
                 }
-            );
+                let paths = re.filePaths
+                Api.saveLastPath(null, paths[0])
+                
+                // 如果是新建的笔记, 必须先保存note
+                var note = Note.getCurNote();
+                if (note && note.IsNew) {
+                    Note.curChangedSaveIt(true);
+                }
+
+                FileService.addAttach(paths, Note.curNoteId, function(files) {
+                    if (files) {
+                        me.addAttachs(files);
+                    }
+                });
+            })
         });
     },
     attachListO: $("#attachList"),
@@ -3234,7 +3236,7 @@ Note.batch = {
             return;
         }
         var note = Note.getNote(noteId);
-        var title = note.Title || getMsg('unTitled');
+        var title = trimTitle(note.Title) || getMsg('unTitled');
         var desc = note.Desc || '...';
         // desc = substr(note.Content, 0, 200);
 
@@ -3700,7 +3702,7 @@ Note._getError = function(err, ret) {
     var Err = {};
     try {
         if (err && typeof err == 'object') {
-            Err.err = err.toString();
+            Err.err = JSON.stringify(err)
         }
     } catch (e) {}
     if (typeof ret == 'object' && 'Msg' in ret) {

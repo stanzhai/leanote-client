@@ -1,12 +1,4 @@
-var fs = require('fs');
-var Evt = require('evt');
-var File = require('file');
-var Note = require('note');
-var Web = require('web');
-var Tag = require('tag');
 var async = require('async');
-var Common = require('common');
-var resanitize = require('resanitize');
 
 var Import = {
   // 解析Leanote
@@ -48,7 +40,7 @@ var Import = {
     async.eachSeries(filePaths, function(path, cb) {
 
       try {
-        var json = JSON.parse(fs.readFileSync(path));
+        var json = JSON.parse(Api.NodeFs.readFileSync(path));
         me.parseLeanote(notebookId, json, function(ret) {
           // 单个文件完成
           eachFileCallback(ret, path)
@@ -213,10 +205,10 @@ var Import = {
   fixContent: function (content) {
     // srip unsage attrs
     var unsafeAttrs = ['id', , /on\w+/i, /data-\w+/i, 'clear', 'target'];
-      content = content.replace(/<([^ >]+?) [^>]*?>/g, resanitize.filterTag(resanitize.stripAttrs(unsafeAttrs)));
+      content = content.replace(/<([^ >]+?) [^>]*?>/g, Api.Resanitize.filterTag(Api.Resanitize.stripAttrs(unsafeAttrs)));
 
       // strip unsafe tags
-      content = resanitize.stripUnsafeTags(content, 
+      content = Api.Resanitize.stripUnsafeTags(content, 
         ['wbr','style', 'comment', 'plaintext', 'xmp', 'listing',
       'applet','base','basefont','bgsound','blink','body','button','dir','embed','fieldset','frameset','head',
       'html','iframe','ilayer','input','isindex','label','layer','legend','link','marquee','menu','meta','noframes',
@@ -230,7 +222,7 @@ var Import = {
     var me = this;
     // 先把files保存到本地
     var files = note.files || [];
-    if (Common.isEmpty(files)) {
+    if (Api.commonService.isEmpty(files)) {
       files = [];
     }
 
@@ -239,7 +231,7 @@ var Import = {
     async.eachSeries(files, 
       function(file, cb) {
         var isAttach = file.isAttach;
-        File.writeBase64(file.base64, !isAttach, file.type, file.title, function(fileOk) {
+        Api.fileService.writeBase64(file.base64, !isAttach, file.type, file.title, function(fileOk) {
           if(fileOk) {
             filesFixed[file.fileId] = fileOk;
             if(isAttach) {
@@ -267,7 +259,7 @@ var Import = {
 
           NotebookId: notebookId,
           Desc: '',
-          NoteId: Common.objectId(),
+          NoteId: Api.commonService.objectId(),
           IsNew: true
         };
         jsonNote._id = jsonNote.NoteId;
@@ -275,12 +267,12 @@ var Import = {
         for(var h = 0; h < jsonNote.Tags.length; ++h) {
           var tagTitle = jsonNote.Tags[h];
           if (tagTitle) {
-            Tag.addOrUpdateTag(tagTitle, function(tag) {
-              Web.addTag(tag); 
+            Api.tagService.addOrUpdateTag(tagTitle, function(tag) {
+              Api.webService.addTag(tag); 
             });
           }
         }
-        Note.updateNoteOrContent(jsonNote, function(insertedNote) {
+        Api.noteService.updateNoteOrContent(jsonNote, function(insertedNote) {
           callback && callback(insertedNote);
         });
       }
@@ -291,7 +283,7 @@ var Import = {
     var me = this;
     var notes = json.notes || [];
     
-    if (Common.isEmpty(notes)) {
+    if (Api.commonService.isEmpty(notes)) {
       callback(true);
       return;
     }

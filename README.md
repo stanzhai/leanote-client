@@ -11,22 +11,26 @@ Please see http://app.leanote.com
 
 ## How to develop it
 
-### 1. Install Electron
+### 1. Install Electron v12.0.2
 
-See https://github.com/atom/electron#downloads
+See https://github.com/electron/electron/releases/tag/v12.0.2
 
 
 ### 2. Run it with electron
 
 Download this project, and run
 
-````shell
-# 1. use gulp to parse less
+```shell
+# 1. install dependencies
+$> cd PATH-TO-LEANOTE-DESKTOP-APP
+$> npm i
+
+# 2. use gulp to parse less
 $> cd PATH-TO-LEANOTE-DESKTOP-APP/dev
-$> npm install
+$> npm i
 $> gulp dev
 
-# 2. run with electron
+# 3. run with electron
 $> cd PATH-TO-LEANOTE-DESKTOP-APP
 $> electron .
 ```

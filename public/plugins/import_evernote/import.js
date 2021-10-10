@@ -1,12 +1,5 @@
 var xml2js = require('xml2js');
-var fs = require('fs');
-var Evt = require('evt');
-var File = require('file');
-var Note = require('note');
-var Web = require('web');
-var Tag = require('tag');
 var async = require('async');
-var Common = require('common');
 
 var Import = {
 
@@ -61,9 +54,9 @@ var Import = {
           continue;
         }
         if(res.IsImage) {
-          var replace = '<img src="' + Evt.getImageLocalUrl(fileId) + '" ' + attrs + '>';
+          var replace = '<img src="' + Api.evtService.getImageLocalUrl(fileId) + '" ' + attrs + '>';
         } else {
-          var replace = '<a href="' + Evt.getAttachLocalUrl(fileId) + '">' + res['Title'] + '</a>'
+          var replace = '<a href="' + Api.evtService.getAttachLocalUrl(fileId) + '">' + res['Title'] + '</a>'
         }
         content = content.replace(ret[0], replace);
       } catch(e) {
@@ -80,7 +73,7 @@ var Import = {
   writeTest: function() {
     var path = '/Users/life/Desktop/1428226025985_2.png.txt';
     fs.readFile(path, function(err, xml) {
-      File.writeBase64(xml+"", true, 'png', 'a.png', function(file) {
+      Api.fileService.writeBase64(xml+"", true, 'png', 'a.png', function(file) {
       });
     });
   },
@@ -168,7 +161,7 @@ var Import = {
         // console.log(type);
         // return cb();
 
-        File.writeBase64(base64Str, isImage, type, filename, function(file) {
+        Api.fileService.writeBase64(base64Str, isImage, type, filename, function(file) {
           if(file) {
             parsedRes[file.hash] = file;
             // parsedRes.push(file);
@@ -245,7 +238,7 @@ var Import = {
               try {
 
                 // 保存到数据库中
-                jsonNote.NoteId = Common.objectId();
+                jsonNote.NoteId = Api.commonService.objectId();
                 jsonNote._id = jsonNote.NoteId;
                 jsonNote.IsNew = true;
                 jsonNote.NotebookId = notebookId;
@@ -259,15 +252,15 @@ var Import = {
                 if(jsonNote.Tags && jsonNote.Tags.length > 0) {
                   for(var h = 0; h < jsonNote.Tags.length; ++h) {
                     var tagTitle = jsonNote.Tags[h];
-                    Tag.addOrUpdateTag(tagTitle, function(tag) {
-                      Web.addTag(tag); 
+                    Api.tagService.addOrUpdateTag(tagTitle, function(tag) {
+                      Api.webService.addTag(tag); 
                     });
                   }
                 }
 
                 console.log('--- haha -- Note.updateNoteOrContent');
 
-                Note.updateNoteOrContent(jsonNote, function(insertedNote) {
+                Api.noteService.updateNoteOrContent(jsonNote, function(insertedNote) {
                   eachCallback && eachCallback(insertedNote);
                   cb();
                 });
