@@ -1,12 +1,4 @@
 {
-<<<<<<< HEAD
-  "name": "Leanote",
-  "version": "0.7",
-  "main": "main.js",
-  "devDependencies": {},
-  "dependencies": {
-    "electron": "^2.0.8"
-=======
   "name": "Leanote-Desktop",
   "version": "1.0.0",
   "main": "main.js",
@@ -21,6 +13,5 @@
     "node-getmac": "1.0.3",
     "validator": ">=3.22.1",
     "xml2js": "0.4.6"
->>>>>>> upstream/master
   }
 }
