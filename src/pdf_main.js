@@ -8,6 +8,9 @@ var exportPdf = {
       show: false
     });
 
+    // Enable @electron/remote for this window's webContents
+    require('@electron/remote/main').enable(win.webContents);
+
     // 写入html, 然后加载这个html
     win.loadURL('file://' + htmlPath);
 

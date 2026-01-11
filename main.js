@@ -210,6 +210,9 @@ function openIt() {
     }
   );
 
+  // Enable @electron/remote for this window's webContents
+  require('@electron/remote/main').enable(mainWindow.webContents);
+
   console.log('load: file://' + __dirname + '/note.html');
 
   // and load the index.html of the app.
@@ -247,6 +250,8 @@ function openIt() {
         arg.icon = new Tray(__dirname + arg.icon)
     }
     var win2 = new BrowserWindow(arg);
+    // Enable @electron/remote for this new window
+    require('@electron/remote/main').enable(win2.webContents);
     win2.loadURL('file://' + __dirname + '/' + html);
     mainWindow = win2;
 

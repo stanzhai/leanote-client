@@ -11,44 +11,38 @@ Please see http://app.leanote.com
 
 ## How to develop it
 
-
-### 1. Install Electron v12.0.2
-
-See https://github.com/electron/electron/releases/tag/v12.0.2
-
-
-### 2. Run it with electron
-
 Download this project, and run
 
 ```shell
-nvm use v11
+nvm use v18
 
 # 1. install dependencies
 $> cd PATH-TO-LEANOTE-DESKTOP-APP
-$> npm i
+$> ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm install
 
-# 2. use gulp to parse less
-$> cd PATH-TO-LEANOTE-DESKTOP-APP/dev
-$> npm i
-$> gulp dev
+# 2. build Less styles (gulp 已弃用，使用新的 npm 脚本)
+# Option A — 一次性构建
+$> npm install
+$> npm run less:build
+
+# Option B — 开发中监听并自动构建
+$> npm install
+$> npm run less:watch
 
 # 3. run with electron
-$> cd PATH-TO-LEANOTE-DESKTOP-APP
 $> npm run dev
 ```
 
 ## Package
 
 ```shell
-nvm use v14
+nvm use v18
 npm run build
 ```
 
 ## Docs
 
 Please see https://github.com/leanote/desktop-app/wiki
-
 
 ## LICENSE
 
