@@ -4,14 +4,15 @@
   "main": "main.js",
   "scripts": {
     "dev": "electron .",
-    "build": "electron-builder",
+    "build": "DEBUG=electron-builder electron-builder",
     "less:build": "node dev/build-less.js",
     "less:watch": "node dev/build-less.js --watch"
   },
   "build": {
     "appId": "site.stanzhai.leanote",
     "mac": {
-      "icon": "icon.icns"
+      "icon": "icon.icns",
+      "darkModeSupport": true
     },
     "electronDownload": {
       "mirror": "https://npmmirror.com/mirrors/electron/"
