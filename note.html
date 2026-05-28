@@ -30,6 +30,112 @@
 <!-- for change theme -->
 <link rel="stylesheet" href="" type="text/css" id="theme"/>
 
+<!-- command palette styles -->
+<style>
+.command-palette-mask {
+	position: fixed;
+	top: 0; left: 0; right: 0; bottom: 0;
+	background: rgba(0, 0, 0, 0.4);
+	z-index: 99999;
+	display: flex;
+	justify-content: center;
+	padding-top: 80px;
+}
+.command-palette {
+	width: 600px;
+	max-height: 480px;
+	background: #fff;
+	border-radius: 8px;
+	box-shadow: 0 8px 40px rgba(0, 0, 0, 0.25);
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	align-self: flex-start;
+}
+.cp-search-wrap {
+	padding: 12px 16px;
+	border-bottom: 1px solid #e0e0e0;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+.cp-search-wrap .fa-search {
+	color: #999;
+	font-size: 16px;
+	flex-shrink: 0;
+}
+.cp-search-wrap input {
+	flex: 1;
+	border: none;
+	outline: none;
+	font-size: 16px;
+	color: #333;
+	background: transparent;
+}
+.cp-search-wrap input::placeholder {
+	color: #aaa;
+}
+.cp-results {
+	flex: 1;
+	overflow-y: auto;
+	padding: 8px 0;
+}
+.cp-section-title {
+	padding: 6px 16px;
+	font-size: 11px;
+	font-weight: 600;
+	color: #999;
+	text-transform: uppercase;
+	letter-spacing: 0.5px;
+}
+.cp-item {
+	padding: 8px 16px;
+	cursor: pointer;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	font-size: 14px;
+	color: #333;
+	transition: background 0.1s;
+}
+.cp-item:hover,
+.cp-item.active {
+	background: #f0f3f7;
+}
+.cp-item .fa {
+	color: #888;
+	font-size: 14px;
+	width: 18px;
+	text-align: center;
+	flex-shrink: 0;
+}
+.cp-item.cp-action .fa {
+	color: #4a90d9;
+}
+.cp-note-title {
+	flex: 1;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.cp-note-notebook {
+	font-size: 12px;
+	color: #999;
+	flex-shrink: 0;
+	max-width: 120px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.cp-no-results {
+	color: #999;
+	cursor: default;
+}
+.cp-no-results:hover {
+	background: transparent;
+}
+</style>
+
 <script>
 // for windows
 if(process.platform != 'darwin') {
@@ -663,6 +769,7 @@ window.isDebug = false;
 <script src="public/js/app/native.js"></script>
 <script src="public/js/app/page.js"></script>
 <script src="public/js/app/note.js"></script>
+<script src="public/js/app/commandPalette.js"></script>
 <script src="public/js/app/tag.js"></script>
 <script src="public/js/app/notebook.js"></script>
 <script src="public/js/object_id.js"></script>
@@ -688,5 +795,33 @@ window.require = window.requireNode;
   document.getElementsByTagName('body')[0].appendChild(s);
 })();
 </script>
+
+<!-- command palette -->
+<div id="commandPalette" class="command-palette-mask" style="display:none">
+  <div class="command-palette">
+    <div class="cp-search-wrap">
+      <i class="fa fa-search"></i>
+      <input type="text" id="cpSearchInput" class="lang-placeholder" placeholder="Search notes..." />
+    </div>
+    <div class="cp-results">
+      <div class="cp-section" id="cpQuickActions">
+        <div class="cp-section-title lang">quickActions</div>
+        <div class="cp-item cp-action" data-action="newNote">
+          <i class="fa fa-plus-circle"></i>
+          <span class="cp-note-title lang">newNote</span>
+        </div>
+      </div>
+      <div class="cp-section" id="cpRecents">
+        <div class="cp-section-title lang">recents</div>
+        <div class="cp-list" id="cpRecentList"></div>
+      </div>
+      <div class="cp-section" id="cpSearchResults" style="display:none">
+        <div class="cp-section-title lang">searchResults</div>
+        <div class="cp-list" id="cpSearchResultList"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>
