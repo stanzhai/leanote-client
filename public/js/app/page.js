@@ -1837,14 +1837,6 @@ var Pren = {
                 }
             }
 
-            // Cmd+K / Ctrl+K 或 Cmd+Shift+P / Ctrl+Shift+P — command palette
-            else if ((keyCode == 75 && !e.shiftKey) || (keyCode == 80 && e.shiftKey)) {
-                if ((isMac() && e.metaKey) || (!isMac() && e.ctrlKey)) {
-                    e.preventDefault();
-                    CommandPalette.show();
-                }
-            }
-
             // linux,windows下需要
             else if (!isMac() && e.ctrlKey) {
                 // p

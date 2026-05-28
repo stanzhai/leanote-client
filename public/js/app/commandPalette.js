@@ -11,6 +11,7 @@ var CommandPalette = {
     selectedIndex: -1,
     searchTimer: null,
     searchSeq: 0,
+    wasInEditor: false,
 
     init: function() {
         var me = this;
@@ -21,6 +22,33 @@ var CommandPalette = {
         me.$searchResults = $('#cpSearchResults');
         me.$recentList = $('#cpRecentList');
         me.$searchResultList = $('#cpSearchResultList');
+
+        // Apply i18n to hardcoded HTML — lang.init() runs before this DOM exists
+        me.$input.attr('placeholder', getMsg('searchNotes'));
+        me.$mask.find('.lang').each(function () {
+            var $el = $(this);
+            var key = $.trim($el.text());
+            if (key && getMsg(key) !== key) {
+                $el.text(getMsg(key));
+            }
+        });
+
+        // Global shortcut via capture phase — fires before the editor but
+        // only calls preventDefault() (NOT stopPropagation), so the event
+        // still reaches the editor's handlers and Vim state stays intact.
+        document.addEventListener('keydown', function(e) {
+            var keyCode = e.keyCode;
+            if ((keyCode == 75 && !e.shiftKey) || (keyCode == 80 && e.shiftKey)) {
+                if ((isMac() && e.metaKey) || (!isMac() && e.ctrlKey)) {
+                    e.preventDefault();
+                    if (me.$mask.is(':visible')) {
+                        me.hide();
+                    } else {
+                        me.show();
+                    }
+                }
+            }
+        }, true);
 
         // Close on background click
         me.$mask.on('click', function(e) {
@@ -83,10 +111,10 @@ var CommandPalette = {
         });
 
         // Click handler for items (mouse click or tap)
-        me.$mask.on('click', '.cp-item:not(.cp-no-results)', function(e) {
+        me.$mask.on('click', '.cp-item:not(.cp-no-results):visible', function(e) {
             e.preventDefault();
             e.stopPropagation();
-            me.$allItems = me.$mask.find('.cp-item:not(.cp-no-results)');
+            me.$allItems = me.$mask.find('.cp-item:not(.cp-no-results):visible');
             me.selectedIndex = me.$allItems.index(this);
             me.selectCurrent();
         });
@@ -94,6 +122,12 @@ var CommandPalette = {
 
     show: function() {
         var me = this;
+        // Detect if the active element is inside the editor — used to
+        // restore focus via the editor API (not raw DOM focus) on hide.
+        var active = document.activeElement;
+        me.wasInEditor = active && (
+            $(active).closest('#editorContent, #mdEditor, #wmd-input, .ace_editor').length > 0
+        );
         me.$mask.show();
         me.$input.val('');
         me.selectedIndex = -1;
@@ -112,6 +146,20 @@ var CommandPalette = {
         if (me.searchTimer) {
             clearTimeout(me.searchTimer);
             me.searchTimer = null;
+        }
+        // Restore focus to the editor using its public API, not raw DOM
+        // focus on the saved element. Ace's Vim keyboard handler needs a
+        // proper focus cycle through editor.focus() to stay consistent.
+        if (me.wasInEditor) {
+            me.wasInEditor = false;
+            setTimeout(function() {
+                var note = Note.getCurNote();
+                if (note && note.IsMarkdown && MD) {
+                    MD.focus();
+                } else if (tinymce && tinymce.activeEditor) {
+                    tinymce.activeEditor.focus();
+                }
+            }, 0);
         }
     },
 
@@ -215,7 +263,7 @@ var CommandPalette = {
 
     navigate: function(direction) {
         var me = this;
-        me.$allItems = me.$mask.find('.cp-item:not(.cp-no-results)');
+        me.$allItems = me.$mask.find('.cp-item:not(.cp-no-results):visible');
         var len = me.$allItems.length;
         if (len === 0) return;
 
@@ -228,7 +276,7 @@ var CommandPalette = {
 
     updateSelection: function() {
         var me = this;
-        me.$allItems = me.$mask.find('.cp-item:not(.cp-no-results)');
+        me.$allItems = me.$mask.find('.cp-item:not(.cp-no-results):visible');
         me.$allItems.removeClass('active');
 
         if (me.selectedIndex >= 0 && me.selectedIndex < me.$allItems.length) {
@@ -252,7 +300,7 @@ var CommandPalette = {
 
     selectCurrent: function() {
         var me = this;
-        me.$allItems = me.$mask.find('.cp-item:not(.cp-no-results)');
+        me.$allItems = me.$mask.find('.cp-item:not(.cp-no-results):visible');
 
         if (me.selectedIndex < 0 || me.selectedIndex >= me.$allItems.length) {
             // If nothing selected, pick the first item
@@ -283,6 +331,16 @@ var CommandPalette = {
             if (noteId) {
                 me.hide();
                 Note.changeNoteForPjax(noteId, true, true);
+                // Focus editor and enable writable mode after content loads
+                setTimeout(function() {
+                    var note = Note.getNote(noteId);
+                    if (note && note.IsMarkdown && MD) {
+                        MD.focus();
+                    } else if (tinymce && tinymce.activeEditor) {
+                        tinymce.activeEditor.focus();
+                    }
+                    Note.toggleWriteable(true);
+                }, 300);
             }
         }
     }
