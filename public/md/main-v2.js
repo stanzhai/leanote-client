@@ -8730,6 +8730,10 @@ define("bower-libs/pagedown-ace/Markdown.Converter", function(){});
             win: 'Ctrl-Q',
             mac: 'Command-Q|Ctrl-Q',
         },
+        code: {
+            win: 'Ctrl-K',
+            mac: 'Command-K|Ctrl-K',
+        },
         image: {
             win: 'Ctrl-G',
             mac: 'Command-G|Ctrl-G',
@@ -14216,6 +14220,14 @@ define('shortcutMgr',[
             },
             isPageDown: true
         },
+        'code': {
+            title: 'Code Sample',
+            defaultKey: {
+                win: 'Ctrl-K',
+                mac: 'Command-K|Ctrl-K',
+            },
+            isPageDown: true
+        },
         'image': {
             title: 'Image',
             defaultKey: {
@@ -14472,7 +14484,7 @@ define('shortcutMgr',[
         quote: getMsg("Blockquote") + ' <blockquote> Ctrl/Cmd+Q',
         quoteexample: getMsg("Blockquote"),
 
-        code: getMsg("Code Sample") + ' <pre><code>',
+        code: getMsg("Code Sample") + ' <pre><code> Ctrl/Cmd+K',
         codeexample: getMsg("enter code here"),
 
         image: getMsg("Image") + '<img> Ctrl/Cmd+G',
