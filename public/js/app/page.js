@@ -561,6 +561,11 @@ $(function() {
     $(window).resize(function() {
         Mobile.isMobile();
         resizeEditor();
+        // 预览面板关闭后，窗口大小调整时，重新计算编辑器宽度使其自适应填充
+        if (!$('.layout-toggler-preview').hasClass('open')) {
+            var totalWidth = Resize.leftColumn.parent().width();
+            Resize.leftColumn.width(totalWidth - 22);
+        }
     });
 
     // 初始化编辑器
