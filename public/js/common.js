@@ -442,6 +442,21 @@ function _setEditorContent(content, isMarkdown, preview, callback) {
 		if(MD) {
 			MD.setContent(content);
 			MD.clearUndo();
+
+			// 默认关闭预览窗口：先加载内容让Ace在正确尺寸下完成渲染，再关闭预览
+			if (!window.__mdPreviewInitDone && $('.layout-toggler-preview').hasClass('open')) {
+				window.__mdPreviewInitDone = true;
+				var previewWasOpen = false;
+				try {
+					previewWasOpen = localStorage.getItem('LeaMdPreviewOpen') === '1';
+				} catch(e) {}
+				if (!previewWasOpen) {
+					setTimeout(function() {
+						$('.layout-toggler-preview').click();
+					}, 100);
+				}
+			}
+
 			callback && callback();
 		} else {
 			clearIntervalForSetContent = setTimeout(function() {

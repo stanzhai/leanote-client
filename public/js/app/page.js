@@ -147,6 +147,9 @@ var Resize = {
                 }
 
             } else {
+                if (!everLeftWidth) {
+                    everLeftWidth = UserInfo.MdEditorWidth || 450;
+                }
                 $t.addClass('open');
                 self.rightColumn.find('.layout-resizer').addClass('open');
                 self.leftColumn.width(everLeftWidth);
@@ -157,6 +160,10 @@ var Resize = {
                     MD.resize();
                 }
             }
+            // 记住预览窗口状态
+            try {
+                localStorage.setItem('LeaMdPreviewOpen', $t.hasClass('open') ? '1' : '0');
+            } catch(e) {}
         });
     },
     // 停止, 保存数据
