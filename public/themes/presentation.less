@@ -1,6 +1,23 @@
 /**
- * 演示
+ * 演示 / 查看模式 — Modern article style
  */
+
+// ---- Font & color system ----
+@font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", sans-serif;
+@font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+@text-color: #1a1a1a;
+@heading-color: #0d0d0d;
+@link-color: #0969da;
+@link-hover: #0550b2;
+@border-color: #d8dee4;
+@bg-gray: #f6f8fa;
+@code-red: #cf222e;
+@quote-border: #0969da;
+@quote-bg: #f6f8fa;
+@quote-text: #57606a;
+@muted: #656d76;
+
+// ---- Layout (full screen) ----
 body {
 	box-shadow: none;
 	left: 0;
@@ -12,319 +29,566 @@ body {
 
 #mainMask,
 #winTool,
-.navbar.navbar-default
-{
- 	display: none;
+.navbar.navbar-default {
+	display: none;
 }
+
 #topDrag {
 	display: none;
 }
-// 查看模式
+
 body.view {
 	#topDrag {
 		display: block;
 		right: 50px;
 	}
 }
+
+// =============================
+//  Presentation Container
+// =============================
 #presentation {
- 	position: absolute;
- 	left: 0;
- 	right: 0;
- 	bottom: 0;
- 	top: 0;
- 	background-color: #fff;
- 	// display: none;
- 	display: block;
- 	-webkit-user-select: text;
- 	overflow-y: scroll;
- 	font-family: "Helvetica Neue",Helvetica,Arial,"Droid Sans Mono", "Droid Sans Fallback",sans-serif;
+	position: absolute;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	top: 0;
+	background-color: #fff;
+	display: block;
+	-webkit-user-select: text;
+	overflow-y: scroll;
+	font-family: @font-family;
+	color: @text-color;
 
- 	svg {
-		border-radius: 5px;
- 	}
+	::selection {
+		background: rgba(9, 105, 218, 0.18);
+	}
 
- 	a {
- 		color: #2a6496;
- 	}
+	svg {
+		border-radius: 8px;
+		display: block;
+		margin: 1.6em auto;
+		max-width: 100%;
+	}
 
- 	hr {
- 		margin: 10px;
- 		width: 20px;
- 		border: none;
- 	}
+	a {
+		color: @link-color;
+		text-decoration: none;
+		&:hover {
+			text-decoration: underline;
+		}
+	}
 
- 	&.writting, &.black {
- 		background-color: #F9F9F5;
+	hr {
+		margin: 2em auto;
+		border: none;
+		border-top: 1px solid @border-color;
+	}
 
- 		color: #2C3E50;
- 		pre.prettyprint {
- 			/* Pretty printing styles. Used with prettify.js. */
-			/* SPAN elements with the classes below are added by prettyprint. */
-			.pln { color: #000 }  /* plain text */
+	// =============================
+	//  Theme: writting (sepia)
+	// =============================
+	&.writting {
+		background-color: #fbfaf5;
+		color: #3b3a36;
 
-			@media screen {
-			  .str { color: #080 }  /* string content */
-			  .kwd { color: #008 }  /* a keyword */
-			  .com { color: #800 }  /* a comment */
-			  .typ { color: #606 }  /* a type name */
-			  .lit { color: #066 }  /* a literal value */
-			  /* punctuation, lisp open bracket, lisp close bracket */
-			  .pun, .opn, .clo { color: #660 }
-			  .tag { color: #008 }  /* a markup tag name */
-			  .atn { color: #606 }  /* a markup attribute name */
-			  .atv { color: #080 }  /* a markup attribute value */
-			  .dec, .var { color: #606 }  /* a declaration; a variable name */
-			  .fun { color: red }  /* a function name */
+		.pren-content {
+			h1, h2, h3, h4, h5, h6 { color: #2c2b26; }
+			strong { color: #2c2b26; }
+
+			blockquote {
+				background: rgba(160, 140, 100, 0.06);
+				border-left-color: #b8a070;
+				color: #5e5540;
 			}
 
-			/* Specify class=linenums on a pre to get line numbering */
-			ol.linenums { margin-top: 0; margin-bottom: 0; color: rgba(102, 128, 153, 0.4) } /* IE indents via margin-left */
-			ol.linenums { margin-left: 10px;}
-			// ol.linenums > li { padding-left: 15px;}
+			code {
+				color: #b34a3a;
+				background: rgba(160, 140, 100, 0.08);
+				border-color: rgba(160, 140, 100, 0.15);
+			}
 
-		    display: block;
-		    background-color: rgba(102, 128, 153, 0.05);
-		    box-shadow: 0 1px 2px rgba(255, 255, 255, 0.1) inset, 45px 0 0 rgba(102, 128, 153, 0.05) inset, 0 1px 0 rgba(102, 128, 153, 0.05);
-		    padding: 9.5px;
- 		}
- 	}
+			pre {
+				background: rgba(160, 140, 100, 0.06);
+				border-color: rgba(160, 140, 100, 0.12);
+				code {
+					color: #3b3a36;
+					background: transparent;
+					border: none;
+				}
+			}
 
- 	&.black {
- 		background-color: #000;
- 		color: #fff;
- 		
- 		blockquote {
-	 		background-color: rgba(192, 182, 182, 0.5);
-	 		border-left-color: #988F8F;
- 		}
-		code {
-			color: #DAD6D7;
-			background-color: #908185;
-		}
- 		pre.prettyprint {
- 			background-color: #CACAB7;
- 		}
- 		ol.linenums > li {
- 			color: #000;
- 		}
- 		svg {
- 			background: #F9F9F5;
- 		}
+			table th {
+				background: rgba(160, 140, 100, 0.06);
+			}
 
- 		.pren-tool {
- 			a {
-	 			color: #fff;
- 			}
- 		}
- 	}
+			table tr:nth-child(even) td {
+				background: rgba(160, 140, 100, 0.03);
+			}
 
- 	// text-size
- 	&.text-min-1 .pren-content {
- 		* {
-		  font-size: 16px;
-		}
-		svg *, pre * {
- 			font-size: 16px;
- 		}
-		h1 {
-		  font-size: 28px;
-		}
-		h2 {
-		  font-size: 22px;
-		}
-		h3 {
-		  font-size: 18px;
-		}
-		h4 {
-		  font-size: 14px;
-		}
- 	}
- 	&.text-min-2 .pren-content {
- 		* {
-		  font-size: 14px;
-		}
-		svg *, pre * {
- 			font-size: 16px;
- 		}
-		h1 {
-		  font-size: 24px;
-		}
-		h2 {
-		  font-size: 20px;
-		}
-		h3 {
-		  font-size: 16px;
-		}
-		h4 {
-		  font-size: 14px;
-		}
- 	}
+			a { color: #7a6030; }
+			hr { border-top-color: rgba(160, 140, 100, 0.2); }
 
- 	&.text-max-1 .pren-content {
- 		* {
-		  font-size: 20px;
+			kbd {
+				color: #3b3a36;
+				background: rgba(160, 140, 100, 0.06);
+				border-color: rgba(160, 140, 100, 0.2);
+				box-shadow: 0 1px 0 rgba(160, 140, 100, 0.15);
+			}
 		}
-		svg *, pre * {
- 			font-size: 16px;
- 		}
-		h1 {
-		  font-size: 32px;
-		}
-		h2 {
-		  font-size: 28px;
-		}
-		h3 {
-		  font-size: 24px;
-		}
-		h4 {
-		  font-size: 18px;
-		}
- 	}
 
- 	&.text-max-2 .pren-content {
- 		* {
-		  font-size: 24px;
+		.pren-title { color: #2c2b26; }
+
+		.pren-tool a {
+			color: #8b8060;
+			&:hover { color: #3b3a36; }
 		}
-		svg *, pre * {
- 			font-size: 16px;
- 		}
-		h1 {
-		  font-size: 38px;
+	}
+
+	// =============================
+	//  Theme: black (dark mode)
+	// =============================
+	&.black {
+		background-color: #1a1a1a;
+		color: #c9c9c9;
+
+		.pren-content {
+			color: #c9c9c9;
+
+			h1, h2, h3, h4, h5, h6 { color: #e8e8e8; }
+			strong { color: #e8e8e8; }
+
+			blockquote {
+				background: rgba(255, 255, 255, 0.05);
+				border-left-color: #539bf5;
+				color: #a0a0a0;
+			}
+
+			code {
+				color: #ff9da4;
+				background: rgba(255, 255, 255, 0.07);
+				border-color: rgba(255, 255, 255, 0.1);
+			}
+
+			pre {
+				background: rgba(255, 255, 255, 0.05);
+				border-color: rgba(255, 255, 255, 0.08);
+				code {
+					color: #c9c9c9;
+					background: transparent;
+					border: none;
+				}
+			}
+
+			table th, table td {
+				border-color: rgba(255, 255, 255, 0.12);
+			}
+
+			table th {
+				background: rgba(255, 255, 255, 0.07);
+				color: #e8e8e8;
+			}
+
+			table tr:nth-child(even) td {
+				background: rgba(255, 255, 255, 0.025);
+			}
+
+			a { color: #539bf5; }
+			hr { border-top-color: rgba(255, 255, 255, 0.12); }
+
+			kbd {
+				color: #c9c9c9;
+				background: rgba(255, 255, 255, 0.07);
+				border-color: rgba(255, 255, 255, 0.15);
+				box-shadow: 0 1px 0 rgba(255, 255, 255, 0.08);
+			}
 		}
-		h2 {
-		  font-size: 32px;
+
+		.pren-title { color: #e8e8e8; }
+
+		.pren-tool a {
+			color: #a0a0a0;
+			&:hover { color: #fff; }
 		}
-		h3 {
-		  font-size: 28px;
-		}
-		h4 {
-		  font-size: 24px;
-		}
- 	}
- 	
+	}
+
+	// =============================
+	//  Font size scaling
+	// =============================
+	&.text-min-2 .pren-content {
+		* { font-size: 15px; line-height: 1.7; }
+		pre *, svg * { font-size: 13px; }
+		h1 { font-size: 1.8em; }
+		h2 { font-size: 1.4em; }
+		h3 { font-size: 1.15em; }
+		h4 { font-size: 1em; }
+	}
+
+	&.text-min-1 .pren-content {
+		* { font-size: 17px; line-height: 1.75; }
+		pre *, svg * { font-size: 14px; }
+		h1 { font-size: 1.9em; }
+		h2 { font-size: 1.45em; }
+		h3 { font-size: 1.2em; }
+		h4 { font-size: 1em; }
+	}
+
+	// Default (level 2): see .pren-content block
+
+	&.text-max-1 .pren-content {
+		* { font-size: 21px; line-height: 1.85; }
+		pre *, svg * { font-size: 14px; }
+		h1 { font-size: 2.1em; }
+		h2 { font-size: 1.6em; }
+		h3 { font-size: 1.3em; }
+		h4 { font-size: 1.05em; }
+	}
+
+	&.text-max-2 .pren-content {
+		* { font-size: 23px; line-height: 1.9; }
+		pre *, svg * { font-size: 15px; }
+		h1 { font-size: 2.2em; }
+		h2 { font-size: 1.7em; }
+		h3 { font-size: 1.35em; }
+		h4 { font-size: 1.1em; }
+	}
 }
+
+// =============================
+//  Floating Toolbar
+// =============================
 .pren-tool {
 	position: fixed;
 	-webkit-user-select: none;
 	right: 0;
 	top: 0;
 	bottom: 0;
-	width: 45px;
-	z-index: 1001; // 比topDrag多一个
-	// visibility: hidden;
+	width: 48px;
+	z-index: 1001;
 	opacity: 0;
+	transition: opacity 0.2s ease;
+	text-align: center;
+
 	&:hover {
 		opacity: 1;
 	}
-	text-align: center;
+
 	a {
 		display: block;
 		font-size: 16px;
-		height: 30px;
-		line-height: 30px;
+		height: 36px;
+		line-height: 36px;
+		color: @muted;
+		transition: color 0.15s;
+		&:hover {
+			color: @text-color;
+		}
 	}
+
 	.pren-tool-bg-color {
-		margin-top: 30px;
+		margin-top: 20px;
 	}
+
 	.pren-tool-text-size-max {
-		font-size: 16px;
+		font-size: 18px;
 	}
+
 	.pren-tool-text-size-min {
-		font-size: 12px;
+		font-size: 14px;
 	}
-	
 }
+
+// =============================
+//  Title
+// =============================
 .pren-title {
-	font-size: 32px;
- 	margin: 100px 0;
- 	// margin-top: 100px;
- 	text-align: center;
- 	padding: 0 150px;
- 	font-weight: bold;
+	font-size: 2.4em;
+	margin: 80px auto 40px;
+	text-align: center;
+	padding: 0 32px;
+	font-weight: 800;
+	letter-spacing: -0.03em;
+	line-height: 1.2;
+	color: @heading-color;
 }
+
+// =============================
+//  Article Content
+// =============================
 .pren-content {
- 	margin: 0 150px;
- 	overflow: hidden;
+	margin: 0 auto;
+	max-width: 720px;
+	padding: 0 32px 120px;
+	overflow: hidden;
 	word-wrap: break-word;
- 	* {
-	  font-size: 18px;
-	  line-height: 1.5;
-	  max-width: 100%; // 有些html有宽度, 就会超出
-	  font-family: "Microsoft Yahei","Hiragino Sans GB","WenQuanYi Micro Hei","Droid Sans Mono", "Droid Sans Fallback",sans-serif;
+
+	// Default base sizes (font scale level 2)
+	* {
+		font-size: 19px;
+		line-height: 1.8;
+		max-width: 100%;
+		font-family: @font-family;
 	}
-	svg *, pre * {
-		font-size: 16px;
+
+	// Inside code/pre, use monospace
+	pre *, svg * {
+		font-size: 14px;
+		font-family: @font-mono;
 	}
+
+	// ---- Paragraphs ----
 	p {
-		margin: 10px 0;
+		margin: 0 0 1.5em;
 	}
+
+	// ---- Headings ----
+	h1, h2, h3, h4, h5, h6 {
+		margin-top: 2em;
+		margin-bottom: 0.5em;
+		font-weight: 700;
+		line-height: 1.3;
+		color: @heading-color;
+		letter-spacing: -0.02em;
+	}
+
 	h1 {
-	  font-size: 30px;
+		font-size: 2em;
+		margin-top: 2.5em;
 	}
-	h2 {
-	  font-size: 24px;
+
+	h2 { font-size: 1.5em; }
+	h3 { font-size: 1.25em; }
+	h4 { font-size: 1em; font-weight: 600; }
+
+	// ---- Links ----
+	a {
+		color: @link-color;
+		text-decoration: none;
+		&:hover {
+			text-decoration: underline;
+		}
 	}
-	h3 {
-	  font-size: 18px;
+
+	// ---- Strong & Bold ----
+	strong, b {
+		font-weight: 600;
+		color: @heading-color;
 	}
-	h4 {
-	  font-size: 14px;
+
+	// ---- Horizontal rule ----
+	hr {
+		margin: 2.5em auto;
+		border: none;
+		border-top: 1px solid @border-color;
+		width: 100%;
+	}
+
+	// ---- Images ----
+	img {
+		max-width: 100%;
+		border-radius: 8px;
+		display: block;
+		margin: 1.5em auto;
+	}
+
+	// ---- Lists ----
+	ul, ol {
+		padding-left: 1.8em;
+		margin: 0 0 1.5em;
+	}
+
+	li {
+		margin-bottom: 0.3em;
+	}
+
+	li > ul,
+	li > ol {
+		margin-bottom: 0;
+	}
+
+	ul ul, ol ul, ul ol, ol ol {
+		margin-bottom: 0;
+	}
+
+	// ---- Blockquote ----
+	blockquote {
+		margin: 0 0 1.5em;
+		padding: 16px 24px;
+		border-left: 4px solid @quote-border;
+		background: @quote-bg;
+		border-radius: 0 6px 6px 0;
+		color: @quote-text;
+
+		p {
+			margin-bottom: 0.7em;
+		}
+
+		p:last-child {
+			margin-bottom: 0;
+		}
+
+		ul:last-child,
+		ol:last-child {
+			margin-bottom: 0;
+		}
+	}
+
+	// ---- Inline Code ----
+	pre, code {
+		font-family: @font-mono;
+	}
+
+	code {
+		padding: 2px 6px;
+		font-size: 0.85em;
+		color: @code-red;
+		background: @bg-gray;
+		border: 1px solid @border-color;
+		border-radius: 4px;
+		word-break: break-word;
+	}
+
+	// ---- Code Blocks ----
+	pre {
+		margin: 0 0 1.5em;
+		padding: 20px;
+		background: @bg-gray;
+		border: 1px solid @border-color;
+		border-radius: 8px;
+		overflow-x: auto;
+		font-size: 0.85em;
+		line-height: 1.55;
+
+		code {
+			padding: 0;
+			font-size: inherit;
+			color: inherit;
+			background: transparent;
+			border: none;
+			border-radius: 0;
+			white-space: pre;
+			word-break: normal;
+		}
+	}
+
+	// ---- Prettify syntax highlighting (light theme) ----
+	pre.prettyprint {
+		.pln { color: #24292f; }
+		.str { color: #0a3069; }
+		.kwd { color: #cf222e; }
+		.com { color: #6e7781; font-style: italic; }
+		.typ { color: #8250df; }
+		.lit { color: #0550ae; }
+		.pun, .opn, .clo { color: #24292f; }
+		.tag { color: #116329; }
+		.atn { color: #8250df; }
+		.atv { color: #0a3069; }
+		.dec, .var { color: #953800; }
+		.fun { color: #8250df; }
+
+		ol.linenums {
+			margin-top: 0;
+			margin-bottom: 0;
+			color: rgba(102, 128, 153, 0.4);
+			margin-left: 30px;
+		}
+	}
+
+	// ---- Tables ----
+	table {
+		width: 100%;
+		margin: 0 0 1.5em;
+		border-collapse: collapse;
+		border-spacing: 0;
+		font-size: 0.9em;
+	}
+
+	table th, table td {
+		padding: 10px 16px;
+		border: 1px solid @border-color;
+		text-align: left;
+		vertical-align: top;
+	}
+
+	table th {
+		font-weight: 600;
+		background: @bg-gray;
+		color: @heading-color;
+	}
+
+	table tbody > tr:nth-child(even) > td,
+	table tbody > tr:nth-child(even) > th {
+		background: #fafbfc;
+	}
+
+	// ---- Rich text editor table classes ----
+	.mce-item-table, .mce-item-table td, .mce-item-table th, .mce-item-table caption {
+		border: 1px solid @border-color;
+		border-collapse: collapse;
+		padding: 10px 16px;
+	}
+
+	// ---- Keyboard shortcuts ----
+	kbd {
+		padding: 2px 6px;
+		font-size: 0.8em;
+		font-family: @font-mono;
+		color: #24292f;
+		background: @bg-gray;
+		border: 1px solid @border-color;
+		border-bottom-width: 2px;
+		border-radius: 4px;
+		box-shadow: 0 1px 0 @border-color;
+		display: inline-block;
+		margin: 0 0.1em;
+		white-space: nowrap;
+	}
+
+	// ---- TOC ----
+	.toc ul {
+		list-style-type: none;
+		margin-bottom: 15px;
+	}
+
+	// ---- Task list ----
+	.m-todo-item {
+		list-style: none;
+	}
+
+	// ---- Footnote ----
+	.footnote {
+		vertical-align: top;
+		position: relative;
+		top: -0.5em;
+		font-size: 0.75em;
+	}
+
+	// ---- Diagrams ----
+	.sequence-diagram, .flow-chart {
+		text-align: center;
+		margin-bottom: 1.5em;
+
+		text {
+			font-size: 14px !important;
+			font-family: @font-family !important;
+		}
+
+		[fill="#ffffff"] {
+			fill: #f6f6f6;
+		}
+
+		[stroke="#000000"] {
+			stroke: #3f3f3f;
+		}
+
+		text[stroke="#000000"] {
+			stroke: none;
+		}
+
+		[fill="#000"],
+		[fill="#000000"],
+		[fill="black"] {
+			fill: #3f3f3f;
+		}
 	}
 }
-
- /*
- body.init #pageInner {
- 	display: block;
- }
- #noteAndEditor {
- 	left: 0 !important;
- }
- #note {
- 	left: 0 !important;
- 	// left: 100px !important;
- 	// right: 100px !important;
-
- 	// padding: 0 100px;
-
- 	#tool {
- 		border: none;
- 	}
- 	#noteTitleDiv {
- 		right: 0;
- 		margin: 20px 0;
- 	}
- 	#noteTitle {
- 		text-align: center;
- 		font-size: 24px;
- 	}
-
- 	* {
-	  font-size: 18px;
-	}
-	h1 {
-	  font-size: 30px;
-	}
-	h2 {
-	  font-size: 24px;
-	}
-	h3 {
-	  font-size: 18px;
-	}
-	h4 {
-	  font-size: 14px;
-	}
- }
-
- #editor, #mdEditor {
- 	bottom: 0;
- 	top: 100px !important;
- }
-
-#mdEditor .layout-wrapper-l3, #editorContent {
- 	top: 0 !important;
-}
-
-#editorContent {
- 	padding: 0 100px;
-}
-*/
