@@ -1,5 +1,5 @@
 // var app = require('electron').app;  // Module to control application life.
-const {app, BrowserWindow, crashReporter, Tray, Menu, ipcMain: ipc} = require('electron');
+const {app, BrowserWindow, crashReporter, Tray, Menu, ipcMain: ipc, screen} = require('electron');
 var pdfMain = require('./src/pdf_main');
 var appIcon;
 
@@ -16,6 +16,55 @@ require('@electron/remote/main').initialize()
 // Keep a global reference of the window object, if you don't, the window will
 // be closed automatically when the javascript object is GCed.
 var mainWindow = null;
+
+// ---------- window state persistence ----------
+const path = require('path');
+const fs = require('fs');
+const WIN_STATE_FILE = path.join(app.getPath('userData'), 'window-state.json');
+
+function loadWinState() {
+  try {
+    return JSON.parse(fs.readFileSync(WIN_STATE_FILE, 'utf-8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveWinState(bounds) {
+  try {
+    fs.writeFileSync(WIN_STATE_FILE, JSON.stringify({
+      x: bounds.x,
+      y: bounds.y,
+      width: bounds.width,
+      height: bounds.height,
+      isMaximized: mainWindow ? mainWindow.isMaximized() : false
+    }, null, 2));
+  } catch (e) {}
+}
+
+function isValidPosition(state) {
+  if (!state || state.width === undefined) return false;
+  const displays = screen.getAllDisplays();
+  // Check if at least part of the window would be visible on any display
+  return displays.some(function(d) {
+    var wa = d.workArea;
+    // Allow the window to be at least partially visible (top-left corner within bounds)
+    var xOk = state.x >= wa.x - state.width + 100 && state.x < wa.x + wa.width - 100;
+    var yOk = state.y >= wa.y - state.height + 50 && state.y < wa.y + wa.height - 50;
+    return xOk && yOk;
+  });
+}
+
+function saveWinStateDebounced() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try { saveWinState(mainWindow.getBounds()); } catch (e) {}
+  }
+}
+var _saveTimeout = null;
+function debouncedSave() {
+  clearTimeout(_saveTimeout);
+  _saveTimeout = setTimeout(saveWinStateDebounced, 300);
+}
 
 if (!app.makeSingleInstance) {
   app.allowRendererProcessReuse = true
@@ -152,15 +201,11 @@ function bindEvents (win) {
   // Emitted when the window is closed.
   win.on('closed', function() {
     console.log('closed');
-    // Dereference the window object, usually you would store windows
-    // in an array if your app supports multi windows, this is the time
-    // when you should delete the corresponding element.
     win = null;
   });
 
   win.on('focus', function() {
     console.log('focus');
-    // ipc.send('focusWindow'); mainProcess没有该方法
     if(win && win.webContents)
       win.webContents.send('focusWindow');
   });
@@ -169,10 +214,18 @@ function bindEvents (win) {
     if(win && win.webContents)
       win.webContents.send('blurWindow');
   });
-  
+
+  // Track window position/size changes for persistence
+  win.on('resize', debouncedSave);
+  win.on('move', debouncedSave);
+  win.on('maximize', debouncedSave);
+  win.on('unmaximize', debouncedSave);
+
   // 以前的关闭是真关闭, 现是是假关闭了
   // 关闭,先保存数据
   win.on('close', function(e) {
+    saveWinStateDebounced();
+
     // windows支持tray, 点close就是隐藏
     if (process.platform.toLowerCase().indexOf('win') === 0) { // win32
       win.hide();
@@ -195,20 +248,35 @@ function openIt() {
   var leanoteProtocol = require('./src/leanote_protocol');
   leanoteProtocol.init();
 
-  // Create the browser window.
-  mainWindow = new BrowserWindow({
-      width: 1050, 
-      height: 595, 
-      frame: process.platform != 'darwin', 
+  var winState = loadWinState();
+  var winOpts = {
+      width: 1050,
+      height: 595,
+      frame: process.platform != 'darwin',
       transparent: false,
       autoHideMenuBar: true,
       webPreferences: {
         nodeIntegration: true,
-        contextIsolation: false, // https://github.com/electron/electron/issues/27961
+        contextIsolation: false,
         enableRemoteModule: true
       }
-    }
-  );
+    };
+
+  // Restore previous window position/size if valid for current display setup
+  if (winState && isValidPosition(winState)) {
+    winOpts.x = winState.x;
+    winOpts.y = winState.y;
+    winOpts.width = winState.width;
+    winOpts.height = winState.height;
+  }
+
+  // Create the browser window.
+  mainWindow = new BrowserWindow(winOpts);
+
+  // Restore maximized state if it was previously maximized
+  if (winState && winState.isMaximized) {
+    mainWindow.maximize();
+  }
 
   // Enable @electron/remote for this window's webContents
   require('@electron/remote/main').enable(mainWindow.webContents);
@@ -219,6 +287,21 @@ function openIt() {
   mainWindow.loadURL('file://' + __dirname + '/note.html');
 
   bindEvents(mainWindow);
+
+  // When screen configuration changes, reset to default if window is off-screen
+  screen.on('display-added', function() { validateWindowPosition(); });
+  screen.on('display-removed', function() { validateWindowPosition(); });
+  screen.on('display-metrics-changed', function() { validateWindowPosition(); });
+
+  function validateWindowPosition() {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    var bounds = mainWindow.getBounds();
+    if (!isValidPosition(bounds)) {
+      mainWindow.setPosition(100, 100);
+      mainWindow.setSize(1050, 595);
+      mainWindow.center();
+    }
+  }
 
   // 前端发来可以关闭了
   ipc.on('quit-app', function(event, arg) {

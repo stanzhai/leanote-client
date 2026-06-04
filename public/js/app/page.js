@@ -1768,6 +1768,8 @@ var Pren = {
             me.presentationO.removeClass('black');
             me._themeMode = 'normal';
         }
+        Config.prenTheme = me._themeMode;
+        Api.writeConfig(Config);
     },
 
     _fontSizeIndex: 2, // 位置
@@ -1790,6 +1792,8 @@ var Pren = {
         if (curClass != nextClass) {
             me.presentationO.removeClass(curClass).addClass(nextClass);
         }
+        Config.prenFontSize = me._fontSizeIndex;
+        Api.writeConfig(Config);
     },
 
     init: function() {
@@ -1893,6 +1897,25 @@ var Pren = {
         $('.pren-tool-text-size-max').click(function() {
             me.toggleFontSizeMode(false);
         });
+
+        // Restore persisted theme mode (normal → writting → black → normal)
+        me.presentationO.removeClass('writting black');
+        if (Config.prenTheme === 'writting') {
+            me.presentationO.addClass('writting');
+            me._themeMode = 'writting';
+        } else if (Config.prenTheme === 'black') {
+            me.presentationO.addClass('black');
+            me._themeMode = 'black';
+        }
+
+        // Restore persisted font size
+        if (Config.prenFontSize !== undefined) {
+            me._fontSizeIndex = Config.prenFontSize;
+            var fontClass = me._fontScales[me._fontSizeIndex];
+            if (fontClass) {
+                me.presentationO.addClass(fontClass);
+            }
+        }
         $('.pren-tool-pre').click(function() {
             me.preOrNext(true);
         });
