@@ -22,6 +22,8 @@
 <!-- markdown theme -->
 <link rel="stylesheet" href="public/themes/markdown/default/index.css" type="text/css" id="md-theme"/>
 
+<!-- design tokens -->
+<link rel="stylesheet" href="public/themes/includes/vars.css" type="text/css"/>
 <!-- theme -->
 <link rel="stylesheet" href="public/themes/default.css" type="text/css"/>
 <link rel="stylesheet" href="public/themes/presentation.css" type="text/css" disabled id="themePresentation"/>
@@ -343,12 +345,9 @@ function log(o) {
               </div>
 
               <div id="newMyNote">
-                <a id="newNoteBtn" title="New note">
-                  <span class="new-note-text"  title="New note">+</span>
-                </a>
-                <span class="new-split">|</span>
+                <a id="newNoteBtn" title="New note">+</a>
                 <a id="newNoteMarkdownBtn" title="New markdown note">
-                  <span class="new-markdown-text" title="New markdown note">+M</span>
+                  <i class="fa fa-code"></i>
                 </a>
                 <span id="curNotebookForNewNote" notebookId="" style="display: none"></span>
               </div>

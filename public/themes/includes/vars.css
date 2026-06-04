@@ -1,0 +1,47 @@
+/* Design Tokens */
+:root {
+  /* Accent */
+  --color-accent: #4F6EF7;
+  --color-accent-hover: #3D5CE5;
+  --color-accent-soft: #EEF0FF;
+
+  /* Backgrounds */
+  --color-bg-sidebar: #EBEDF0;
+  --color-bg-note-list: #FAFBFC;
+  --color-bg-editor: #FFFFFF;
+  --color-bg-toolbar: #FAFBFC;
+  --color-bg-hover: #F2F4F7;
+
+  /* Borders */
+  --color-border: #E5E7EB;
+
+  /* Text */
+  --color-text: #111827;
+  --color-text-secondary: #6B7280;
+  --color-text-muted: #9CA3AF;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08);
+
+  /* Radius */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+
+  /* Transitions */
+  --transition-fast: 150ms ease;
+  --transition-normal: 200ms ease;
+}
+
+::selection {
+  background: var(--color-accent);
+  color: #fff;
+}
+::-moz-selection {
+  background: var(--color-accent);
+  color: #fff;
+}
+::-webkit-selection {
+  background: var(--color-accent);
+  color: #fff;
+}
