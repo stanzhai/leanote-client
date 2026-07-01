@@ -49,7 +49,7 @@ var projectPath = __dirname;
 // 确保 leanote CLI 命令已安装
 (function ensureLeanoteCLI() {
     var home = require('os').homedir();
-    var sourcePath = NodePath.join(__dirname, '..', '..', 'bin', 'leanote.js');
+    var appRoot = require('@electron/remote').app.getAppPath();
 
     // 候选 bin 目录，按优先级选第一个可写的
     var candidates = [
@@ -70,19 +70,27 @@ var projectPath = __dirname;
         } catch (e) {}
     }
 
-    if (!binDir) return;
+    if (!binDir) {
+        console.log('[leanote] No writable bin directory found');
+        return;
+    }
 
     // 清理旧版本可能写到 /usr/local/bin 的残留文件
-    var legacyPath = '/usr/local/bin/leanote';
-    try { if (NodeFs.existsSync(legacyPath)) NodeFs.unlinkSync(legacyPath); } catch (e) {}
+    try { if (NodeFs.existsSync('/usr/local/bin/leanote')) NodeFs.unlinkSync('/usr/local/bin/leanote'); } catch (e) {}
 
     var wrapperPath = NodePath.join(binDir, 'leanote');
     var versionPath = NodePath.join(binDir, 'leanote.version');
 
-    // 检查已安装的版本，与当前版本相同则跳过
-    var appRoot = require('@electron/remote').app.getAppPath();
-    var pkg = JSON.parse(NodeFs.readFileSync(NodePath.join(appRoot, 'package.json'), 'utf-8'));
-    var currentVersion = pkg.version;
+    // 读当前版本号
+    var currentVersion;
+    try {
+        var pkg = JSON.parse(NodeFs.readFileSync(NodePath.join(appRoot, 'package.json'), 'utf-8'));
+        currentVersion = pkg.version;
+    } catch (e) {
+        currentVersion = '2.1.4';
+    }
+
+    // 版本相同则跳过
     try {
         if (NodeFs.existsSync(versionPath)) {
             var installedVersion = NodeFs.readFileSync(versionPath, 'utf-8').trim();
@@ -90,14 +98,30 @@ var projectPath = __dirname;
         }
     } catch (e) {}
 
+    // 查找 leanote.js 源文件（从 src/ 目录读取，确保打包后在 asar 内可访问）
+    var scriptContent = null;
+    var tryPaths = [
+        NodePath.join(__dirname, '..', 'leanote_cli.js')
+    ];
+    for (var j = 0; j < tryPaths.length; j++) {
+        try {
+            scriptContent = NodeFs.readFileSync(tryPaths[j], 'utf-8');
+            break;
+        } catch (e) {
+            console.log('[leanote] Not found at: ' + tryPaths[j]);
+        }
+    }
+
+    if (!scriptContent) {
+        console.log('[leanote] leanote.js not found in any path, skipping install');
+        return;
+    }
+
     try {
-        // 将 leanote.js 从打包目录复制到磁盘，解决打包后外部 node 无法读取 asar 内文件的问题
-        var scriptContent = NodeFs.readFileSync(sourcePath, 'utf-8');
         var scriptPath = NodePath.join(binDir, 'leanote.js');
         NodeFs.writeFileSync(scriptPath, scriptContent);
         NodeFs.chmodSync(scriptPath, '755');
 
-        // 创建 wrapper：优先用系统 node，没有则用 Electron 自带二进制
         var wrapper = '#!/bin/sh\n' +
             'NODE="node"\n' +
             'command -v node >/dev/null 2>&1 || NODE="' +
@@ -106,14 +130,13 @@ var projectPath = __dirname;
         NodeFs.writeFileSync(wrapperPath, wrapper);
         NodeFs.chmodSync(wrapperPath, '755');
 
-        // 记录已安装的版本号
         NodeFs.writeFileSync(versionPath, currentVersion);
         console.log('[leanote] CLI installed to ' + wrapperPath);
     } catch (err) {
-        console.log('[leanote] Auto-install failed:', err.message);
+        console.log('[leanote] Install failed:', err.message);
     }
 
-    // 将 bin 目录写入 shell rc 文件，确保终端可用
+    // 写入 shell rc 文件
     var shellRc = NodePath.join(home, '.zshrc');
     if (!NodeFs.existsSync(shellRc)) {
         shellRc = NodePath.join(home, '.bashrc');
@@ -125,7 +148,7 @@ var projectPath = __dirname;
     try {
         if (NodeFs.existsSync(shellRc)) {
             var rcContent = NodeFs.readFileSync(shellRc, 'utf-8');
-            if (rcContent.indexOf(pathLine) === -1) {
+            if (rcContent.indexOf(binDir) === -1) {
                 NodeFs.appendFileSync(shellRc, '\n' + pathLine + '  # leanote\n');
                 console.log('[leanote] Added PATH to ' + shellRc);
             }
