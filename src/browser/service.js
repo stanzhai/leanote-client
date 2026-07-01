@@ -159,3 +159,12 @@ var projectPath = __dirname;
         }
     } catch (e) {}
 })();
+
+// 启动本地 HTTP 服务，供 CLI 通过 API 调用（避免直接写文件不同步）
+(function startLocalServer() {
+    try {
+        require('./src/local_server').start(Service);
+    } catch (e) {
+        console.log('[leanote] Failed to start local server:', e.message);
+    }
+})();

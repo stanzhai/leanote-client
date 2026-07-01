@@ -6,6 +6,50 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const fs = require('fs');
+const http = require('http');
+
+// --- API client (tries HTTP against running app, falls back to file I/O) ---
+
+var API_URL = 'http://127.0.0.1:8912';
+var apiAvailable = null;
+
+function checkAPI() {
+    return new Promise(function (resolve) {
+        if (apiAvailable !== null) { resolve(apiAvailable); return; }
+        var req = http.get(API_URL + '/api/ping', { timeout: 500 }, function (res) {
+            apiAvailable = true;
+            req.destroy();
+            resolve(true);
+        });
+        req.on('error', function () { apiAvailable = false; resolve(false); });
+        req.on('timeout', function () { apiAvailable = false; req.destroy(); resolve(false); });
+    });
+}
+
+function callAPI(method, path, data) {
+    return new Promise(function (resolve, reject) {
+        var body = data ? JSON.stringify(data) : '';
+        var opts = {
+            hostname: '127.0.0.1',
+            port: 8912,
+            path: path,
+            method: method,
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 3000
+        };
+        var req = http.request(opts, function (res) {
+            var raw = '';
+            res.on('data', function (c) { raw += c; });
+            res.on('end', function () {
+                try { resolve(JSON.parse(raw)); } catch (e) { reject(new Error('Invalid response')); }
+            });
+        });
+        req.on('error', function (e) { reject(e); });
+        req.on('timeout', function () { req.destroy(); reject(new Error('Timeout')); });
+        req.write(body);
+        req.end();
+    });
+}
 
 // --- Helpers ---
 
@@ -736,6 +780,54 @@ function readStdin() {
     });
 }
 
+// --- API-aware wrappers: try HTTP first, fall back to file I/O ---
+
+async function addNote(opts) {
+    var apiOk = await checkAPI();
+    if (apiOk) {
+        try {
+            var res = await callAPI('POST', '/api/note/addNote', {
+                title: opts.title, content: opts.content, tags: opts.tags,
+                notebook: opts.notebook || undefined
+            });
+            if (res.success) {
+                var tagsStr = (opts.tags && opts.tags.length > 0) ? ' [' + opts.tags.join(', ') + ']' : '';
+                console.log('Added: "' + opts.title + '" -> ' + (opts.notebook || 'AI札') + tagsStr);
+                return;
+            }
+            console.error('API error:', res.error);
+            process.exit(1);
+        } catch (e) {
+            // Fall through to file I/O
+        }
+    }
+    cmdAddInternal(opts);
+}
+
+async function editNote(opts) {
+    if (opts._help) { printHelp('edit'); process.exit(0); }
+    var apiOk = await checkAPI();
+    if (apiOk) {
+        try {
+            var payload = { noteId: opts.noteId };
+            if (opts.title !== undefined) payload.title = opts.title;
+            if (opts.content !== undefined) payload.content = opts.content;
+            if (opts.tags !== undefined) payload.tags = opts.tags;
+            if (opts.notebook !== undefined) payload.notebook = opts.notebook;
+            var res = await callAPI('POST', '/api/note/updateNote', payload);
+            if (res.success) {
+                console.log('Updated: ' + (opts.noteId.substring(0, 8) + '...'));
+                return;
+            }
+            console.error('API error:', res.error);
+            process.exit(1);
+        } catch (e) {
+            // Fall through to file I/O
+        }
+    }
+    cmdEditInternal(opts);
+}
+
 // --- Main ---
 
 async function main() {
@@ -784,20 +876,21 @@ async function main() {
     }
 
     switch (cmd) {
-        case 'add':
+        case 'add': {
             if (pipedContent && !cmdArgs.some(function (a) { return a === '-c' || a === '--content'; })) {
-                // Use piped content when no explicit -c given
                 var addOpts = parseAddArgs(cmdArgs);
                 if (addOpts._help) { printHelp('add'); process.exit(0); }
                 addOpts.content = pipedContent;
                 addOpts._readStdin = false;
-                cmdAddInternal(addOpts);
+                await addNote(addOpts);
             } else {
                 var opts = parseAddArgs(cmdArgs);
                 if (opts._help) { printHelp('add'); process.exit(0); }
                 if (opts._readStdin) opts.content = pipedContent;
-                cmdAddInternal(opts);
+                await addNote(opts);
             }
+            break;
+        }
             break;
         case 'list':
             cmdList(cmdArgs);
@@ -808,16 +901,17 @@ async function main() {
         case 'search':
             cmdSearch(cmdArgs);
             break;
-        case 'edit':
+        case 'edit': {
             if (pipedContent) {
                 var editOpts = parseEditArgs(cmdArgs);
                 if (editOpts._help) { printHelp('edit'); process.exit(0); }
                 editOpts.content = pipedContent;
-                cmdEditInternal(editOpts);
+                await editNote(editOpts);
             } else {
-                cmdEdit(cmdArgs);
+                await editNote(parseEditArgs(cmdArgs));
             }
             break;
+        }
         default:
             console.error('Unknown command: ' + cmd);
             printGlobalHelp();
