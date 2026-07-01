@@ -80,7 +80,9 @@ var projectPath = __dirname;
     var versionPath = NodePath.join(binDir, 'leanote.version');
 
     // 检查已安装的版本，与当前版本相同则跳过
-    var currentVersion = require('../../package.json').version;
+    var appRoot = require('@electron/remote').app.getAppPath();
+    var pkg = JSON.parse(NodeFs.readFileSync(NodePath.join(appRoot, 'package.json'), 'utf-8'));
+    var currentVersion = pkg.version;
     try {
         if (NodeFs.existsSync(versionPath)) {
             var installedVersion = NodeFs.readFileSync(versionPath, 'utf-8').trim();
