@@ -49,7 +49,7 @@ var projectPath = __dirname;
 // 确保 leanote CLI 命令已安装
 (function ensureLeanoteCLI() {
     var home = require('os').homedir();
-    var source = NodePath.join(__dirname, '..', '..', 'bin', 'leanote.js');
+    var sourcePath = NodePath.join(__dirname, '..', '..', 'bin', 'leanote.js');
 
     // 候选 bin 目录，按优先级选第一个可写的
     var candidates = [
@@ -72,18 +72,25 @@ var projectPath = __dirname;
 
     if (!binDir) return;
 
-    var target = NodePath.join(binDir, 'leanote');
-    if (NodeFs.existsSync(target)) return;
+    var wrapperPath = NodePath.join(binDir, 'leanote');
+    if (NodeFs.existsSync(wrapperPath)) return;
 
     try {
+        // 将 leanote.js 从打包目录复制到磁盘，解决打包后外部 node 无法读取 asar 内文件的问题
+        var scriptContent = NodeFs.readFileSync(sourcePath, 'utf-8');
+        var scriptPath = NodePath.join(binDir, 'leanote.js');
+        NodeFs.writeFileSync(scriptPath, scriptContent);
+        NodeFs.chmodSync(scriptPath, '755');
+
+        // 创建 wrapper：优先用系统 node，没有则用 Electron 自带二进制
         var wrapper = '#!/bin/sh\n' +
             'NODE="node"\n' +
             'command -v node >/dev/null 2>&1 || NODE="' +
                 process.execPath.replace(/"/g, '\\"') + '"\n' +
-            'exec "$NODE" "' + source.replace(/"/g, '\\"') + '" "$@"\n';
-        NodeFs.writeFileSync(target, wrapper);
-        NodeFs.chmodSync(target, '755');
-        console.log('[leanote] CLI installed to ' + target);
+            'exec "$NODE" "' + scriptPath.replace(/"/g, '\\"') + '" "$@"\n';
+        NodeFs.writeFileSync(wrapperPath, wrapper);
+        NodeFs.chmodSync(wrapperPath, '755');
+        console.log('[leanote] CLI installed to ' + wrapperPath);
     } catch (err) {
         console.log('[leanote] Auto-install failed:', err.message);
     }
