@@ -98,14 +98,16 @@ var projectPath = __dirname;
         }
     } catch (e) {}
 
-    // 查找 leanote.js 源文件（从 src/ 目录读取，确保打包后在 asar 内可访问）
+    // 查找 leanote.js 源文件（asar 内路径 + 开发模式备选路径）
     var scriptContent = null;
     var tryPaths = [
+        NodePath.join(appRoot, 'src', 'leanote_cli.js'),
         NodePath.join(__dirname, '..', 'leanote_cli.js')
     ];
     for (var j = 0; j < tryPaths.length; j++) {
         try {
             scriptContent = NodeFs.readFileSync(tryPaths[j], 'utf-8');
+            console.log('[leanote] Found at: ' + tryPaths[j]);
             break;
         } catch (e) {
             console.log('[leanote] Not found at: ' + tryPaths[j]);
