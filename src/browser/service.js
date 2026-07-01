@@ -90,9 +90,11 @@ var projectPath = __dirname;
         currentVersion = '2.1.4';
     }
 
-    // 版本相同则跳过
+    // 如果 wrapper、脚本、版本文件都完整且版本匹配，跳过安装
     try {
-        if (NodeFs.existsSync(versionPath)) {
+        if (NodeFs.existsSync(wrapperPath) &&
+            NodeFs.existsSync(NodePath.join(binDir, 'leanote.js')) &&
+            NodeFs.existsSync(versionPath)) {
             var installedVersion = NodeFs.readFileSync(versionPath, 'utf-8').trim();
             if (installedVersion === currentVersion) return;
         }

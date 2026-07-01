@@ -23,6 +23,13 @@ function objectId() {
     return crypto.randomBytes(12).toString('hex');
 }
 
+function nedbId() {
+    return crypto.randomBytes(Math.ceil(Math.max(8, 16 * 2)))
+        .toString('base64')
+        .replace(/[+\/]/g, '')
+        .slice(0, 16);
+}
+
 function readNDB(filepath) {
     if (!fs.existsSync(filepath)) return [];
     const raw = fs.readFileSync(filepath, 'utf-8').trim();
@@ -130,9 +137,13 @@ function findNote(noteId) {
     return null;
 }
 
+function nedbDate(date) {
+    return { '$$date': date.getTime() };
+}
+
 function parseDate(d) {
     if (!d) return 0;
-    if (d && d.$$date) return d.$$date;
+    if (d && d['$$date']) return d['$$date'];
     var ts = new Date(d).getTime();
     return isNaN(ts) ? 0 : ts;
 }
@@ -180,6 +191,7 @@ function cmdAdd(args) {
     } else {
         notebookId = objectId();
         appendNDB(ctx.notebooksPath, {
+            _id: nedbId(),
             NotebookId: notebookId,
             Title: targetNotebook,
             Seq: -1,
@@ -192,11 +204,12 @@ function cmdAdd(args) {
 
     // Create note
     var noteId = objectId();
-    var now = new Date();
+    var now = nedbDate(new Date());
     var desc = opts.content.replace(/\n/g, ' ').replace(/#/g, '').substring(0, 50).trim();
     var abstract = opts.content.substring(0, 500);
 
     appendNDB(ctx.notesPath, {
+        _id: nedbId(),
         NoteId: noteId,
         UserId: ctx.userId,
         NotebookId: notebookId,
@@ -210,6 +223,7 @@ function cmdAdd(args) {
         IsTrash: false,
         IsDirty: true,
         LocalIsNew: true,
+        LocalIsDelete: false,
         IsBlog: false,
         CreatedTime: now,
         UpdatedTime: now
@@ -228,6 +242,7 @@ function cmdAdd(args) {
         }
         if (!found) {
             appendNDB(ctx.tagsPath, {
+                _id: nedbId(),
                 TagId: objectId(),
                 UserId: ctx.userId,
                 Tag: tagTitle,
@@ -400,7 +415,7 @@ function cmdEdit(args) {
                 n.Desc = fields.Content.replace(/\n/g, ' ').replace(/#/g, '').substring(0, 50).trim();
                 n.Abstract = fields.Content.substring(0, 500);
             }
-            n.UpdatedTime = new Date();
+            n.UpdatedTime = nedbDate(new Date());
             n.IsDirty = true;
             return n;
         }
@@ -413,6 +428,7 @@ function cmdEdit(args) {
 
     // Upsert tags if changed
     if (opts.tags) {
+        var now = nedbDate(new Date());
         var tags = readNDB(ctx.tagsPath);
         for (var ti = 0; ti < opts.tags.length; ti++) {
             var tagTitle = opts.tags[ti];
@@ -425,14 +441,15 @@ function cmdEdit(args) {
             }
             if (!tagFound) {
                 appendNDB(ctx.tagsPath, {
+                    _id: nedbId(),
                     TagId: objectId(),
                     UserId: ctx.userId,
                     Tag: tagTitle,
                     IsDirty: true,
                     Count: 1,
                     LocalIsDelete: false,
-                    CreatedTime: new Date(),
-                    UpdatedTime: new Date()
+                    CreatedTime: now,
+                    UpdatedTime: now
                 });
             }
         }
@@ -828,21 +845,24 @@ function cmdAddInternal(opts) {
     } else {
         notebookId = objectId();
         appendNDB(ctx.notebooksPath, {
+            _id: nedbId(),
             NotebookId: notebookId, Title: targetNotebook, Seq: -1,
             UserId: ctx.userId, ParentNotebookId: '', LocalIsNew: true, IsDirty: true
         });
     }
 
     var noteId = objectId();
-    var now = new Date();
+    var now = nedbDate(new Date());
     var desc = opts.content.replace(/\n/g, ' ').replace(/#/g, '').substring(0, 50).trim();
     var abstract = opts.content.substring(0, 500);
 
     appendNDB(ctx.notesPath, {
+        _id: nedbId(),
         NoteId: noteId, UserId: ctx.userId, NotebookId: notebookId,
         Title: opts.title, Content: opts.content, Desc: desc, ImgSrc: '',
         Tags: opts.tags, Abstract: abstract, IsMarkdown: true, IsTrash: false,
-        IsDirty: true, LocalIsNew: true, IsBlog: false, CreatedTime: now, UpdatedTime: now
+        IsDirty: true, LocalIsNew: true, LocalIsDelete: false, IsBlog: false,
+        CreatedTime: now, UpdatedTime: now
     });
 
     var tags = readNDB(ctx.tagsPath);
@@ -854,6 +874,7 @@ function cmdAddInternal(opts) {
         }
         if (!found) {
             appendNDB(ctx.tagsPath, {
+                _id: nedbId(),
                 TagId: objectId(), UserId: ctx.userId, Tag: tagTitle,
                 IsDirty: true, Count: 1, LocalIsDelete: false, CreatedTime: now, UpdatedTime: now
             });
@@ -900,13 +921,14 @@ function cmdEditInternal(opts) {
                 n.Desc = fields.Content.replace(/\n/g, ' ').replace(/#/g, '').substring(0, 50).trim();
                 n.Abstract = fields.Content.substring(0, 500);
             }
-            n.UpdatedTime = new Date();
+            n.UpdatedTime = nedbDate(new Date());
             n.IsDirty = true;
             return n;
         }
     );
     if (!found) { console.error('Error: Note "' + opts.noteId + '" not found.'); process.exit(1); }
     if (opts.tags) {
+        var now2 = nedbDate(new Date());
         var tags = readNDB(ctx.tagsPath);
         for (var ti = 0; ti < opts.tags.length; ti++) {
             var tagTitle = opts.tags[ti], tagFound = false;
@@ -914,7 +936,7 @@ function cmdEditInternal(opts) {
                 if (tags[tj].UserId === ctx.userId && tags[tj].Tag === tagTitle) { tagFound = true; break; }
             }
             if (!tagFound) {
-                appendNDB(ctx.tagsPath, { TagId: objectId(), UserId: ctx.userId, Tag: tagTitle, IsDirty: true, Count: 1, LocalIsDelete: false, CreatedTime: new Date(), UpdatedTime: new Date() });
+                appendNDB(ctx.tagsPath, { _id: nedbId(), TagId: objectId(), UserId: ctx.userId, Tag: tagTitle, IsDirty: true, Count: 1, LocalIsDelete: false, CreatedTime: now2, UpdatedTime: now2 });
             }
         }
     }
