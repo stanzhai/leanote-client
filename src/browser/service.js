@@ -72,8 +72,21 @@ var projectPath = __dirname;
 
     if (!binDir) return;
 
+    // 清理旧版本可能写到 /usr/local/bin 的残留文件
+    var legacyPath = '/usr/local/bin/leanote';
+    try { if (NodeFs.existsSync(legacyPath)) NodeFs.unlinkSync(legacyPath); } catch (e) {}
+
     var wrapperPath = NodePath.join(binDir, 'leanote');
-    if (NodeFs.existsSync(wrapperPath)) return;
+    var versionPath = NodePath.join(binDir, 'leanote.version');
+
+    // 检查已安装的版本，与当前版本相同则跳过
+    var currentVersion = require('../../package.json').version;
+    try {
+        if (NodeFs.existsSync(versionPath)) {
+            var installedVersion = NodeFs.readFileSync(versionPath, 'utf-8').trim();
+            if (installedVersion === currentVersion) return;
+        }
+    } catch (e) {}
 
     try {
         // 将 leanote.js 从打包目录复制到磁盘，解决打包后外部 node 无法读取 asar 内文件的问题
@@ -90,6 +103,9 @@ var projectPath = __dirname;
             'exec "$NODE" "' + scriptPath.replace(/"/g, '\\"') + '" "$@"\n';
         NodeFs.writeFileSync(wrapperPath, wrapper);
         NodeFs.chmodSync(wrapperPath, '755');
+
+        // 记录已安装的版本号
+        NodeFs.writeFileSync(versionPath, currentVersion);
         console.log('[leanote] CLI installed to ' + wrapperPath);
     } catch (err) {
         console.log('[leanote] Auto-install failed:', err.message);
