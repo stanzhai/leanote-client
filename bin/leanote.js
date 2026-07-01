@@ -749,7 +749,7 @@ async function main() {
 
     // Global --help / -h (before subcommand dispatch)
     if (argv.indexOf('--help') !== -1 || argv.indexOf('-h') !== -1) {
-        if (cmd !== 'add') {
+        if (cmdIndex >= 0) {
             printHelp(cmd);
         } else {
             printGlobalHelp();
