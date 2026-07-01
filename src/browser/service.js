@@ -48,18 +48,34 @@ var projectPath = __dirname;
 
 // 确保 leanote CLI 命令已安装
 (function ensureLeanoteCLI() {
-    var binDir = '/usr/local/bin';
-    var target = NodePath.join(binDir, 'leanote');
+    var home = require('os').homedir();
     var source = NodePath.join(__dirname, '..', '..', 'bin', 'leanote.js');
 
-    // 已存在则跳过
+    // 候选 bin 目录，按优先级选第一个可写的
+    var candidates = [
+        NodePath.join(home, 'bin'),
+        NodePath.join(home, '.local', 'bin'),
+        NodePath.join(require('@electron/remote').app.getPath('userData'), 'bin')
+    ];
+
+    var binDir = null;
+    for (var i = 0; i < candidates.length; i++) {
+        if (!NodeFs.existsSync(candidates[i])) {
+            try { NodeFs.mkdirSync(candidates[i], { recursive: true }); } catch (e) { continue; }
+        }
+        try {
+            NodeFs.accessSync(candidates[i], NodeFs.constants.W_OK);
+            binDir = candidates[i];
+            break;
+        } catch (e) {}
+    }
+
+    if (!binDir) return;
+
+    var target = NodePath.join(binDir, 'leanote');
     if (NodeFs.existsSync(target)) return;
 
-    // 检查 /usr/local/bin 是否可写
-    try { NodeFs.accessSync(binDir, NodeFs.constants.W_OK); } catch (e) { return; }
-
     try {
-        // 用 Electron 自带的 Node 作为后备，不依赖用户系统是否装了 node
         var wrapper = '#!/bin/sh\n' +
             'NODE="node"\n' +
             'command -v node >/dev/null 2>&1 || NODE="' +
@@ -67,8 +83,27 @@ var projectPath = __dirname;
             'exec "$NODE" "' + source.replace(/"/g, '\\"') + '" "$@"\n';
         NodeFs.writeFileSync(target, wrapper);
         NodeFs.chmodSync(target, '755');
-        console.log('[leanote] CLI installed: leanote');
+        console.log('[leanote] CLI installed to ' + target);
     } catch (err) {
         console.log('[leanote] Auto-install failed:', err.message);
     }
+
+    // 将 bin 目录写入 shell rc 文件，确保终端可用
+    var shellRc = NodePath.join(home, '.zshrc');
+    if (!NodeFs.existsSync(shellRc)) {
+        shellRc = NodePath.join(home, '.bashrc');
+        if (!NodeFs.existsSync(shellRc)) {
+            shellRc = NodePath.join(home, '.bash_profile');
+        }
+    }
+    var pathLine = 'export PATH="$PATH:' + binDir + '"';
+    try {
+        if (NodeFs.existsSync(shellRc)) {
+            var rcContent = NodeFs.readFileSync(shellRc, 'utf-8');
+            if (rcContent.indexOf(pathLine) === -1) {
+                NodeFs.appendFileSync(shellRc, '\n' + pathLine + '  # leanote\n');
+                console.log('[leanote] Added PATH to ' + shellRc);
+            }
+        }
+    } catch (e) {}
 })();
