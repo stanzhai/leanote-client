@@ -45,3 +45,30 @@ Service.dispatch = function() {};
 var gui = require('./src/gui');
 
 var projectPath = __dirname;
+
+// 确保 leanote CLI 命令已安装
+(function ensureLeanoteCLI() {
+    var binDir = '/usr/local/bin';
+    var target = NodePath.join(binDir, 'leanote');
+    var source = NodePath.join(__dirname, '..', '..', 'bin', 'leanote.js');
+
+    // 已存在则跳过
+    if (NodeFs.existsSync(target)) return;
+
+    // 检查 /usr/local/bin 是否可写
+    try { NodeFs.accessSync(binDir, NodeFs.constants.W_OK); } catch (e) { return; }
+
+    try {
+        // 用 Electron 自带的 Node 作为后备，不依赖用户系统是否装了 node
+        var wrapper = '#!/bin/sh\n' +
+            'NODE="node"\n' +
+            'command -v node >/dev/null 2>&1 || NODE="' +
+                process.execPath.replace(/"/g, '\\"') + '"\n' +
+            'exec "$NODE" "' + source.replace(/"/g, '\\"') + '" "$@"\n';
+        NodeFs.writeFileSync(target, wrapper);
+        NodeFs.chmodSync(target, '755');
+        console.log('[leanote] CLI installed: leanote');
+    } catch (err) {
+        console.log('[leanote] Auto-install failed:', err.message);
+    }
+})();
