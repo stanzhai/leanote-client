@@ -206,10 +206,29 @@ function getNotebookTitle(notebookId) {
 function loadNotes(filter) {
   var ctx = getContext();
   var notes = readNDB(ctx.notesPath);
-  return notes
-    .filter(function (n) {
-      return n.IsTrash !== true && n.LocalIsDelete !== true;
-    })
+  // Deduplicate by NoteId: if any copy has a deletion flag, discard the note entirely.
+  // Otherwise keep the most recent copy (highest UpdatedTime).
+  var byId = {};
+  notes.forEach(function (n) {
+    var deleted = n.IsTrash === true || n.LocalIsDelete === true || n.IsDeleted === true;
+    var existing = byId[n.NoteId];
+    if (!existing) {
+      byId[n.NoteId] = { note: n, deleted: deleted };
+      return;
+    }
+    existing.deleted = existing.deleted || deleted;
+    if (!existing.deleted && !deleted) {
+      var t1 = parseDate(existing.note.UpdatedTime);
+      var t2 = parseDate(n.UpdatedTime);
+      if (t2 > t1) existing.note = n;
+    }
+  });
+  var deduped = [];
+  for (var k in byId) {
+    if (byId[k].deleted) continue;
+    deduped.push(byId[k].note);
+  }
+  return deduped
     .filter(
       filter ||
         function () {
@@ -230,7 +249,8 @@ function findNote(noteId) {
     if (
       notes[i].NoteId === noteId &&
       notes[i].IsTrash !== true &&
-      notes[i].LocalIsDelete !== true
+      notes[i].LocalIsDelete !== true &&
+      notes[i].IsDeleted !== true
     ) {
       return notes[i];
     }
@@ -450,9 +470,8 @@ function cmdList(args) {
     if (title.length > maxTitle)
       title = title.substring(0, maxTitle - 3) + "...";
 
-    var idShort = n.NoteId.substring(0, 8);
-    console.log(idShort + "  " + formatTime(n.UpdatedTime) + "  " + title);
-    console.log("       " + notebook + tags);
+    console.log(n.NoteId + "  " + formatTime(n.UpdatedTime) + "  " + title);
+    console.log("                         " + notebook + tags);
 
     // Show first line of content as preview when verbose
     if (opts.verbose) {
@@ -561,7 +580,7 @@ function cmdEdit(args) {
     ctx.notesPath,
     function (n) {
       if (n.NoteId === opts.noteId || n.NoteId.indexOf(opts.noteId) === 0) {
-        if (n.IsTrash !== true && n.LocalIsDelete !== true) {
+        if (n.IsTrash !== true && n.LocalIsDelete !== true && n.IsDeleted !== true) {
           return true;
         }
       }
@@ -673,8 +692,7 @@ function cmdSearch(args) {
     var title = n.Title || "(untitled)";
 
     // Highlight matching keyword
-    var idShort = n.NoteId.substring(0, 8);
-    console.log(idShort + "  " + formatTime(n.UpdatedTime) + "  " + title);
+    console.log(n.NoteId + "  " + formatTime(n.UpdatedTime) + "  " + title);
 
     // Show content excerpt with keyword context
     var content = n.Content || "";
@@ -1261,7 +1279,7 @@ function cmdEditInternal(opts) {
     ctx.notesPath,
     function (n) {
       if (n.NoteId === opts.noteId || n.NoteId.indexOf(opts.noteId) === 0) {
-        if (n.IsTrash !== true && n.LocalIsDelete !== true) return true;
+        if (n.IsTrash !== true && n.LocalIsDelete !== true && n.IsDeleted !== true) return true;
       }
       return false;
     },
