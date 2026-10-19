@@ -1,6 +1,6 @@
-//! leanote CLI — offline minimal surface, byte-compatible with bin/leanote.js.
-//! Modes implemented in this ticket: add (incl. stdin), list, show.
-//! (search/edit/HTTP mode come with later tickets.)
+//! leanote CLI — full surface, byte-compatible with bin/leanote.js:
+//! add/list/show/search/edit (all stdin-aware), dual-mode HTTP probe,
+//! first-run shim switch.
 
 mod cli;
 
