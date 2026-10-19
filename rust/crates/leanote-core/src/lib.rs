@@ -365,10 +365,10 @@ impl Store {
         stmt.query_row([id.to_string()], row_to_note).optional()
     }
 
-    /// JS local_server findNoteByPrefix: exact id first (any state), else
-    /// prefix matches in insertion order, first non-trash/non-deleted wins.
+    /// JS leanote_data findNote+resolveNote: exact id first (non-trash
+    /// only), else prefix matches in insertion order, first live one wins.
     pub fn find_note_by_prefix(&self, prefix: &str) -> rusqlite::Result<Option<Note>> {
-        if let Some(n) = self.get_note_any(&Id(prefix.to_string()))? {
+        if let Some(n) = self.get_note(&Id(prefix.to_string()))? {
             return Ok(Some(n));
         }
         let mut stmt = self.conn.prepare(
@@ -384,6 +384,48 @@ impl Store {
             }
         }
         Ok(None)
+    }
+
+    /// JS deleteNote (leanote_data.js): trash + local-delete flags, never a
+    /// hard delete, dirty so sync pushes it.
+    pub fn trash_note(&self, id: &Id) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE notes SET IsTrash=1, LocalIsDelete=1, IsDirty=1, UpdatedTime=?2 WHERE NoteId=?1",
+            params![id.to_string(), now_ms()],
+        )
+    }
+
+    /// Live notebook by exact title for this user (MCP list/update filters).
+    pub fn find_notebook_by_title(&self, title: &str) -> rusqlite::Result<Option<Notebook>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT NotebookId, UserId, Title, ParentNotebookId, Seq, LocalIsNew, IsDirty, LocalIsDelete
+             FROM notebooks WHERE UserId=?1 AND Title=?2 AND LocalIsDelete=0 ORDER BY rowid",
+        )?;
+        stmt.query_row(
+            params![self.user_id, title],
+            |r| {
+                Ok(Notebook {
+                    notebook_id: Id(r.get(0)?),
+                    user_id: r.get(1)?,
+                    title: r.get(2)?,
+                    parent_notebook_id: r.get(3)?,
+                    seq: r.get(4)?,
+                    is_new: r.get::<_, i64>(5)? != 0,
+                    is_dirty: r.get::<_, i64>(6)? != 0,
+                    is_deleted: r.get::<_, i64>(7)? != 0,
+                })
+            },
+        )
+        .optional()
+    }
+
+    /// MCP update_note "notebook" move (JS updateNoteFields): the /api
+    /// updateNote path intentionally ignores notebook moves, MCP honors them.
+    pub fn set_notebook(&self, id: &Id, notebook_id: &Id) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE notes SET NotebookId=?2, IsDirty=1, UpdatedTime=?3 WHERE NoteId=?1",
+            params![id.to_string(), notebook_id.to_string(), now_ms()],
+        )
     }
 
     /// Unified search (spec §30): case-insensitive substring over
