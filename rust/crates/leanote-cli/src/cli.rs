@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 
 pub fn run(argv: Vec<String>) -> i32 {
     // JS: first arg that is a known subcommand wins; default "add".
-    const SUBCOMMANDS: [&str; 6] = ["add", "list", "show", "search", "edit", "help"];
+    const SUBCOMMANDS: [&str; 7] = ["add", "list", "show", "search", "edit", "sync", "help"];
     let mut cmd = "add";
     let mut cmd_index: Option<usize> = None;
     for (i, a) in argv.iter().enumerate() {
@@ -39,13 +39,18 @@ pub fn run(argv: Vec<String>) -> i32 {
         None => argv.clone(),
     };
 
+    // sync takes no stdin; skip the piped read to avoid blocking on a tty-less
+    // pipe that never closes (tests pipe nothing, but be safe)
+    if cmd == "sync" {
+        return cmd_sync(&cmd_args);
+    }
+
     // Read stdin when piped (JS: !process.stdin.isTTY).
     let piped = if !atty_stdin() {
         read_stdin()
     } else {
         String::new()
     };
-
     match cmd {
         "add" => cmd_add(&cmd_args, &piped),
         "list" => cmd_list(&cmd_args),
@@ -54,10 +59,7 @@ pub fn run(argv: Vec<String>) -> i32 {
             eprintln!("Error: search is not implemented yet");
             1
         }
-        "edit" => {
-            eprintln!("Error: edit is not implemented yet");
-            1
-        }
+        "sync" => cmd_sync(&cmd_args),
         _ => {
             eprintln!("Unknown command: {}", cmd);
             print_global_help();
@@ -208,7 +210,81 @@ fn open_store() -> Result<Store, String> {
     Store::open(std::path::PathBuf::from(dir), "user1".to_string()).map_err(|e| e.to_string())
 }
 
-// --- list ---
+// --- sync ---
+
+/// `leanote sync --host <url> --email <e> --password <p>`: login + full sync.
+/// Bad credentials exit 1 with the server's own Msg (e.g. WrongPassword).
+fn cmd_sync(args: &[String]) -> i32 {
+    let mut host = String::new();
+    let mut email = String::new();
+    let mut password = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" if i + 1 < args.len() => {
+                host = args[i + 1].clone();
+                i += 2;
+            }
+            "--email" if i + 1 < args.len() => {
+                email = args[i + 1].clone();
+                i += 2;
+            }
+            "--password" if i + 1 < args.len() => {
+                password = args[i + 1].clone();
+                i += 2;
+            }
+            _ => {
+                eprintln!("Error: unknown sync argument: {}", args[i]);
+                return 1;
+            }
+        }
+    }
+    if host.is_empty() || email.is_empty() || password.is_empty() {
+        eprintln!("Error: sync requires --host, --email and --password");
+        return 1;
+    }
+    let store = match open_store() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return 1;
+        }
+    };
+    let account = match leanote_core::sync::Api::login(&host, &email, &password, &store) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return 1;
+        }
+    };
+    println!("Logged in as {} <{}>", account.username, account.email);
+    match leanote_core::sync::full_sync(
+        &leanote_core::sync::Api::for_account(&account),
+        &store,
+        &PrintProgress,
+    ) {
+        Ok(stats) => {
+            println!(
+                "Synced {} notebooks, {} notes, {} tags; {} contents fetched; LastSyncUsn={}",
+                stats.notebooks, stats.notes, stats.tags, stats.contents,
+                store.last_sync_usn().unwrap_or(-1)
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            1
+        }
+    }
+}
+
+struct PrintProgress;
+
+impl leanote_core::sync::SyncProgress for PrintProgress {
+    fn note(&self, msg: String) {
+        println!("{msg}");
+    }
+}
 
 struct ListOpts {
     notebook: String,

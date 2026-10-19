@@ -8,6 +8,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
+pub mod sync;
+
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// 24-hex-char id, same shape as the JS `objectId()` (12 random bytes hex).
@@ -143,8 +145,8 @@ pub fn app_data_dir() -> PathBuf {
 }
 
 pub struct Store {
-    conn: Connection,
-    user_id: String,
+    pub(crate) conn: Connection,
+    pub(crate) user_id: String,
 }
 
 impl Store {
@@ -167,6 +169,11 @@ impl Store {
 
     pub fn user_id(&self) -> &str {
         &self.user_id
+    }
+
+    /// Raw scalar query for tests/tools that count rows directly.
+    pub fn raw_query_row(&self, sql: &str) -> rusqlite::Result<i64> {
+        self.conn.query_row(sql, [], |r| r.get(0))
     }
 
     /// All writes go through transactions — a kill mid-write leaves the
@@ -323,8 +330,7 @@ pub struct NewNote {
     pub is_markdown: bool,
 }
 
-/// JS: content.replace(/\n/g," ").replace(/#/g,"").substring(0,50).trim()
-fn plain_desc(content: &str) -> String {
+pub(crate) fn plain_desc(content: &str) -> String {
     content
         .replace('\n', " ")
         .replace('#', "")
@@ -437,6 +443,8 @@ CREATE TABLE IF NOT EXISTS notebooks (
     LocalIsNew INTEGER NOT NULL DEFAULT 0,
     IsDirty INTEGER NOT NULL DEFAULT 0,
     LocalIsDelete INTEGER NOT NULL DEFAULT 0,
+    CreatedTime INTEGER NOT NULL DEFAULT 0,
+    UpdatedTime INTEGER NOT NULL DEFAULT 0,
     ServerNotebookId TEXT DEFAULT NULL
 );
 CREATE TABLE IF NOT EXISTS notes (
@@ -469,6 +477,7 @@ CREATE TABLE IF NOT EXISTS tags (
     IsDirty INTEGER NOT NULL DEFAULT 0,
     Count INTEGER NOT NULL DEFAULT 0,
     LocalIsDelete INTEGER NOT NULL DEFAULT 0,
+    Usn INTEGER NOT NULL DEFAULT 0,
     CreatedTime INTEGER NOT NULL DEFAULT 0,
     UpdatedTime INTEGER NOT NULL DEFAULT 0,
     UNIQUE(UserId, Tag)
@@ -479,6 +488,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     Username TEXT NOT NULL DEFAULT '',
     Host TEXT NOT NULL DEFAULT '',
     Token TEXT NOT NULL DEFAULT '',
+    LastSyncUsn INTEGER NOT NULL DEFAULT -1,
     IsActive INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(UpdatedTime DESC);
