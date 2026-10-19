@@ -96,11 +96,10 @@ pub async fn api_fallback(
 
 /// JS transports{} + transportLastUsed{} semantics, including the
 /// `Object.keys(transports).length >= TRANSPORT_MAX` cap check and the
-/// 5-minute TTL reaper. `order` mirrors JS object key insertion order.
+/// 5-minute TTL reaper.
 #[derive(Default)]
 pub struct SessionBook {
     sessions: HashMap<String, u64>,
-    order: Vec<String>,
 }
 
 impl SessionBook {
@@ -116,7 +115,6 @@ impl SessionBook {
     pub fn create(&mut self) -> String {
         let sid = uuid();
         self.sessions.insert(sid.clone(), Self::now());
-        self.order.push(sid.clone());
         sid
     }
 
@@ -129,7 +127,6 @@ impl SessionBook {
     /// JS transport.onclose: delete both maps.
     pub fn remove(&mut self, sid: &str) {
         self.sessions.remove(sid);
-        self.order.retain(|s| s != sid);
     }
 
     pub fn contains(&self, sid: &str) -> bool {
@@ -166,7 +163,6 @@ impl SessionBook {
     // -- test hooks --
     pub fn insert_with_last_used(&mut self, sid: &str, last_used: u64) {
         self.sessions.insert(sid.to_string(), last_used);
-        self.order.push(sid.to_string());
     }
     pub fn last_used(&self, sid: &str) -> Option<u64> {
         self.sessions.get(sid).copied()

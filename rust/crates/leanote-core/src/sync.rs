@@ -53,7 +53,7 @@ impl Api {
         let api = Api::new(host, "");
         let ret = api.post_form(
             "auth/login",
-            &[("macAddr", "rust".to_string()), ("v", version().to_string())],
+            &[("macAddr", mac_addr()), ("v", client_version())],
             &[("email", email), ("pwd", pwd)],
         )?;
         if ret.get("Ok") != Some(&Value::Bool(true)) {
@@ -81,6 +81,16 @@ impl Api {
     /// Authenticated client from a stored account.
     pub fn for_account(account: &Account) -> Self {
         Api::new(&account.host, &account.token)
+    }
+
+    /// POST auth/logout (src/api.js `logout`): errors are ignored, the JS
+    /// callback fires regardless — mirror that by swallowing the Result.
+    pub fn logout(&self) {
+        let _ = self.post_form(
+            "auth/logout",
+            &[("macAddr", mac_addr()), ("v", client_version())],
+            &[],
+        );
     }
 
     fn new(host: &str, token: &str) -> Self {
@@ -138,7 +148,7 @@ impl Api {
     /// GET user/getSyncState → LastSyncUsn.
     pub fn get_sync_state(&self) -> Result<i64, SyncError> {
         let v = Self::ok_or_api(
-            self.get("user/getSyncState", &[("macAddr", "rust".to_string())])?,
+            self.get("user/getSyncState", &[("macAddr", mac_addr()), ("v", client_version())])?
         )?;
         Ok(v.get("LastSyncUsn").and_then(Value::as_i64).unwrap_or(0))
     }
@@ -336,8 +346,56 @@ fn default_agent() -> Agent {
         .new_agent()
 }
 
-fn version() -> &'static str {
-    concat!(env!("CARGO_PKG_VERSION"), "_rust")
+/// `src/api.js`: `os.platform() + '_' + os.arch()` (e.g. `darwin_arm64`).
+/// The JS client also appends `_data/version` when present; the server only
+/// logs the string, so the platform pair is the contract that matters.
+pub fn client_version() -> String {
+    format!("{}_{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// `src/api.js` uses `node-getmac`, which takes the first `ether <mac>` line
+/// of `ifconfig -a`. getifaddrs enumerates interfaces in the same order, so
+/// the first AF_LINK/AF_PACKET sockaddr with 6 address bytes is the same MAC
+/// (lowercase, colon-separated). `00:00:00:00:00:00` fallback (the server
+/// only logs this field).
+pub fn mac_addr() -> String {
+    const FALLBACK: &str = "00:00:00:00:00:00";
+    // SAFETY: getifaddrs returns a NULL-terminated list owned by the caller;
+    // we only read it and hand it back to freeifaddrs.
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return FALLBACK.to_string();
+        }
+        let mut mac = String::new();
+        let mut cur = ifap;
+        while !cur.is_null() && mac.is_empty() {
+            let ifa = &*cur;
+            cur = ifa.ifa_next;
+            if ifa.ifa_addr.is_null() {
+                continue;
+            }
+            let family = (*ifa.ifa_addr).sa_family as i32;
+            #[cfg(target_os = "macos")]
+            let bytes = (family == libc::AF_LINK).then(|| {
+                let sdl = &*(ifa.ifa_addr as *const libc::sockaddr_dl);
+                let (nlen, alen) = (sdl.sdl_nlen as usize, sdl.sdl_alen as usize);
+                (alen >= 6)
+                    .then(|| sdl.sdl_data[nlen..nlen + 6].iter().map(|&b| b as u8).collect::<Vec<_>>())
+            });
+            #[cfg(target_os = "linux")]
+            let bytes = (family == libc::AF_PACKET).then(|| {
+                let sll = &*(ifa.ifa_addr as *const libc::sockaddr_ll);
+                (sll.sll_halen as usize >= 6).then(|| sll.sll_addr[..6].to_vec())
+            });
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            let bytes: Option<Vec<u8>> = None;
+            let Some(b) = bytes.flatten() else { continue };
+            mac = b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(":");
+        }
+        libc::freeifaddrs(ifap);
+        if mac.is_empty() { FALLBACK.to_string() } else { mac }
+    }
 }
 
 /// Only the values we emit need escaping (token, email, ids, numbers).
@@ -1101,6 +1159,12 @@ impl Store {
                 },
             )
             .optional()
+    }
+
+    /// JS logout: `db.users.update({_id}, {IsActive: false})` — token dropped
+    /// client-side, rows kept for re-login.
+    pub fn deactivate_account(&self) -> rusqlite::Result<usize> {
+        self.conn.execute("UPDATE accounts SET IsActive=0 WHERE IsActive=1", [])
     }
 
     // -- incr sync (JS Sync.incrSync/sendChanges/_syncNoteToLocal) --

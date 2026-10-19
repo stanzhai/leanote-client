@@ -6,6 +6,7 @@
 //! | Method+Path                        | Query (from `Api.getUrl`)                | Body                       | Response parsed by JS                                           |
 //! |------------------------------------|------------------------------------------|----------------------------|-----------------------------------------------------------------|
 //! | POST `/api/auth/login`             | `token, macAddr, v`                      | form: `email`, `pwd`        | ok: `{Ok:true, UserId, Email, Username, Token}`; bad pwd: `{Ok:false, Msg:"WrongPassword"}` |
+//! | POST `/api/auth/logout`             | `token, macAddr, v`                      | –                          | `{Ok:true}` (`src/api.js` ignores errors; calls back regardless) |
 //! | GET  `/api/user/getSyncState`      | `token, macAddr, v`                      | –                          | `{Ok:true, LastSyncUsn}` (`sync.js` compares `LastSyncUsn > lastSyncUsn`) |
 //! | GET  `/api/notebook/getSyncNotebooks` | `token, afterUsn, maxEntry`           | –                          | JSON array of notebook rows; must be top-level array (`Common.isOk`: array if `'length' in ret`); last chunk has `len < maxEntry`; `sync.js` uses `Usn` (advance cursor), `NotebookId`, `Title`, `Seq`, `ParentNotebookId`, `IsDeleted`, `IsDirty`, `CreatedTime`, `UpdatedTime` |
 //! | GET  `/api/note/getSyncNotes`      | `token, afterUsn, maxEntry`              | –                          | JSON array of note rows; `sync.js` uses `Usn`, `NoteId`, `Title`, `NotebookId`, `IsDeleted`, `IsTrash`, `IsMarkdown`, `Tags`, `Files`, `CreatedTime`, `UpdatedTime`; content arrives via `getNoteContent` |
@@ -73,6 +74,8 @@ struct Inner {
     token: Option<String>,
     /// Next USN handed to push responses (>= max dataset USN).
     next_usn: i64,
+    /// `macAddr` + `v` received on the last `auth/login`, for wire-parity asserts.
+    login_query: (String, String),
 }
 
 /// Programmable state shared between test code and the server task.
@@ -150,6 +153,11 @@ impl FakeServer {
     pub fn clear_pushes(&self) {
         self.inner.lock().unwrap().pushes.clear();
     }
+
+    /// `(macAddr, v)` from the last login request.
+    pub fn login_query(&self) -> (String, String) {
+        self.inner.lock().unwrap().login_query.clone()
+    }
 }
 
 /// Login credentials the fake server accepts.
@@ -165,6 +173,7 @@ pub async fn start() -> FakeServer {
     let inner = Arc::new(Mutex::new(Inner::default()));
     let app = Router::new()
         .route("/api/auth/login", post(login))
+        .route("/api/auth/logout", post(logout))
         .route("/api/user/getSyncState", get(get_sync_state))
         .route("/api/notebook/getSyncNotebooks", get(get_sync_notebooks))
         .route("/api/note/getSyncNotes", get(get_sync_notes))
@@ -256,9 +265,10 @@ fn require_token(query: &Map<String, Value>, inner: &Inner) -> Option<Response> 
 
 async fn login(
     State(inner): State<Arc<Mutex<Inner>>>,
-    _query: Query<Map<String, Value>>,
+    query: Query<Map<String, Value>>,
     body: Bytes,
 ) -> Response {
+    let qs = query.0;
     let fields = parse_fields(&body_to_string(&body));
     let email_ok = fields.get("email").and_then(|v| v.as_str()) == Some(EMAIL);
     let pwd_ok = fields.get("pwd").and_then(|v| v.as_str()) == Some(PWD);
@@ -267,6 +277,10 @@ async fn login(
     }
     let mut inner = inner.lock().unwrap();
     inner.token = Some(TOKEN.to_string());
+    inner.login_query = (
+        qs.get("macAddr").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        qs.get("v").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+    );
     // next push USN is max(dataset usn)+1; login itself does not consume one
     inner.next_usn = inner.next_usn.max(inner.sync_usn) + 1;
     inner.sync_usn = inner.sync_usn.max(inner.next_usn - 1);
@@ -277,6 +291,13 @@ async fn login(
         "Username": "user1",
         "Token": TOKEN,
     }))
+}
+
+/// `auth/logout`: the real endpoint always answers `Ok` (src/api.js ignores
+/// the body); the fake keeps the token valid so subsequent sync tests can
+/// keep using it.
+async fn logout() -> Response {
+    json_response(json!({"Ok": true}))
 }
 
 async fn get_sync_state(
@@ -439,13 +460,6 @@ fn push(
                     row_ids.0 = n.to_string();
                 }
             }
-            let usn = fields
-                .get("usn")
-                .or_else(|| fields.get("Usn"))
-                .and_then(|v| v.as_i64());
-            // ponytail: usn echoed from client unused; conflict-by-stale-usn
-            // injection is handled by inject_response, add if ticket 04 needs it
-
             if let Some(injected) = inner.conflicts.pop_front() {
                 inner.pushes.push(RecordedPush {
                     endpoint: endpoint.to_string(),
@@ -505,7 +519,6 @@ fn push(
             });
             inner.next_usn = next_usn + 1;
             inner.sync_usn = inner.sync_usn.max(next_usn);
-            let _ = (usn, &row_ids);
             json_response(response)
         })
     }

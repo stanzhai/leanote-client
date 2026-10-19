@@ -224,10 +224,10 @@ fn main() {
         let lang = i18n::system_lang();
 
         // Already signed in? → straight to shell (startup incr-sync is 04's).
-        let signed_in = leanote_core::Store::open(dir.clone(), "user1".into())
+        let signed_in_account = leanote_core::Store::open(dir.clone(), "user1".into())
             .ok()
-            .and_then(|s| s.active_account().ok().flatten())
-            .is_some();
+            .and_then(|s| s.active_account().ok().flatten());
+        let signed_in = signed_in_account.is_some();
 
         let displays: Vec<gpui_kit::Bounds<gpui_kit::Pixels>> =
             cx.displays().iter().map(|d| d.visible_bounds()).collect();
@@ -277,6 +277,7 @@ fn main() {
                     dir_for_window.clone(),
                     lang,
                     signed_in,
+                    signed_in_account.map(|a| a.user_id),
                     fake_for_window
                         .as_ref()
                         .map(|(h, e, p)| (h.as_str(), e.as_str(), p.as_str())),
@@ -288,6 +289,15 @@ fn main() {
         single_instance::listen(listener, cx);
         // Ticket 16: tray icon + 显示/退出 menu (left-click → show).
         tray::init(cx);
+
+        // Review item 2: returning user → background incr sync (non-blocking).
+        if signed_in {
+            let shell_boot = shell.clone();
+            cx.spawn(async move |cx| {
+                let _ = shell_boot.update(cx, |s, cx| s.sync_now(cx));
+            })
+            .detach();
+        }
 
         // Demo helper: auto-submit the fake login for screenshots.
         if std::env::var("LEANOTE_FAKE_AUTOSUBMIT").ok().as_deref() == Some("1") {

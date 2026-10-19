@@ -122,6 +122,29 @@ async fn login_persists_token_and_wrong_password_errors() {
     assert_eq!(s.last_sync_usn().unwrap(), -1);
 }
 
+/// Item 6: login/getSyncState must send the real `macAddr` (node-getmac
+/// shape: lowercase colon hex, never the literal "rust") and `v`
+/// (os.platform()+os.arch() shape).
+#[tokio::test(flavor = "multi_thread")]
+async fn login_sends_real_macaddr_and_version() {
+    let srv = seeded().await;
+    let dir = tmpdir("wireparams");
+    let s = store(&dir);
+    Api::login(&srv.url(), EMAIL, PWD, &s).unwrap();
+
+    let (mac, v) = srv.login_query();
+    assert!(
+        mac.len() == 17
+            && mac.bytes().enumerate().all(|(i, c)| {
+                (i % 3 == 2 && c == b':') || (i % 3 != 2 && c.is_ascii_digit() || c.is_ascii_lowercase())
+            }),
+        "macAddr must look like aa:bb:cc:dd:ee:ff, got {mac:?}"
+    );
+    assert!(mac != "rust", "placeholder macAddr leaked");
+    assert!(v != "rust" && !v.is_empty(), "v must be the platform string, got {v:?}");
+    assert_eq!(v, leanote_core::sync::client_version());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn full_sync_dataset_parity_and_last_sync_usn() {
     let srv = seeded().await;

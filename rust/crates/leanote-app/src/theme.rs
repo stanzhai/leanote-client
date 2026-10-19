@@ -1,5 +1,5 @@
 //! Wake visual language (ADR-0003): 4 material layers, 8 type sizes, 4px
-//! spacing grid, tiered radii 12/8/6/4, Wake-blue accent, SF Pro + Menlo.
+//! spacing grid, panel/selection radii, Wake-blue accent, SF Pro + Menlo.
 //! Dark/light follow the system; this module only carries the token values.
 
 use gpui_kit::{hsla, px, Hsla, Pixels};
@@ -30,15 +30,9 @@ pub fn spacing(n: i32) -> Pixels {
     px((n.max(0) as f32) * 4.)
 }
 
-/// Tiered radii (ADR-0003): panel 12 / selection 8 / button 6 / badge 4.
+/// Tiered radii (ADR-0003): panel 12 / selection 8.
 pub const RADIUS_PANEL: f32 = 12.;
 pub const RADIUS_SELECTION: f32 = 8.;
-#[cfg_attr(not(test), allow(dead_code))]
-pub const RADIUS_BUTTON: f32 = 6.;
-#[cfg_attr(not(test), allow(dead_code))]
-pub const RADIUS_BADGE: f32 = 4.;
-#[cfg_attr(not(test), allow(dead_code))]
-pub const RADII: [f32; 4] = [RADIUS_PANEL, RADIUS_SELECTION, RADIUS_BUTTON, RADIUS_BADGE];
 
 /// Wake blue (Q16): used for selection + actions only.
 pub fn accent() -> Hsla {
@@ -119,8 +113,8 @@ mod tests {
         for w in FONT_SIZES.windows(2) {
             assert!(w[0] < w[1], "{FONT_SIZES:?}");
         }
-        // Tiered radii 12/8/6/4 descending.
-        assert_eq!(RADII, [12., 8., 6., 4.]);
+        // Radii 12/8 descending.
+        assert_eq!((RADIUS_PANEL, RADIUS_SELECTION), (12., 8.));
         // 4px spacing grid.
         assert_eq!(spacing(0), px(0.));
         assert_eq!(spacing(1), px(4.));

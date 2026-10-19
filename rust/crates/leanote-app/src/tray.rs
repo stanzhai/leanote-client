@@ -50,8 +50,10 @@ pub fn init(cx: &mut App) {
     use tray_icon::menu::{Menu, MenuEvent, MenuItem};
     use tray_icon::{TrayIconBuilder, TrayIconEvent};
 
-    let show = MenuItem::with_id("show", "显示", true, None);
-    let quit = MenuItem::with_id("quit", "退出", true, None);
+    let lang = crate::i18n::system_lang();
+    let t = |k: crate::i18n::Key| crate::i18n::t(lang, k);
+    let show = MenuItem::with_id("show", t(crate::i18n::Key::TrayShow), true, None);
+    let quit = MenuItem::with_id("quit", t(crate::i18n::Key::TrayQuit), true, None);
     let menu = Menu::new();
     let _ = menu.append(&show);
     let _ = menu.append(&quit);

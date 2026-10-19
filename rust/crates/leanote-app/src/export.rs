@@ -9,13 +9,8 @@
 use leanote_core::{Note, Notebook, Store};
 use serde_json::{json, Value};
 
-/// `Date.format("yyyy-MM-dd hh:mm:ss")` from the export plugin — UTC, same
-/// as the core store's timestamps.
-fn leanote_time(ms: i64) -> String {
-    let secs = ms.div_euclid(1000);
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400);
-    // Howard Hinnant civil_from_days (same as app_shell::fmt_time).
+/// Howard Hinnant civil_from_days — days since 1970-01-01 → (y, m, d).
+pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -26,6 +21,16 @@ fn leanote_time(ms: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// `Date.format("yyyy-MM-dd hh:mm:ss")` from the export plugin — UTC, same
+/// as the core store's timestamps.
+fn leanote_time(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
     format!(
         "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
         tod / 3600,
@@ -134,18 +139,6 @@ fn file_row(file_id: &str, base64: &str, md5: &str, file_type: &str, is_attach: 
     })
 }
 
-/// File extension → `type` field, same defaulting the JS side uses for
-/// unknown types (it stores whatever the file row carried; we only have
-/// local bytes here, so the extension is the type).
-fn file_type_from(name: &str) -> String {
-    let ext = name.rsplit('.').next().unwrap_or("");
-    if ext.is_empty() || ext == name {
-        "bin".to_string()
-    } else {
-        ext.to_ascii_lowercase()
-    }
-}
-
 /// A note plus the base64 blobs to embed for it. `files` maps the 24-hex
 /// fileIds referenced by the content (`leanote://file/getImage?fileId=` /
 /// `getAttach?fileId=` after the backup rewrote them) to (bytes, is_attach).
@@ -158,15 +151,26 @@ pub fn backup_note(note: &Note, files: &[(String, Vec<u8>, bool)]) -> Value {
         let b64 = base64_encode(bytes);
         let md5 = md5_hex(bytes);
         let kind = if *is_attach { "getAttach" } else { "getImage" };
-        // Replace any source form that carried this fileId: the local
-        // scheme, or the server API URL. Title text between []/() kept.
-        let server_forms: Vec<String> = SERVER_HOSTS
-            .with(|h| h.borrow().iter().map(|host| host.clone()).collect());
-        for host in server_forms {
-            let from = format!("{host}/api/file/{kind}?fileId={file_id}");
-            let to = format!("leanote://file/{kind}?fileId={file_id}");
-            content = content.replace(&from, &to);
+        // Replace ANY `{host}/api/file/{kind}?fileId={file_id}` URL with the
+        // local scheme — the import side only matches leanote:// URLs and a
+        // note may reference files from any host it was authored on.
+        let needle = format!("/api/file/{kind}?fileId={file_id}");
+        let to = format!("leanote://file/{kind}?fileId={file_id}");
+        let mut out = String::with_capacity(content.len());
+        let mut rest = content.as_str();
+        while let Some(pos) = rest.find(&needle) {
+            let head = &rest[..pos];
+            // URL starts after the last delimiter before the host.
+            let url_start = head
+                .rfind(['(', '"', '\'', ' ', '>'])
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            out.push_str(&head[..url_start]);
+            out.push_str(&to);
+            rest = &rest[pos + needle.len()..];
         }
+        out.push_str(rest);
+        content = out;
         file_rows.push(file_row(
             file_id,
             &b64,
@@ -186,23 +190,6 @@ pub fn backup_note(note: &Note, files: &[(String, Vec<u8>, bool)]) -> Value {
         "updatedTime": leanote_time(note.updated_time),
         "files": file_rows,
     })
-}
-
-thread_local! {
-    /// Known server origins (login host) whose `/api/file/...` URLs should be
-    /// rewritten to `leanote://` in backups. Set once per export via
-    /// [`set_backup_server_host`].
-    static SERVER_HOSTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Record the account host so backup content rewriting can match its URLs.
-pub fn set_backup_server_host(host: &str) {
-    let h = host.trim_end_matches('/').to_string();
-    SERVER_HOSTS.with(|s| {
-        let mut v = s.borrow_mut();
-        v.clear();
-        v.push(h);
-    });
 }
 
 /// Whole store → `.leanote` backup JSON (top-level keys exactly as the JS
@@ -432,9 +419,9 @@ mod tests {
 
     #[test]
     fn backup_rewrites_server_file_urls_to_leanote_scheme() {
-        set_backup_server_host("http://s.example");
+        // host never registered anywhere — rewrite must be unconditional
         let n = note(
-            "![i](http://s.example/api/file/getImage?fileId=5581029f6289dc3301000000)\n[a](http://s.example/api/file/getAttach?fileId=aabbccddeeff001122334455)",
+            "![i](http://never-seen.example/api/file/getImage?fileId=5581029f6289dc3301000000)\n[a](https://other.example/api/file/getAttach?fileId=aabbccddeeff001122334455)",
             true,
         );
         let files = vec![

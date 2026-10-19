@@ -104,6 +104,12 @@ keys! {
     ExportBackup => ("导出备份 (.leanote)", "Export backup (.leanote)"),
     PdfFellBack => ("服务器导出 PDF 失败，已导出 HTML", "Server PDF export failed, exported HTML instead"),
     NotSynced => ("笔记尚未同步到服务器", "Note is not synced to the server"),
+    // Ticket 16 tray menu.
+    TrayShow => ("显示", "Show"),
+    TrayQuit => ("退出", "Quit"),
+    // Review item 2: sync-now/logout controls.
+    SyncNow => ("立即同步", "Sync now"),
+    Logout => ("登出", "Log out"),
 }
 
 #[cfg(test)]
@@ -153,5 +159,6 @@ mod tests {
         Key::NewNotebook, Key::RenameNotebook, Key::DeleteNotebook, Key::MoveNotebookTo,
         Key::RootLevel, Key::RenameTag, Key::DeleteTag, Key::Confirm, Key::Cancel,
         Key::SearchPlaceholder, Key::SearchNoResults, Key::SearchEmptyHint, Key::SearchFootnote,
+        Key::TrayShow, Key::TrayQuit, Key::SyncNow, Key::Logout,
     ];
 }

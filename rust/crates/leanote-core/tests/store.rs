@@ -580,3 +580,19 @@ fn save_with_history_no_change_writes_nothing() {
     assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM note_history").unwrap(), 0);
     assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM notes").unwrap(), 1);
 }
+
+/// Review item 1: a store opened for a non-"user1" account must see its own
+/// dirty notes (sync readiness query is UserId-scoped, not hardcoded).
+#[test]
+fn store_scopes_dirty_notes_to_opened_user() {
+    let s = Store::open(tmpdir_live("scoped-user"), "userX".to_string()).expect("open store");
+    let n = add(&s, "Mine", "# x", &[], "NB");
+    let dirty: Vec<_> = s.dirty_notes().expect("dirty_notes");
+    assert!(dirty.iter().any(|d| d.note_id.to_string() == n.note_id.to_string()), "userX's note must be dirty for userX");
+
+    let other = Store::open(tmpdir_live("scoped-user"), "user1".to_string()).expect("open store");
+    assert!(
+        other.dirty_notes().expect("dirty_notes").is_empty(),
+        "user1 must not see userX's rows"
+    );
+}

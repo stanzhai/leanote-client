@@ -144,6 +144,11 @@ pub struct Account {
 
 pub const DB_FILE: &str = "leanote.db";
 
+/// Column list shared by the browse queries (JS _getNotes).
+pub(crate) const NOTES_COLS: &str = "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
+    IsMarkdown, IsTrash, IsDirty, LocalIsNew, LocalIsDelete, IsBlog, Star, CreatedTime, UpdatedTime
+ FROM notes";
+
 /// Column list + live-note filter shared by the browse queries (JS _getNotes).
 pub(crate) const NOTES_LIVE_BASE: &str = "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
     IsMarkdown, IsTrash, IsDirty, LocalIsNew, LocalIsDelete, IsBlog, Star, CreatedTime, UpdatedTime
@@ -262,12 +267,10 @@ impl Store {
 
     /// Trashed notes newest-first (JS getTrashNotes: IsTrash=1, no other filter).
     pub fn list_trash(&self) -> rusqlite::Result<Vec<Note>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
-                IsMarkdown, IsTrash, IsDirty, LocalIsNew, LocalIsDelete, IsBlog, Star, CreatedTime, UpdatedTime
-             FROM notes WHERE IsTrash=1
-             ORDER BY UpdatedTime DESC, rowid ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "{NOTES_COLS} WHERE IsTrash=1
+             ORDER BY UpdatedTime DESC, rowid ASC"
+        ))?;
         let rows = stmt.query_map([], row_to_note)?;
         rows.collect()
     }
@@ -329,22 +332,17 @@ impl Store {
 
     /// Notes newest-first (matches JS `loadNotes` sort by UpdatedTime desc).
     pub fn list_notes(&self) -> rusqlite::Result<Vec<Note>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
-                IsMarkdown, IsTrash, IsDirty, LocalIsNew, LocalIsDelete, IsBlog, Star, CreatedTime, UpdatedTime
-             FROM notes WHERE IsTrash=0 AND LocalIsDelete=0 AND IsDeleted=0
-             ORDER BY UpdatedTime DESC, rowid ASC",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{NOTES_LIVE_BASE} ORDER BY UpdatedTime DESC, rowid ASC"))?;
         let rows = stmt.query_map([], row_to_note)?;
         rows.collect()
     }
 
     pub fn get_note(&self, id: &Id) -> rusqlite::Result<Option<Note>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
-                IsMarkdown, IsTrash, IsDirty, LocalIsNew, LocalIsDelete, IsBlog, Star, CreatedTime, UpdatedTime
-             FROM notes WHERE NoteId=?1 AND IsTrash=0 AND LocalIsDelete=0 AND IsDeleted=0",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{NOTES_LIVE_BASE} AND NoteId=?1"))?;
         stmt.query_row([id.to_string()], row_to_note).optional()
     }
 
@@ -634,11 +632,7 @@ impl Store {
     /// Note by exact id regardless of trash/deleted state (JS getNote uses
     /// findOne({NoteId}) with no status filter).
     pub fn get_note_any(&self, id: &Id) -> rusqlite::Result<Option<Note>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
-                IsMarkdown, IsTrash, IsDirty, LocalIsNew, LocalIsDelete, IsBlog, Star, CreatedTime, UpdatedTime
-             FROM notes WHERE NoteId=?1",
-        )?;
+        let mut stmt = self.conn.prepare(&format!("{NOTES_COLS} WHERE NoteId=?1"))?;
         stmt.query_row([id.to_string()], row_to_note).optional()
     }
 
@@ -648,11 +642,9 @@ impl Store {
         if let Some(n) = self.get_note(&Id(prefix.to_string()))? {
             return Ok(Some(n));
         }
-        let mut stmt = self.conn.prepare(
-            "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
-                IsMarkdown, IsTrash, IsDirty, LocalIsNew, LocalIsDelete, IsBlog, Star, CreatedTime, UpdatedTime
-             FROM notes WHERE NoteId LIKE ?1 || '%' ORDER BY rowid",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{NOTES_COLS} WHERE NoteId LIKE ?1 || '%' ORDER BY rowid"))?;
         let rows = stmt.query_map([prefix.replace('%', "\\%").replace('_', "\\_")], row_to_note)?;
         for n in rows {
             let n = n?;

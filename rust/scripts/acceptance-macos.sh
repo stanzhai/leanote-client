@@ -9,7 +9,6 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BIN="$ROOT/rust/target/release/leanote"
-APPBIN="$ROOT/rust/target/release/leanote-app"
 WORK=$(mktemp -d /tmp/leanote-accept.XXXXXX)
 PASS=0; FAIL=0
 

@@ -94,7 +94,7 @@ pub(crate) fn render(
         .child(
             Label::new(t(i18n::Key::ConflictTitle))
                 .text_size(px(13.))
-                .text_color(theme::accent()),
+                .text_color(fg),
         )
         .child(
             h_flex()

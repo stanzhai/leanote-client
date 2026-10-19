@@ -16,7 +16,7 @@ use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, WindowExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::{px, AnyElement, KeyDownEvent, SharedString, Task, Window};
-use leanote_core::sync::{Api, SyncProgress, SyncStats};
+use leanote_core::sync::{Api, NoProgress, SyncProgress, SyncStats};
 use std::sync::{Arc, Mutex};
 
 /// ADR-0003 fixed widths.
@@ -76,6 +76,11 @@ pub enum NavSelection {
 pub struct AppShell {
     phase: Phase,
     lang: Lang,
+    /// Active account's UserId (rows are scoped per user db); "user1" until
+    /// login re-keys it.
+    user_id: String,
+    /// Review item 2/3: outcome of the last incr sync (startup + SyncNow).
+    sync_status: Option<Result<SharedString, SharedString>>,
     data_dir: std::path::PathBuf,
     host: gpui_kit::Entity<InputState>,
     email: gpui_kit::Entity<InputState>,
@@ -141,6 +146,8 @@ impl AppShell {
         data_dir: std::path::PathBuf,
         lang: Lang,
         signed_in: bool,
+        // Signed-in account's user id (None → still "user1" placeholder).
+        user_id: Option<String>,
         fake_prefill: Option<(&str, &str, &str)>,
     ) -> Self {
         let host = cx.new(|cx| {
@@ -182,6 +189,8 @@ impl AppShell {
                 Phase::Login
             },
             lang,
+            user_id: user_id.unwrap_or_else(|| "user1".to_string()),
+            sync_status: None,
             data_dir,
             host,
             email,
@@ -234,7 +243,7 @@ impl AppShell {
 
         // Login + sync are blocking ureq calls — off the UI thread.
         let work = cx.background_spawn(async move {
-            let result: Result<SyncStats, String> = (|| {
+            let result: Result<(String, SyncStats), String> = (|| {
                 let Ok(store) = leanote_core::Store::open(dir.clone(), "user1".into()) else {
                     return Err("cannot open local store".into());
                 };
@@ -245,7 +254,8 @@ impl AppShell {
                     return Err("cannot open local store".into());
                 };
                 let api = Api::for_account(&account);
-                leanote_core::sync::full_sync(&api, &store, &progress).map_err(|e| e.to_string())
+                let uid = account.user_id.clone();
+                leanote_core::sync::full_sync(&api, &store, &progress).map(|s| (uid, s)).map_err(|e| e.to_string())
             })();
             result
         });
@@ -279,7 +289,8 @@ impl AppShell {
             };
             let _ = this.update(cx, |shell, cx| {
                 match result {
-                    Ok(_) => {
+                    Ok((user_id, _stats)) => {
+                        shell.user_id = user_id;
                         shell.phase = Phase::Shell;
                     }
                     Err(e) => {
@@ -290,6 +301,67 @@ impl AppShell {
                 cx.notify();
             });
         }));
+    }
+
+    /// Review item 2: background incr sync for the signed-in account
+    /// (startup + SyncNow). Failure is non-blocking — logged + shown in the
+    /// identity area.
+    pub(crate) fn sync_now(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        let Some(acct) = self.store().and_then(|s| s.active_account().ok().flatten()) else {
+            return;
+        };
+        let dir = self.data_dir.clone();
+        let uid = acct.user_id.clone();
+        let work = cx.background_spawn(async move {
+            (|| {
+                let store = leanote_core::Store::open(dir, uid).map_err(|e| e.to_string())?;
+                let api = Api::for_account(&acct);
+                let stats = leanote_core::sync::incr_sync(&api, &store, &NoProgress)
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(stats)
+            })()
+        });
+        self._task = Some(cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |shell, cx| {
+                match &result {
+                    Ok(_) => {
+                        shell.sync_status = Some(Ok("sync ok".into()));
+                    }
+                    Err(e) => {
+                        leanote_core::logging::log("sync", e);
+                        shell.sync_status = Some(Err(e.clone().into()));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Review item 3: one muted line for the identity area.
+    fn sync_status_label(&self) -> SharedString {
+        let t = |k: i18n::Key| i18n::t(self.lang, k);
+        match &self.sync_status {
+            None => t(i18n::Key::NotSynced).to_string().into(),
+            Some(Ok(_)) => t(i18n::Key::SyncDone).to_string().into(),
+            Some(Err(e)) => format!("{}: {}", t(i18n::Key::SyncFailed), e).into(),
+        }
+    }
+
+    /// Review item 2: logout — server-side signout (best effort), local
+    /// account deactivated, back to the login screen.
+    fn logout(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        if let Some(acct) = self.store().and_then(|s| s.active_account().ok().flatten()) {
+            Api::for_account(&acct).logout();
+            if let Ok(store) = leanote_core::Store::open(self.data_dir.clone(), acct.user_id.clone()) {
+                let _ = store.deactivate_account();
+            }
+        }
+        self.user_id = "user1".to_string();
+        self.sync_status = None;
+        self.phase = Phase::Login;
+        self._task = None;
+        cx.notify();
     }
 
     pub(crate) fn dark(&self, window: &Window) -> bool {
@@ -303,7 +375,7 @@ impl AppShell {
 
     fn store(&self) -> Option<leanote_core::Store> {
         // Re-open per read: cheap (WAL) and always fresh after star/trash ops.
-        leanote_core::Store::open(self.data_dir.clone(), "user1".into()).ok()
+        leanote_core::Store::open(self.data_dir.clone(), self.user_id.clone()).ok()
     }
 
     /// Notes for the current nav selection, in list order.
@@ -696,7 +768,7 @@ impl AppShell {
     fn export_backup(&mut self, cx: &mut gpui_kit::Context<Self>) {
         let name = "leanote-backup.leanote".to_string();
         let dir = self.data_dir.clone();
-        let user = "user1".to_string();
+        let user = self.user_id.clone();
         self.export_with_panel(name, cx, move |path| {
             let store = leanote_core::Store::open(dir, user).map_err(|e| e.to_string())?;
             std::fs::write(&path, crate::export::backup_to_leanote_json(&store))
@@ -952,7 +1024,7 @@ fn render_login(
 
     let register = gpui_kit::component::link::Link::new("register")
         .href("https://leanote.com/register")
-        .child(small_label(t(i18n::Key::Register), gpui_kit::hsla(0., 0., 1., 0.)))
+        .child(small_label(t(i18n::Key::Register), muted))
         .on_click(|_ev, _window, cx| cx.open_url("https://leanote.com/register"));
 
     let mut form = gpui_kit::base::v_flex()
@@ -1102,6 +1174,7 @@ impl AppShell {
         cx: &mut gpui_kit::Context<Self>,
     ) -> gpui_kit::Div {
         let fg = theme::foreground(dark);
+        let muted = theme::muted_foreground(dark);
         let (notebooks_open, tags_open) = (self.notebooks_open, self.tags_open);
         let shell = cx.weak_entity();
         let lang = self.lang;
@@ -1137,10 +1210,20 @@ impl AppShell {
             .px_3()
             .gap_1()
             .child(Label::new(t(i18n::Key::AppName)).text_size(px(16.)).text_color(fg))
+            // Review item 3: signed-in identity + last sync outcome.
+            .when_some(
+                self.store().and_then(|s| s.active_account().ok().flatten()),
+                |el, acct| {
+                    el.child(small_label(
+                        if acct.username.is_empty() { acct.email.clone() } else { acct.username.clone() },
+                        muted,
+                    ))
+                    .child(small_label(self.sync_status_label(), muted))
+                },
+            )
             .child(all_row)
             .child(starred_row)
-            .child(trash_row)
-            .child(self.group_header(dark, t(i18n::Key::NavNotebooks), notebooks_open, Group::Notebooks, cx));
+            .child(trash_row);
 
         // Ticket 11: right-click menu on the Notebooks group header —
         // "New Notebook" at root level.
@@ -1341,6 +1424,19 @@ impl AppShell {
                     .label(t(i18n::Key::ExportBackup))
                     .ghost()
                     .on_click(cx.listener(|this, _ev, _window, cx| this.export_backup(cx))),
+            )
+            // Review item 2: manual incr sync + sign out.
+            .child(
+                Button::new("sync-now")
+                    .label(t(i18n::Key::SyncNow))
+                    .ghost()
+                    .on_click(cx.listener(|this, _ev, _window, cx| this.sync_now(cx))),
+            )
+            .child(
+                Button::new("logout")
+                    .label(t(i18n::Key::Logout))
+                    .ghost()
+                    .on_click(cx.listener(|this, _ev, _window, cx| this.logout(cx))),
             );
 
         nav
@@ -1532,7 +1628,7 @@ impl AppShell {
                                     el.child(
                                         Icon::new(IconName::StarFill)
                                             .xsmall()
-                                            .text_color(if is_sel { sel_fg } else { theme::accent() }),
+                                            .text_color(if is_sel { sel_fg } else { muted }),
                                     )
                                 }),
                         )
@@ -1955,18 +2051,7 @@ impl AppShell {
 
 /// epoch ms → "YYYY-MM-DD" (display only; store keeps epoch ms).
 pub(crate) fn fmt_time(ms: i64) -> String {
-    let days = ms.div_euclid(86_400_000);
-    // Howard Hinnant civil_from_days.
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
+    let (y, m, d) = crate::export::civil_from_days(ms.div_euclid(86_400_000));
     format!("{y:04}-{m:02}-{d:02}")
 }
 
