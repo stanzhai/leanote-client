@@ -21,7 +21,7 @@ fn datadir(name: &str) -> std::path::PathBuf {
 
 fn run(dir: &std::path::PathBuf, args: &[&str], stdin: Option<&str>) -> (String, String, i32) {
     let mut cmd = Command::new(bin());
-    cmd.args(args).env("LEANOTE_RUST_DATA", dir).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args).env("LEANOTE_RUST_DATA", dir).env("LEANOTE_NO_SHIM_SWITCH", "1").env("LEANOTE_PORT", "8913").stdout(Stdio::piped()).stderr(Stdio::piped());
     if stdin.is_some() {
         cmd.stdin(Stdio::piped());
     }
