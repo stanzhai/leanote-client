@@ -273,7 +273,10 @@ fn open_store() -> Result<Store, String> {
 
 // --- sync ---
 
-/// `leanote sync --host <url> --email <e> --password <p>`: login + full sync.
+/// `leanote sync --host <url> --email <e> --password <p>`: login + sync.
+/// Fresh login (LastSyncUsn<0) does a full pass; later runs do the
+/// incremental pull+push round, like JS `incrSync`, so offline edits are
+/// pushed instead of reverted by a re-pull.
 /// Bad credentials exit 1 with the server's own Msg (e.g. WrongPassword).
 fn cmd_sync(args: &[String]) -> i32 {
     let mut host = String::new();
@@ -319,11 +322,18 @@ fn cmd_sync(args: &[String]) -> i32 {
         }
     };
     println!("Logged in as {} <{}>", account.username, account.email);
-    match leanote_core::sync::full_sync(
-        &leanote_core::sync::Api::for_account(&account),
-        &store,
-        &PrintProgress,
-    ) {
+    let api = leanote_core::sync::Api::for_account(&account);
+    let run: fn(
+        &leanote_core::sync::Api,
+        &Store,
+        &dyn leanote_core::sync::SyncProgress,
+    ) -> Result<leanote_core::sync::SyncStats, leanote_core::sync::SyncError> =
+        if store.last_sync_usn().unwrap_or(-1) >= 0 {
+            leanote_core::sync::incr_sync
+        } else {
+            leanote_core::sync::full_sync
+        };
+    match run(&api, &store, &PrintProgress) {
         Ok(stats) => {
             println!(
                 "Synced {} notebooks, {} notes, {} tags; {} contents fetched; LastSyncUsn={}",
