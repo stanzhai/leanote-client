@@ -3,17 +3,17 @@
 //! read-only Markdown reader, star toggle, trash actions.
 
 use crate::browse::{self, NavNode};
+use crate::conflict_bar;
 use crate::i18n::{self, Lang};
 use crate::theme::{self, Material};
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
-use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable};
 use gpui_kit::prelude::*;
-use gpui_kit::{px, KeyDownEvent, SharedString, Task, Window};
+use gpui_kit::{px, SharedString, Task, Window};
 use leanote_core::sync::{Api, SyncProgress, SyncStats};
 use std::sync::{Arc, Mutex};
 
@@ -39,6 +39,14 @@ pub enum Phase {
 enum Group {
     Notebooks,
     Tags,
+}
+
+/// Which conflict-bar button was pressed (ticket 14).
+#[derive(Clone, Copy)]
+enum ConflictChoice {
+    UseLocal,
+    UseServer,
+    KeepBoth,
 }
 
 /// What the middle list is filtered to (left-nav selection).
@@ -67,26 +75,10 @@ pub struct AppShell {
     /// Note currently shown in the reader (kept across list re-filters
     /// until the selection changes).
     selected: Option<leanote_core::Id>,
-    // --- Ticket 10 editor state ---
-    /// Edit mode for `selected` (only entered for live IsMarkdown notes).
-    editing: Option<EditState>,
-    /// History popover open (only meaningful while editing).
-    history_open: bool,
-    /// Which history row is previewed (None = list view).
-    history_preview: Option<leanote_core::Id>,
-}
-
-/// Right-pane edit mode (ticket 10): title + multiline source editor with
-/// preview toggle. Buffer lives in the kit's TextareaState so IME
-/// composition is handled entirely by the kit.
-struct EditState {
-    note_id: leanote_core::Id,
-    title: gpui_kit::Entity<InputState>,
-    content: gpui_kit::Entity<TextareaState>,
-    /// Show rendered preview instead of source.
-    preview: bool,
-    /// Set for one frame after a save, to flash "Saved".
-    saved_flash: bool,
+    // --- Ticket 12 rich-text state ---
+    /// Set after a successful Convert to Markdown; cleared when the
+    /// selection changes. Rendered as a one-line feedback next to the badge.
+    converted_note: Option<leanote_core::Id>,
 }
 
 /// Progress sink that forwards full_sync lines into a channel the UI drains.
@@ -157,9 +149,7 @@ impl AppShell {
             notebooks_open: true,
             tags_open: true,
             selected: None,
-            editing: None,
-            history_open: false,
-            history_preview: None,
+            converted_note: None,
         }
     }
 
@@ -323,140 +313,48 @@ impl AppShell {
     fn select_nav(&mut self, nav: NavSelection, cx: &mut gpui_kit::Context<Self>) {
         self.nav = nav;
         self.selected = None; // new filter → no stale reader content
-        self.close_editor();
         cx.notify();
     }
 
     fn select_note(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
         self.selected = Some(id);
-        self.close_editor();
+        self.converted_note = None;
         cx.notify();
-    }
-
-    fn close_editor(&mut self) {
-        self.editing = None;
-        self.history_open = false;
-        self.history_preview = None;
-    }
-
-    /// Enter edit mode for the selected live markdown note. Buffer is seeded
-    /// from the store; all editing (incl. IME composition) stays inside the
-    /// kit's input state — this code never mutates the buffer on key events.
-    fn start_editing(
-        &mut self,
-        window: &mut Window,
-        cx: &mut gpui_kit::Context<Self>,
-    ) {
-        let Some(id) = self.selected.clone() else { return };
-        let Some(note) = self.store().and_then(|s| s.get_note_any(&id).ok().flatten()) else {
-            return;
-        };
-        if !note.is_markdown || note.is_trash || note.is_deleted {
-            return;
-        }
-        let title = cx.new(|cx| InputState::new(window, cx).default_value(note.title.clone()));
-        let content =
-            cx.new(|cx| TextareaState::new(window, cx).default_value(note.content.clone()));
-        self.editing = Some(EditState {
-            note_id: id,
-            title,
-            content,
-            preview: false,
-            saved_flash: false,
-        });
-        self.history_open = false;
-        self.history_preview = None;
-        cx.notify();
-    }
-
-    /// Save button / ⌘S: write through save_note_with_history (snapshot of
-    /// the pre-change content, IsDirty=1 so sync pushes it).
-    fn save_editor(&mut self, cx: &mut gpui_kit::Context<Self>) {
-        let Some(ed) = &self.editing else { return };
-        let title = ed.title.read(cx).value().to_string();
-        let content = ed.content.read(cx).value().to_string();
-        let id = ed.note_id.clone();
-        if let Some(store) = self.store() {
-            let _ = store.save_note_with_history(
-                &id,
-                leanote_core::NoteUpdate {
-                    title: Some(title),
-                    content: Some(content),
-                    ..Default::default()
-                },
-            );
-        }
-        if let Some(ed) = &mut self.editing {
-            ed.saved_flash = true;
-        }
-        cx.notify();
-    }
-
-    /// Leave edit mode without saving.
-    fn stop_editing(&mut self, cx: &mut gpui_kit::Context<Self>) {
-        self.close_editor();
-        cx.notify();
-    }
-
-    /// New note in the current nav context's notebook (IsNew=1, dirty) and
-    /// open it straight in the editor.
-    fn new_note(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
-        // Notebook context: current notebook nav, else the first notebook.
-        let store = match self.store() {
-            Some(s) => s,
-            None => return,
-        };
-        let notebook_title = match &self.nav {
-            NavSelection::Notebook(id) => store
-                .notebook_title(id)
-                .unwrap_or_else(|_| id.to_string()),
-            _ => store
-                .notebooks()
-                .unwrap_or_default()
-                .into_iter()
-                .next()
-                .map(|nb| nb.title)
-                .unwrap_or_else(|| "Inbox".into()),
-        };
-        let Ok(note) = store.add_note(leanote_core::NewNote {
-            title: String::new(),
-            content: String::new(),
-            tags: vec![],
-            notebook_title,
-            is_markdown: true,
-        }) else {
-            return;
-        };
-        match &self.nav {
-            NavSelection::Notebook(_) => {}
-            _ => self.nav = NavSelection::AllNotes,
-        }
-        self.selected = Some(note.note_id.clone());
-        self.close_editor();
-        cx.notify();
-        self.start_editing(window, cx);
-    }
-
-    fn restore_history_version(
-        &mut self,
-        history_id: leanote_core::Id,
-        window: &mut Window,
-        cx: &mut gpui_kit::Context<Self>,
-    ) {
-        let Some(ed) = &self.editing else { return };
-        let note_id = ed.note_id.clone();
-        let Some(store) = self.store() else { return };
-        if store.restore_history(&note_id, &history_id).ok().flatten().is_some() {
-            self.close_editor();
-            self.selected = Some(note_id);
-            self.start_editing(window, cx); // reopen seeded with restored content
-        }
     }
 
     /// Star is local-only: toggle_star never touches IsDirty (GLOSSARY).
     fn toggle_star(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
         if let Some(store) = self.store() {
             let _ = store.toggle_star(&id);
+        }
+        cx.notify();
+    }
+
+    /// Ticket 14 conflict bar actions. All three clear the conflict row; the
+    /// store methods decide what happens to the note itself.
+    fn resolve_conflict(
+        &mut self,
+        how: ConflictChoice,
+        server_note_id: String,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if let Some(store) = self.store() {
+            match how {
+                ConflictChoice::UseLocal => {
+                    let _ = store.resolve_conflict_use_local(&server_note_id);
+                }
+                ConflictChoice::UseServer => {
+                    let _ = store.resolve_conflict_use_server(&server_note_id);
+                }
+                ConflictChoice::KeepBoth => {
+                    let suffix = conflict_bar::keep_both_suffix(self.lang);
+                    if let Ok(Some(new_id)) =
+                        store.resolve_conflict_keep_both(&server_note_id, suffix)
+                    {
+                        self.selected = Some(new_id);
+                    }
+                }
+            }
         }
         cx.notify();
     }
@@ -486,6 +384,23 @@ impl AppShell {
             let _ = store.empty_trash();
         }
         self.selected = None;
+        cx.notify();
+    }
+
+    /// Ticket 12: one-way HTML → Markdown conversion of the selected
+    /// rich-text note. Persisted (content rewritten, IsMarkdown=1, dirty)
+    /// so the next push sends Markdown to the server; the reader re-renders
+    /// straight from the converted store row.
+    fn convert_selected_to_markdown(
+        &mut self,
+        id: leanote_core::Id,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if let Some(store) = self.store() {
+            if matches!(store.convert_to_markdown(&id), Ok(Some(_))) {
+                self.converted_note = Some(id);
+            }
+        }
         cx.notify();
     }
 }
@@ -538,8 +453,9 @@ impl Render for AppShell {
             }
             Phase::Shell { .. } => {
                 body = body
-                    .child(self.render_list(dark, &t, window, cx))
-                    .child(self.render_reader(dark, &t, window, cx));
+                    .child(self.render_nav(dark, &t, cx))
+                    .child(self.render_list(dark, &t, cx))
+                    .child(self.render_reader(dark, &t, cx));
             }
         }
 
@@ -794,7 +710,6 @@ impl AppShell {
         &mut self,
         dark: bool,
         t: &dyn Fn(i18n::Key) -> &'static str,
-        _window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) -> gpui_kit::Div {
         let fg = theme::foreground(dark);
@@ -814,24 +729,6 @@ impl AppShell {
             NavSelection::Tag(tag) => tag.as_str(),
         };
 
-        // Trash view has no new-note; every other context does (ticket 10).
-        let mut header = gpui_kit::base::h_flex()
-            .gap_2()
-            .child(
-                Label::new(format!("{} · {}", title, count))
-                    .text_size(px(16.))
-                    .text_color(fg),
-            )
-            .child(gpui_kit::base::h_flex().flex_1());
-        if self.nav != NavSelection::Trash {
-            header = header.child(
-                Button::new("new-note")
-                    .icon(IconName::Plus)
-                    .ghost()
-                    .on_click(cx.listener(|this, _ev, window, cx| this.new_note(window, cx))),
-            );
-        }
-
         let mut list = gpui_kit::base::v_flex()
             .w(px(MID_W))
             .h_full()
@@ -840,7 +737,11 @@ impl AppShell {
             .pt(px(TITLEBAR_H))
             .px_3()
             .gap_1()
-            .child(header);
+            .child(
+                Label::new(format!("{} · {}", title, count))
+                    .text_size(px(16.))
+                    .text_color(fg),
+            );
 
         if notes.is_empty() {
             list = list.child(small_label(t(i18n::Key::EmptyNotes), muted));
@@ -890,13 +791,10 @@ impl AppShell {
     /// Right pane: remainder width, 720px centered reading column, read-only
     /// Markdown via TextView (CommonMark + GFM incl. tables/strikethrough/
     /// fenced code highlight/links/blockquotes; remote images over http).
-    /// When `editing` is set for the selected note, renders the source
-    /// editor + preview toggle instead (ticket 10).
     fn render_reader(
         &mut self,
         dark: bool,
         t: &dyn Fn(i18n::Key) -> &'static str,
-        window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) -> gpui_kit::Div {
         let fg = theme::foreground(dark);
@@ -910,25 +808,51 @@ impl AppShell {
             .bg(theme::material(Material::Background, dark))
             .pt(px(TITLEBAR_H));
 
+        // Ticket 14: adjudication bar when this note (or any note) has an
+        // unresolved conflict. Built before the selection check so it also
+        // shows with nothing selected.
+        let conflicts = self
+            .store()
+            .and_then(|s| s.list_conflicts().ok())
+            .unwrap_or_default();
+        let bar = conflict_bar::bar_state(
+            &conflicts,
+            self.selected.as_ref().map(|id| id.to_string()).as_deref(),
+        )
+        .map(|c| {
+            let (sid, sid2, sid3) = (
+                c.server_note_id.clone(),
+                c.server_note_id.clone(),
+                c.server_note_id.clone(),
+            );
+            conflict_bar::render(
+                dark,
+                self.lang,
+                c,
+                cx.listener(move |this, _ev, _window, cx| {
+                    this.resolve_conflict(ConflictChoice::UseLocal, sid.clone(), cx)
+                }),
+                cx.listener(move |this, _ev, _window, cx| {
+                    this.resolve_conflict(ConflictChoice::UseServer, sid2.clone(), cx)
+                }),
+                cx.listener(move |this, _ev, _window, cx| {
+                    this.resolve_conflict(ConflictChoice::KeepBoth, sid3.clone(), cx)
+                }),
+            )
+        });
+
         let note = self
             .selected
             .as_ref()
             .and_then(|id| self.store().and_then(|s| s.get_note_any(id).ok().flatten()));
-        // Editor mode takes over the pane for the selected note (ticket 10).
-        if self
-            .editing
-            .as_ref()
-            .is_some_and(|ed| Some(&ed.note_id) == self.selected.as_ref())
-        {
-            return self.render_editor(dark, t, window, cx);
-        }
 
         let Some(n) = note else {
+            let mut empty = gpui_kit::base::v_flex().w(px(READER_W)).mx_auto().gap_2();
+            if let Some(bar) = bar {
+                empty = empty.child(bar);
+            }
             return pane.child(
-                gpui_kit::base::v_flex()
-                    .w(px(READER_W))
-                    .mx_auto()
-                    .gap_2()
+                empty
                     .child(small_label(i18n::t(self.lang, i18n::Key::NoSelection), muted))
                     .child(Label::new(t(i18n::Key::NoSelection)).text_size(px(16.)).text_color(fg)),
             );
@@ -955,6 +879,26 @@ impl AppShell {
         };
 
         let mut toolbar = gpui_kit::base::h_flex().gap_2().child(star_btn);
+        // Ticket 12: rich-text notes are read-only Markdown renders; the
+        // only write path is the explicit convert action. No edit entry
+        // exists anywhere for them.
+        if !n.is_markdown {
+            let cid = n.note_id.clone();
+            toolbar = toolbar
+                .child(small_label(t(i18n::Key::RichTextReadonly), muted))
+                .child(
+                    Button::new("convert-md")
+                        .label(t(i18n::Key::ConvertToMarkdown))
+                        .outline()
+                        .on_click(cx.listener(move |this, _ev, _window, cx| {
+                            this.convert_selected_to_markdown(cid.clone(), cx)
+                        })),
+                );
+        }
+        if self.converted_note.as_ref() == Some(&n.note_id) {
+            toolbar =
+                toolbar.child(small_label(t(i18n::Key::ConvertedToMarkdown), muted));
+        }
         if is_trash_view {
             let rid = n.note_id.clone();
             toolbar = toolbar.child(
@@ -976,233 +920,38 @@ impl AppShell {
                     .outline()
                     .on_click(cx.listener(|this, _ev, _window, cx| this.empty_trash(cx))),
             );
-        } else if n.is_markdown {
-            toolbar = toolbar.child(
-                Button::new("edit-note")
-                    .label(t(i18n::Key::Edit))
-                    .outline()
-                    .on_click(cx.listener(|this, _ev, window, cx| this.start_editing(window, cx))),
-            );
         }
 
         let src = browse::reader_markdown_src(&n.title, &n.content, n.is_markdown);
-        pane.child(
-            gpui_kit::base::v_flex()
-                .w(px(READER_W))
-                .mx_auto()
-                .gap_2()
-                .min_h_0()
-                .child(
-                    gpui_kit::base::h_flex()
-                        .gap_2()
-                        .child(small_label(
-                            browse::note_meta(&nb_name, &n.tags, n.updated_time),
-                            muted,
-                        ))
-                        .child(gpui_kit::base::h_flex().flex_1()),
-                )
-                .child(toolbar)
-                // GFM tables + strikethrough ship in TextView's default GFM
-                // parse options; `.scrollable` keeps the whole pane from
-                // scrolling away under the toolbar.
-                .child(
-                    TextView::markdown("reader", src)
-                        .scrollable(true)
-                        .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
-                ),
-        )
-    }
 
-    /// Right pane in edit mode (ticket 10): title input + source textarea
-    /// with preview toggle, save, history. ⌘S/ctrl-S is handled by an
-    /// on_key_down that only matches the exact modifier combo — every text
-    /// keystroke (incl. IME composition) passes through untouched.
-    fn render_editor(
-        &mut self,
-        dark: bool,
-        t: &dyn Fn(i18n::Key) -> &'static str,
-        _window: &mut Window,
-        cx: &mut gpui_kit::Context<Self>,
-    ) -> gpui_kit::Div {
-        let fg = theme::foreground(dark);
-        let muted = theme::muted_foreground(dark);
-        let note_id = self.editing.as_ref().unwrap().note_id.clone();
-        let history = self
-            .store()
-            .and_then(|s| s.list_history(&note_id).ok())
-            .unwrap_or_default();
-
-        let pane = gpui_kit::base::v_flex()
-            .flex_1()
-            .h_full()
-            .min_w_0()
-            .bg(theme::material(Material::Background, dark))
-            .pt(px(TITLEBAR_H));
-
-        let Some(ed) = &self.editing else { unreachable!("caller checked") };
-        let title_entity = ed.title.clone();
-        let content_entity = ed.content.clone();
-        let preview = ed.preview;
-        let saved_flash = ed.saved_flash;
-
-        // Toolbar: Source/Preview toggle · Save · History · Done.
-        let mut toolbar = gpui_kit::base::h_flex().gap_2();
-        let (toggle_key, toggle_icon) = if preview {
-            (i18n::Key::EditorSource, AssetIcon::Code)
-        } else {
-            (i18n::Key::EditorPreview, AssetIcon::Eye)
-        };
-        toolbar = toolbar.child(
-            Button::new("toggle-preview")
-                .label(t(toggle_key))
-                .icon(toggle_icon)
-                .outline()
-                .on_click(cx.listener(|this, _ev, _window, cx| {
-                    if let Some(ed) = &mut this.editing {
-                        ed.preview = !ed.preview;
-                    }
-                    cx.notify();
-                })),
-        );
-        toolbar = toolbar.child(
-            Button::new("save-note")
-                .label(t(if saved_flash { i18n::Key::Saved } else { i18n::Key::Save }))
-                .icon(AssetIcon::Save)
-                .primary()
-                .on_click(cx.listener(|this, _ev, _window, cx| this.save_editor(cx))),
-        );
-        let hist_count = history.len();
-        toolbar = toolbar.child(
-            Button::new("history")
-                .label(format!("{} · {}", t(i18n::Key::History), hist_count))
-                .icon(AssetIcon::Clock)
-                .outline()
-                .on_click(cx.listener(|this, _ev, _window, cx| {
-                    this.history_open = !this.history_open;
-                    this.history_preview = None;
-                    cx.notify();
-                })),
-        );
-        toolbar = toolbar.child(gpui_kit::base::h_flex().flex_1());
-        toolbar = toolbar.child(
-            Button::new("done")
-                .label(t(i18n::Key::Done))
-                .ghost()
-                .on_click(cx.listener(|this, _ev, _window, cx| this.stop_editing(cx))),
-        );
-
-        // Body: preview via TextView, source via kit Textarea. The whole
-        // column gets the ⌘S key listener; it only acts on the exact combo
-        // so IME composition keystrokes flow to the input untouched.
-        let body = if preview {
-            let src = content_entity.read(cx).value().to_string();
-            let title_txt = title_entity.read(cx).value().to_string();
-            gpui_kit::base::v_flex()
-                .min_h_0()
-                .flex_1()
-                .child(
-                    TextView::markdown("editor-preview", browse::reader_markdown_src(
-                        &title_txt,
-                        &src,
-                        true,
-                    ))
-                    .scrollable(true)
-                    .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
-                )
-                .into_any_element()
-        } else {
-            gpui_kit::base::v_flex()
-                .min_h_0()
-                .flex_1()
-                .gap_2()
-                .child(
-                    Input::new(&title_entity)
-                        .appearance(false)
-                        .bordered(false)
-                        .h(px(32.)),
-                )
-                .child(Textarea::new(&content_entity).flex_1().min_h_0().h_full())
-                .into_any_element()
-        };
 
         let mut col = gpui_kit::base::v_flex()
             .w(px(READER_W))
             .mx_auto()
             .gap_2()
-            .min_h_0()
-            .h_full()
+            .min_h_0();
+        if let Some(bar) = bar {
+            col = col.child(bar);
+        }
+        col = col
+            .child(
+                gpui_kit::base::h_flex()
+                    .gap_2()
+                    .child(small_label(
+                        browse::note_meta(&nb_name, &n.tags, n.updated_time),
+                        muted,
+                    ))
+                    .child(gpui_kit::base::h_flex().flex_1()),
+            )
             .child(toolbar)
-            .child(body)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
-                // IME-safe: only exact cmd/ctrl+S (key_char is None for
-                // cmd combos), never intercepts composition keystrokes.
-                let m = &ev.keystroke.modifiers;
-                let exact = (m.platform || m.control) && !m.alt && !m.shift
-                    && ev.keystroke.key.eq_ignore_ascii_case("s");
-                if exact {
-                    this.save_editor(cx);
-                }
-            }));
-
-        // History popover (list + preview + restore).
-        if self.history_open {
-            let mut rows = gpui_kit::base::v_flex().gap_1();
-            if let Some(pid) = &self.history_preview {
-                if let Some(h) = history.iter().find(|h| &h.history_id == pid) {
-                    let src = browse::reader_markdown_src(&h.title, &h.content, true);
-                    let back_id = pid.clone();
-                    rows = rows
-                        .child(small_label(format!("{} · {}", h.title, fmt_time(h.created_time)), muted))
-                        .child(
-                            TextView::markdown("history-preview", src)
-                                .scrollable(true)
-                                .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
-                        )
-                        .child(
-                            Button::new("history-back")
-                                .label(t(i18n::Key::History))
-                                .outline()
-                                .on_click(cx.listener(move |this, _ev, _window, _cx| {
-                                    this.history_preview = None;
-                                })),
-                        );
-                    let rid = pid.clone();
-                    col = col.child(
-                        Button::new("history-restore")
-                            .label(t(i18n::Key::RestoreVersion))
-                            .icon(AssetIcon::RotateCcw)
-                            .primary()
-                            .on_click(cx.listener(move |this, _ev, window, cx| {
-                                this.restore_history_version(rid.clone(), window, cx)
-                            })),
-                    );
-                }
-            } else if history.is_empty() {
-                rows = rows.child(small_label(t(i18n::Key::HistoryEmpty), muted));
-            } else {
-                for h in &history {
-                    let hid = h.history_id.clone();
-                    let label = format!("{} · {}", h.title, fmt_time(h.created_time));
-                    rows = rows.child(
-                        Button::new(format!("history-row-{}", h.history_id.to_string()))
-                            .label(label)
-                            .ghost()
-                            .on_click(cx.listener(move |this, _ev, _window, _cx| {
-                                this.history_preview = Some(hid.clone());
-                            })),
-                    );
-                }
-            }
-            col = col.child(rows);
-        }
-
-        // Clear the one-frame saved flash after this render.
-        if saved_flash {
-            if let Some(ed) = &mut self.editing {
-                ed.saved_flash = false;
-            }
-        }
-        let _ = fg;
+            // GFM tables + strikethrough ship in TextView's default GFM
+            // parse options; `.scrollable` keeps the whole pane from
+            // scrolling away under the toolbar.
+            .child(
+                TextView::markdown("reader", src)
+                    .scrollable(true)
+                    .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
+            );
         pane.child(col)
     }
 }

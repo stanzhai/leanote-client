@@ -8,7 +8,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
-pub mod sync;
+pub mod html2md;
+ pub mod sync;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -497,6 +498,32 @@ impl Store {
             upsert_tags(&tx, &self.user_id, &t, now)?;
         }
         tx.commit()?;
+        self.get_note(id)
+    }
+    /// Ticket 12「转存为 Markdown」: convert a rich-text note's HTML body to
+    /// Markdown IN PLACE — Content overwritten, IsMarkdown=1, IsDirty=1 so
+    /// the next sync pushes updateNote. Explicit user action, one-way.
+    /// Returns None when the note id is unknown.
+    pub fn convert_to_markdown(&self, id: &Id) -> rusqlite::Result<Option<Note>> {
+        let Some(old) = self.get_note_any(id)? else {
+            return Ok(None);
+        };
+        if old.is_markdown {
+            return Ok(Some(old)); // already Markdown, nothing to convert
+        }
+        let md = crate::html2md::html_to_markdown(&old.content);
+        let now = now_ms();
+        self.conn.execute(
+            "UPDATE notes SET Content=?2, \"Desc\"=?3, Abstract=?4, IsMarkdown=1, IsDirty=1,
+                UpdatedTime=?5 WHERE NoteId=?1",
+            params![
+                id.to_string(),
+                md,
+                plain_desc(&md),
+                md.chars().take(500).collect::<String>(),
+                now,
+            ],
+        )?;
         self.get_note(id)
     }
 
