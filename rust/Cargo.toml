@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/leanote-core", "crates/leanote-cli"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }

@@ -1,0 +1,14 @@
+[package]
+name = "leanote-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "leanote"
+path = "src/main.rs"
+
+[dependencies]
+leanote-core = { path = "../leanote-core" }
+
+[dev-dependencies]
+rusqlite = { workspace = true }

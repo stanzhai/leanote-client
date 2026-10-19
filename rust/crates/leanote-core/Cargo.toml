@@ -1,0 +1,7 @@
+[package]
+name = "leanote-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rusqlite = { workspace = true }
