@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/leanote-core", "crates/leanote-cli", "crates/leanote-http", "fake-server"]
+members = ["crates/leanote-core", "crates/leanote-cli", "crates/leanote-http", "crates/leanote-app", "fake-server"]
 
 [workspace.package]
 edition = "2021"

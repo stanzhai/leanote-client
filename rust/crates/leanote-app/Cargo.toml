@@ -1,0 +1,20 @@
+[package]
+name = "leanote-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "leanote-app"
+path = "src/main.rs"
+
+[dependencies]
+leanote-core = { path = "../leanote-core" }
+leanote-fakeserver = { path = "../../fake-server" }
+gpui-kit = "0.7.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smol = "2"
+sys-locale = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
