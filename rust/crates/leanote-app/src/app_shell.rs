@@ -3,6 +3,7 @@
 //! read-only Markdown reader, star toggle, trash actions.
 
 use crate::browse::{self, NavNode};
+use crate::conflict_bar;
 use crate::i18n::{self, Lang};
 use crate::theme::{self, Material};
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -10,7 +11,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
-use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable};
+use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, WindowExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::{px, SharedString, Task, Window};
 use leanote_core::sync::{Api, SyncProgress, SyncStats};
@@ -38,6 +39,14 @@ pub enum Phase {
 enum Group {
     Notebooks,
     Tags,
+}
+
+/// Which conflict-bar button was pressed (ticket 14).
+#[derive(Clone, Copy)]
+enum ConflictChoice {
+    UseLocal,
+    UseServer,
+    KeepBoth,
 }
 
 /// What the middle list is filtered to (left-nav selection).
@@ -69,6 +78,13 @@ pub struct AppShell {
     /// Ticket 15: export outcome shown inline in the reader toolbar
     /// (e.g. PDF-fell-back-to-HTML reason). Cleared on selection change.
     export_status: Option<SharedString>,
+    /// Ticket 13: ⌘K search overlay (dialog-hosted palette + last rows).
+    search: crate::search_overlay::SearchOverlay,
+    search_rows: Vec<crate::search_overlay::ResultRow>,
+    // --- Ticket 12 rich-text state ---
+    /// Set after a successful Convert to Markdown; cleared when the
+    /// selection changes. Rendered as a one-line feedback next to the badge.
+    converted_note: Option<leanote_core::Id>,
 }
 
 /// Progress sink that forwards full_sync lines into a channel the UI drains.
@@ -140,6 +156,9 @@ impl AppShell {
             tags_open: true,
             selected: None,
             export_status: None,
+            search: crate::search_overlay::SearchOverlay::new(window, cx),
+            search_rows: Vec::new(),
+            converted_note: None,
         }
     }
 
@@ -232,9 +251,13 @@ impl AppShell {
         }));
     }
 
-    fn dark(&self, window: &Window) -> bool {
+    pub(crate) fn dark(&self, window: &Window) -> bool {
         window.appearance() == gpui_kit::WindowAppearance::Dark
             || window.appearance() == gpui_kit::WindowAppearance::VibrantDark
+    }
+
+    pub(crate) fn lang(&self) -> i18n::Lang {
+        self.lang
     }
 
     fn store(&self) -> Option<leanote_core::Store> {
@@ -308,13 +331,88 @@ impl AppShell {
 
     fn select_note(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
         self.selected = Some(id);
+        self.converted_note = None;
         cx.notify();
+    }
+
+    /// Ticket 13: ⌘K toggles the overlay from any phase (dialog layer is
+    /// window-level, not pane-level).
+    pub fn toggle_search(&self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        self.search.toggle(&cx.entity(), window, cx);
+    }
+
+    /// Overlay rows as of the last committed query (re-render source).
+    pub(crate) fn overlay_rows(&self) -> &[crate::search_overlay::ResultRow] {
+        &self.search_rows
+    }
+
+    /// Committed query → unified core search → rows. IME-safe: the palette
+    /// only calls this on `InputEvent::Change` (committed text).
+    pub(crate) fn run_overlay_search(&mut self, query: &str, cx: &mut gpui_kit::Context<Self>) {
+        self.search_rows = if crate::search_overlay::should_search(query, false) {
+            self.search_store(query)
+        } else {
+            Vec::new()
+        };
+        cx.notify();
+    }
+
+    /// ↩ on a row: open the note in the reader (`selected` drives it), then
+    /// close the overlay. The middle list keeps its filter/nav untouched.
+    pub(crate) fn confirm_overlay(
+        &mut self,
+        index: gpui_kit::component::IndexPath,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if let Some(row) = self.search_rows.get(index.row) {
+            let id = leanote_core::Id(row.note_id.clone());
+            self.select_note(id, cx);
+        }
+        window.close_dialog(cx);
+    }
+
+    fn search_store(&self, query: &str) -> Vec<crate::search_overlay::ResultRow> {
+        let Some(store) = self.store() else { return Vec::new() };
+        let hits = store.search(query, crate::search_overlay::RESULT_LIMIT).unwrap_or_default();
+        crate::search_overlay::format_rows(&hits, |id| {
+            store.notebook_title(id).unwrap_or_else(|_| id.to_string())
+        })
     }
 
     /// Star is local-only: toggle_star never touches IsDirty (GLOSSARY).
     fn toggle_star(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
         if let Some(store) = self.store() {
             let _ = store.toggle_star(&id);
+        }
+        cx.notify();
+    }
+
+    /// Ticket 14 conflict bar actions. All three clear the conflict row; the
+    /// store methods decide what happens to the note itself.
+    fn resolve_conflict(
+        &mut self,
+        how: ConflictChoice,
+        server_note_id: String,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if let Some(store) = self.store() {
+            match how {
+                ConflictChoice::UseLocal => {
+                    let _ = store.resolve_conflict_use_local(&server_note_id);
+                }
+                ConflictChoice::UseServer => {
+                    let _ = store.resolve_conflict_use_server(&server_note_id);
+                }
+                ConflictChoice::KeepBoth => {
+                    let suffix = conflict_bar::keep_both_suffix(self.lang);
+                    if let Ok(Some(new_id)) =
+                        store.resolve_conflict_keep_both(&server_note_id, suffix)
+                    {
+                        self.selected = Some(new_id);
+                    }
+                }
+            }
         }
         cx.notify();
     }
@@ -455,6 +553,22 @@ fn home_dir() -> std::path::PathBuf {
     std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
+    /// Ticket 12: one-way HTML → Markdown conversion of the selected
+    /// rich-text note. Persisted (content rewritten, IsMarkdown=1, dirty)
+    /// so the next push sends Markdown to the server; the reader re-renders
+    /// straight from the converted store row.
+    fn convert_selected_to_markdown(
+        &mut self,
+        id: leanote_core::Id,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if let Some(store) = self.store() {
+            if matches!(store.convert_to_markdown(&id), Ok(Some(_))) {
+                self.converted_note = Some(id);
+            }
+        }
+        cx.notify();
+    }
 }
 
 impl Render for AppShell {
@@ -466,7 +580,16 @@ impl Render for AppShell {
         let list_bg = theme::material(Material::List, dark);
 
         // Whole window: material[0] shows through the 44px transparent titlebar.
-        let root = gpui_kit::base::v_flex().size_full().bg(base_bg).text_color(cx.theme().foreground);
+        let root = gpui_kit::base::v_flex()
+            .size_full()
+            .bg(base_bg)
+            .text_color(cx.theme().foreground)
+            .on_action(
+                cx.listener(|this, _: &crate::search_overlay::ToggleSearch, window, cx| {
+                    // Any phase: the dialog layer is window-level.
+                    this.toggle_search(window, cx);
+                }),
+            );
 
         // 44px strip shares sidebar material — drawn by the root bg.
         let titlebar = gpui_kit::base::h_flex().h(px(TITLEBAR_H)).w_full().flex_none();
@@ -870,17 +993,51 @@ impl AppShell {
             .bg(theme::material(Material::Background, dark))
             .pt(px(TITLEBAR_H));
 
+        // Ticket 14: adjudication bar when this note (or any note) has an
+        // unresolved conflict. Built before the selection check so it also
+        // shows with nothing selected.
+        let conflicts = self
+            .store()
+            .and_then(|s| s.list_conflicts().ok())
+            .unwrap_or_default();
+        let bar = conflict_bar::bar_state(
+            &conflicts,
+            self.selected.as_ref().map(|id| id.to_string()).as_deref(),
+        )
+        .map(|c| {
+            let (sid, sid2, sid3) = (
+                c.server_note_id.clone(),
+                c.server_note_id.clone(),
+                c.server_note_id.clone(),
+            );
+            conflict_bar::render(
+                dark,
+                self.lang,
+                c,
+                cx.listener(move |this, _ev, _window, cx| {
+                    this.resolve_conflict(ConflictChoice::UseLocal, sid.clone(), cx)
+                }),
+                cx.listener(move |this, _ev, _window, cx| {
+                    this.resolve_conflict(ConflictChoice::UseServer, sid2.clone(), cx)
+                }),
+                cx.listener(move |this, _ev, _window, cx| {
+                    this.resolve_conflict(ConflictChoice::KeepBoth, sid3.clone(), cx)
+                }),
+            )
+        });
+
         let note = self
             .selected
             .as_ref()
             .and_then(|id| self.store().and_then(|s| s.get_note_any(id).ok().flatten()));
 
         let Some(n) = note else {
+            let mut empty = gpui_kit::base::v_flex().w(px(READER_W)).mx_auto().gap_2();
+            if let Some(bar) = bar {
+                empty = empty.child(bar);
+            }
             return pane.child(
-                gpui_kit::base::v_flex()
-                    .w(px(READER_W))
-                    .mx_auto()
-                    .gap_2()
+                empty
                     .child(small_label(i18n::t(self.lang, i18n::Key::NoSelection), muted))
                     .child(Label::new(t(i18n::Key::NoSelection)).text_size(px(16.)).text_color(fg)),
             );
@@ -907,6 +1064,26 @@ impl AppShell {
         };
 
         let mut toolbar = gpui_kit::base::h_flex().gap_2().child(star_btn);
+        // Ticket 12: rich-text notes are read-only Markdown renders; the
+        // only write path is the explicit convert action. No edit entry
+        // exists anywhere for them.
+        if !n.is_markdown {
+            let cid = n.note_id.clone();
+            toolbar = toolbar
+                .child(small_label(t(i18n::Key::RichTextReadonly), muted))
+                .child(
+                    Button::new("convert-md")
+                        .label(t(i18n::Key::ConvertToMarkdown))
+                        .outline()
+                        .on_click(cx.listener(move |this, _ev, _window, cx| {
+                            this.convert_selected_to_markdown(cid.clone(), cx)
+                        })),
+                );
+        }
+        if self.converted_note.as_ref() == Some(&n.note_id) {
+            toolbar =
+                toolbar.child(small_label(t(i18n::Key::ConvertedToMarkdown), muted));
+        }
         if is_trash_view {
             let rid = n.note_id.clone();
             toolbar = toolbar.child(
@@ -961,31 +1138,36 @@ impl AppShell {
         }
 
         let src = browse::reader_markdown_src(&n.title, &n.content, n.is_markdown);
-        pane.child(
-            gpui_kit::base::v_flex()
-                .w(px(READER_W))
-                .mx_auto()
-                .gap_2()
-                .min_h_0()
-                .child(
-                    gpui_kit::base::h_flex()
-                        .gap_2()
-                        .child(small_label(
-                            browse::note_meta(&nb_name, &n.tags, n.updated_time),
-                            muted,
-                        ))
-                        .child(gpui_kit::base::h_flex().flex_1()),
-                )
-                .child(toolbar)
-                // GFM tables + strikethrough ship in TextView's default GFM
-                // parse options; `.scrollable` keeps the whole pane from
-                // scrolling away under the toolbar.
-                .child(
-                    TextView::markdown("reader", src)
-                        .scrollable(true)
-                        .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
-                ),
-        )
+
+
+        let mut col = gpui_kit::base::v_flex()
+            .w(px(READER_W))
+            .mx_auto()
+            .gap_2()
+            .min_h_0();
+        if let Some(bar) = bar {
+            col = col.child(bar);
+        }
+        col = col
+            .child(
+                gpui_kit::base::h_flex()
+                    .gap_2()
+                    .child(small_label(
+                        browse::note_meta(&nb_name, &n.tags, n.updated_time),
+                        muted,
+                    ))
+                    .child(gpui_kit::base::h_flex().flex_1()),
+            )
+            .child(toolbar)
+            // GFM tables + strikethrough ship in TextView's default GFM
+            // parse options; `.scrollable` keeps the whole pane from
+            // scrolling away under the toolbar.
+            .child(
+                TextView::markdown("reader", src)
+                    .scrollable(true)
+                    .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
+            );
+        pane.child(col)
     }
 }
 

@@ -1,7 +1,5 @@
 //! zh/en interface strings, following the system language (Q12: only zh/en).
 
-
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
     Zh,
@@ -62,10 +60,22 @@ keys! {
     Restore => ("恢复", "Restore"),
     HardDelete => ("彻底删除", "Delete forever"),
     EmptyTrash => ("清空废纸篓", "Empty trash"),
+    // Ticket 13: ⌘K search overlay.
+    SearchPlaceholder => ("搜索笔记…", "Search notes…"),
+    SearchNoResults => ("没有匹配的笔记", "No matching notes"),
+    SearchEmptyHint => ("输入关键词搜索标题、内容与标签", "Type to search titles, content and tags"),
+    SearchFootnote => ("↑↓ 选择   ↩ 打开   esc 关闭", "↑↓ navigate   ↩ open   esc close"),
     // Ticket 12: rich-text notes render read-only as converted Markdown.
     RichTextReadonly => ("富文本（只读）", "Rich text (read only)"),
-    ConvertToMarkdown => ("转存为 Markdown", "Convert to Markdown"),
-    ConvertedToMarkdown => ("已转存为 Markdown", "Converted to Markdown"),
+    ConvertToMarkdown => ("转换为 Markdown", "Convert to Markdown"),
+    ConvertedToMarkdown => ("已转换为 Markdown", "Converted to Markdown"),
+    // Ticket 14: conflict adjudication bar.
+    ConflictTitle => ("检测到同步冲突", "Sync conflict detected"),
+    ConflictLocal => ("本地版本", "Local version"),
+    ConflictServer => ("服务器版本", "Server version"),
+    UseLocal => ("用本地", "Use local"),
+    UseServer => ("用服务器", "Use server"),
+    KeepBoth => ("两边保留", "Keep both"),
     // Ticket 15: export actions + PDF-fallback reason.
     ExportHtml => ("导出 HTML", "Export HTML"),
     ExportMarkdown => ("导出 Markdown", "Export Markdown"),
@@ -115,5 +125,8 @@ mod tests {
         Key::RichTextReadonly, Key::ConvertToMarkdown, Key::ConvertedToMarkdown,
         Key::ExportHtml, Key::ExportMarkdown, Key::ExportPdf, Key::ExportBackup,
         Key::PdfFellBack, Key::NotSynced,
+        Key::ConflictTitle, Key::ConflictLocal, Key::ConflictServer,
+        Key::UseLocal, Key::UseServer, Key::KeepBoth,
+        Key::SearchPlaceholder, Key::SearchNoResults, Key::SearchEmptyHint, Key::SearchFootnote,
     ];
 }
