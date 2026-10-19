@@ -589,6 +589,247 @@ impl Store {
         )
     }
 
+
+    // ---- Ticket 11: notebook & tag management (offline, sync-pushed) ----
+
+    /// JS Notebook.addNotebook: new row, LocalIsNew+IsDirty (pushed on the
+    /// next sync). Seq = max sibling + 1 so it lands last in its group —
+    /// the visible order the user expects, unlike the JS tree's Seq:-1.
+    pub fn create_notebook(&self, title: &str, parent_id: &str) -> rusqlite::Result<Notebook> {
+        let tx = self.conn.unchecked_transaction()?;
+        let max_seq: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(Seq), -1) FROM notebooks
+                 WHERE UserId=?1 AND ParentNotebookId=?2",
+                params![self.user_id, parent_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1);
+        let id = Id::new();
+        let now = now_ms();
+        tx.execute(
+            "INSERT INTO notebooks (NotebookId, UserId, Title, ParentNotebookId, Seq, Usn,
+                LocalIsNew, IsDirty, LocalIsDelete, CreatedTime, UpdatedTime)
+             VALUES (?1,?2,?3,?4,?5,0,1,1,0,?6,?6)",
+            params![id.to_string(), self.user_id, title, parent_id, max_seq + 1, now],
+        )?;
+        tx.commit()?;
+        Ok(self
+            .notebooks()?
+            .into_iter()
+            .find(|nb| nb.notebook_id == id)
+            .expect("just inserted"))
+    }
+
+    /// JS Notebook.updateNotebookTitle: Title + IsDirty + UpdatedTime.
+    pub fn rename_notebook(&self, id: &Id, title: &str) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE notebooks SET Title=?2, IsDirty=1, UpdatedTime=?3 WHERE NotebookId=?1",
+            params![id.to_string(), title, now_ms()],
+        )
+    }
+
+    /// Ticket 11 (ticket text overrides the JS guard): deleting a notebook
+    /// sends its notes to trash — IsTrash+LocalIsDelete+IsDirty, exactly
+    /// `trash_note`, never a hard delete — so nothing is lost. Child
+    /// notebooks are deleted the same soft way (LocalIsDelete+IsDirty; sync
+    /// pushes notebook/deleteNotebook, or drops them locally when they were
+    /// never pushed).
+    pub fn delete_notebook(&self, id: &Id) -> rusqlite::Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let now = now_ms();
+        // this notebook + every descendant.
+        let mut all = vec![id.to_string()];
+        let mut frontier = vec![id.to_string()];
+        while let Some(p) = frontier.pop() {
+            let kids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT NotebookId FROM notebooks
+                     WHERE ParentNotebookId=?1 AND LocalIsDelete=0",
+                )?;
+                let v = stmt
+                    .query_map([p], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                v
+            };
+            for child in kids {
+                frontier.push(child.clone());
+                all.push(child);
+            }
+        }
+        for nb_id in &all {
+            // notes → trash (not lost)
+            tx.execute(
+                "UPDATE notes SET IsTrash=1, LocalIsDelete=1, IsDirty=1, UpdatedTime=?2
+                 WHERE NotebookId=?1 AND IsTrash=0",
+                params![nb_id, now],
+            )?;
+            tx.execute(
+                "UPDATE notebooks SET LocalIsDelete=1, IsDirty=1, UpdatedTime=?2 WHERE NotebookId=?1",
+                params![nb_id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(all.len())
+    }
+
+    /// JS Notebook.dragNotebooks: the moved notebook plus EVERY sibling in
+    /// both the old and the new parent group gets ParentNotebookId/Seq
+    /// rewritten, IsDirty=1. Either pass the full new sibling order for the
+    /// target group (`sibling_order` containing `id`), or an empty order and
+    /// `new_index` to insert among the existing siblings.
+    pub fn move_notebook(
+        &self,
+        id: &Id,
+        new_parent: &str,
+        new_index: usize,
+        sibling_order: &[String],
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let now = now_ms();
+        let old_parent: String = tx
+            .query_row(
+                "SELECT ParentNotebookId FROM notebooks WHERE NotebookId=?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+
+        let rewrite = |group_parent: &str, order: &[String]| -> rusqlite::Result<()> {
+            for (seq, nb) in order.iter().enumerate() {
+                tx.execute(
+                    "UPDATE notebooks SET ParentNotebookId=?2, Seq=?3, IsDirty=1, UpdatedTime=?4
+                     WHERE NotebookId=?1",
+                    params![nb, group_parent, seq as i64, now],
+                )?;
+            }
+            Ok(())
+        };
+
+        // Old group minus the moved notebook, re-packed 0..n-1.
+        let old_rest: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT NotebookId FROM notebooks
+                 WHERE ParentNotebookId=?1 AND NotebookId<>?2 AND LocalIsDelete=0
+                 ORDER BY Seq, rowid",
+            )?;
+            let v = stmt
+                .query_map(params![old_parent, id.to_string()], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            v
+        };
+        rewrite(&old_parent, &old_rest)?;
+
+        // New group: caller-provided order, or insert at new_index.
+        if sibling_order.iter().any(|s| s == &id.to_string()) {
+            rewrite(new_parent, sibling_order)?;
+        } else {
+            let mut group: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT NotebookId FROM notebooks
+                     WHERE ParentNotebookId=?1 AND LocalIsDelete=0 ORDER BY Seq, rowid",
+                )?;
+                let v = stmt
+                    .query_map([new_parent], |r| r.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                v
+            };
+            let at = new_index.min(group.len());
+            group.insert(at, id.to_string());
+            rewrite(new_parent, &group)?;
+        }
+        tx.commit()
+    }
+
+    /// Ticket 11: rename a tag globally — every note's Tags CSV rewritten
+    /// (whole-tag match only), affected notes IsDirty, tag row retitled
+    /// (IsDirty stays set, so the add of the new name pushes next sync).
+    /// JS never shipped a global rename; the Electron UI edits per-note tags.
+    pub fn rename_tag(&self, old: &str, new: &str) -> rusqlite::Result<usize> {
+        if old == new || new.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let now = now_ms();
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT NoteId, Tags FROM notes WHERE LocalIsDelete=0")?;
+            let v = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            v
+        };
+        let mut changed = 0;
+        for (note_id, csv) in rows {
+            let mut tags: Vec<String> =
+                csv.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
+            if !tags.iter().any(|t| t == old) {
+                continue;
+            }
+            for t in tags.iter_mut() {
+                if t == old {
+                    *t = new.to_string();
+                }
+            }
+            tx.execute(
+                "UPDATE notes SET Tags=?2, IsDirty=1, UpdatedTime=?3 WHERE NoteId=?1",
+                params![note_id, tags.join(","), now],
+            )?;
+            changed += 1;
+        }
+        // retitle the tag row; JS re-adds the new name on next use
+        let n = tx.execute(
+            "UPDATE tags SET Tag=?2, UpdatedTime=?3, LocalIsDelete=0, IsDirty=1
+             WHERE UserId=?4 AND Tag=?1",
+            params![old, new, now, self.user_id],
+        )?;
+        if n == 0 {
+            tx.execute(
+                "INSERT INTO tags (TagId, UserId, Tag, IsDirty, Count, LocalIsDelete, CreatedTime, UpdatedTime)
+                 VALUES (?1,?2,?3,1,1,0,?4,?4)",
+                params![Id::new().to_string(), self.user_id, new, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// JS Tag.deleteTag + Note.updateNoteToDeleteTag: tag row soft-deleted
+    /// (LocalIsDelete+IsDirty → tag/deleteTag push), every note's Tags CSV
+    /// loses the tag and goes IsDirty. Returns notes touched.
+    pub fn delete_tag(&self, tag: &str) -> rusqlite::Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let now = now_ms();
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT NoteId, Tags FROM notes WHERE LocalIsDelete=0")?;
+            let v = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            v
+        };
+        let mut changed = 0;
+        for (note_id, csv) in rows {
+            let mut tags: Vec<String> =
+                csv.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
+            let before = tags.len();
+            tags.retain(|t| t != tag);
+            if tags.len() == before {
+                continue;
+            }
+            tx.execute(
+                "UPDATE notes SET Tags=?2, IsDirty=1, UpdatedTime=?3 WHERE NoteId=?1",
+                params![note_id, tags.join(","), now],
+            )?;
+            changed += 1;
+        }
+        tx.execute(
+            "UPDATE tags SET LocalIsDelete=1, IsDirty=1, UpdatedTime=?2 WHERE UserId=?3 AND Tag=?1",
+            params![tag, now, self.user_id],
+        )?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
     /// Unified search (spec §30): case-insensitive substring over
     /// Title+Content+Tags, weights Title 3 / Tags 2 / Content 1, excerpt
     /// window exactly as `src/leanote_cli.js` cmdSearch.

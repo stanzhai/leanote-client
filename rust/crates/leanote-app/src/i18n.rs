@@ -71,6 +71,16 @@ keys! {
     UseLocal => ("用本地", "Use local"),
     UseServer => ("用服务器", "Use server"),
     KeepBoth => ("两边保留", "Keep both"),
+    // Ticket 11: nav context actions.
+    NewNotebook => ("新建笔记本", "New Notebook"),
+    RenameNotebook => ("重命名笔记本", "Rename Notebook"),
+    DeleteNotebook => ("删除笔记本", "Delete Notebook"),
+    MoveNotebookTo => ("移动到…", "Move to…"),
+    RootLevel => ("顶层", "Top level"),
+    RenameTag => ("重命名标签", "Rename Tag"),
+    DeleteTag => ("删除标签", "Delete Tag"),
+    Confirm => ("确定", "OK"),
+    Cancel => ("取消", "Cancel"),
 }
 
 #[cfg(test)]
@@ -113,5 +123,7 @@ mod tests {
         Key::RichTextReadonly, Key::ConvertToMarkdown, Key::ConvertedToMarkdown,
         Key::ConflictTitle, Key::ConflictLocal, Key::ConflictServer,
         Key::UseLocal, Key::UseServer, Key::KeepBoth,
+        Key::NewNotebook, Key::RenameNotebook, Key::DeleteNotebook, Key::MoveNotebookTo,
+        Key::RootLevel, Key::RenameTag, Key::DeleteTag, Key::Confirm, Key::Cancel,
     ];
 }

@@ -691,3 +691,155 @@ async fn incr_resolve_keep_both_splits_and_pushes_copy_via_addnote() {
     assert_eq!(add.fields["Content"].as_str().unwrap(), "# Note 42\n\nlocal edit");
     assert!(s.list_conflicts().unwrap().is_empty());
 }
+
+// ---- Ticket 11: notebook/tag management pushes ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn notebook_ops_push_add_update_delete_with_seq() {
+    let (srv, _dir, s, api) = synced("t11_nb_ops").await;
+    let nb1 = s.notebooks().unwrap().into_iter().find(|nb| nb.title == "Notebook 1").unwrap();
+
+    // offline: create (root) + create (child) + rename + move
+    let work = s.create_notebook("Work", "").unwrap();
+    assert_eq!(work.seq, 4, "root max seq was 3 (nb1,nb3 roots) + 1");
+    let sub = s.create_notebook("Work-sub", &work.notebook_id).unwrap();
+    assert_eq!(sub.seq, 0);
+    s.rename_notebook(&work.notebook_id, "Work2").unwrap();
+    // move nb1 (root, seq 1) to the FRONT of root via explicit order
+    s.move_notebook(
+        &nb1.notebook_id,
+        "",
+        0,
+        &[nb1.notebook_id.to_string(), work.notebook_id.to_string(), "nb3".into()],
+    )
+    .unwrap();
+
+    srv.clear_pushes();
+    incr_sync(&api, &s, &NoProgress).unwrap();
+
+    let pushes = srv.pushes();
+    // adds pushed for LocalIsNew notebooks
+    let adds: Vec<&leanote_fakeserver::RecordedPush> =
+        pushes.iter().filter(|p| p.endpoint == "notebook/addNotebook").collect();
+    assert_eq!(adds.len(), 2, "Work2 + Work-sub added: {:?}", adds);
+    let titles: Vec<&str> = adds.iter().map(|p| p.fields["title"].as_str().unwrap()).collect();
+    assert!(titles.contains(&"Work2"), "renamed title pushed: {titles:?}");
+    assert!(titles.contains(&"Work-sub"));
+    // child seq pushed as its in-group seq
+    let sub_push = adds.iter().find(|p| p.fields["title"] == json!("Work-sub")).unwrap();
+    assert_eq!(sub_push.fields["seq"].as_str().unwrap_or("0"), "0");
+    // update pushed for every rewritten root sibling (nb1, nb3); Work2 was
+    // LocalIsNew so it travels as addNotebook, not updateNotebook
+    let ups: Vec<&leanote_fakeserver::RecordedPush> =
+        pushes.iter().filter(|p| p.endpoint == "notebook/updateNotebook").collect();
+    assert!(ups.len() >= 2, "moved group rewritten: {:?}", ups);
+    let nb1_up = ups
+        .iter()
+        .find(|p| p.fields["notebookId"] == json!("nb1"))
+        .expect("nb1 updateNotebook pushed");
+    assert_eq!(nb1_up.fields["seq"].as_str().unwrap_or("0"), "0", "nb1 moved to front → Seq 0");
+
+    // delete: notes to trash + notebook soft-deleted → deleteNotebook + updateNote(IsTrash) pushes
+    srv.clear_pushes();
+    s.delete_notebook(&work.notebook_id).unwrap();
+    incr_sync(&api, &s, &NoProgress).unwrap();
+    let pushes = srv.pushes();
+    assert!(
+        pushes.iter().any(|p| p.endpoint == "notebook/deleteNotebook"),
+        "deleteNotebook pushed: {:?}",
+        pushes.iter().map(|p| p.endpoint.clone()).collect::<Vec<_>>()
+    );
+    assert!(s.list_trash().unwrap().is_empty(), "no notes lived in Work");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_notebook_pushes_trashed_notes_and_notebook_delete() {
+    let (srv, _dir, s, api) = synced("t11_nb_delete").await;
+    let nb2 = s.notebooks().unwrap().into_iter().find(|nb| nb.title == "Notebook 2").unwrap();
+    let live: i64 = s
+        .raw_query_row("SELECT COUNT(*) FROM notes WHERE NotebookId='nb2' AND IsTrash=0")
+        .unwrap();
+    assert_eq!(live, 150, "dataset: 450 notes cycled over 3 notebooks");
+
+    s.delete_notebook(&nb2.notebook_id).unwrap();
+    let trash = s.list_trash().unwrap();
+    assert_eq!(trash.len(), 150, "notes trashed, not lost");
+    assert!(s.raw_query_row("SELECT COUNT(*) FROM notes WHERE NotebookId='nb2'").unwrap() >= 150);
+
+    srv.clear_pushes();
+    incr_sync(&api, &s, &NoProgress).unwrap();
+    let pushes = srv.pushes();
+    assert!(
+        pushes.iter().any(|p| p.endpoint == "notebook/deleteNotebook"),
+        "notebook delete pushed"
+    );
+    // trashing is the existing trash_note semantics → note/deleteTrash push
+    let trashed_pushes: Vec<&leanote_fakeserver::RecordedPush> = pushes
+        .iter()
+        .filter(|p| p.endpoint == "note/deleteTrash")
+        .collect();
+    assert_eq!(trashed_pushes.len(), 150, "every trashed note pushed deleteTrash");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn note_move_pushes_server_notebook_id() {
+    let (srv, _dir, s, api) = synced("t11_note_move").await;
+    // note0043: 43 % 3 = 1 → nb2. move it to nb3.
+    s.set_notebook(&Id("note0043".into()), &Id("nb3".into())).unwrap();
+
+    srv.clear_pushes();
+    incr_sync(&api, &s, &NoProgress).unwrap();
+    let pushes = srv.pushes();
+    let up = find_push(&pushes, "note/updateNote");
+    assert_eq!(up.fields["NoteId"].as_str().unwrap(), "note0043");
+    assert_eq!(
+        up.fields["NotebookId"].as_str().unwrap(),
+        "nb3",
+        "push resolves the target notebook's server id (JS keeps ids aligned)"
+    );
+    let n = s.get_note_any(&Id("note0043".into())).unwrap().unwrap();
+    assert!(!n.is_dirty, "pushed clean");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tag_rename_and_delete_push_updated_tags() {
+    let (srv, _dir, s, api) = synced("t11_tags").await;
+    // rename: notes 0,10,...,440 carry "shared"
+    assert_eq!(s.rename_tag("shared", "team").unwrap(), 45);
+
+    srv.clear_pushes();
+    incr_sync(&api, &s, &NoProgress).unwrap();
+    let pushes = srv.pushes();
+    let ups: Vec<&leanote_fakeserver::RecordedPush> =
+        pushes.iter().filter(|p| p.endpoint == "note/updateNote").collect();
+    assert_eq!(ups.len(), 45, "every tagged note pushed: got {}", ups.len());
+    let tags_of = |p: &leanote_fakeserver::RecordedPush| -> String {
+        match p.fields.get("Tags") {
+            Some(serde_json::Value::Array(a)) =>
+                a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            _ => String::new(),
+        }
+    };
+    assert!(ups.iter().all(|p| tags_of(p) == "team"), "server sees the renamed tag");
+    // the new tag name itself is added on the server
+    assert!(
+        pushes.iter().any(|p| p.endpoint == "tag/addTag" && p.fields["tag"] == json!("team")),
+        "tag/addTag for the new name: {:?}",
+        pushes.iter().filter(|p| p.endpoint == "tag/addTag").map(|p| p.fields.clone()).collect::<Vec<_>>()
+    );
+
+    // delete: tag row soft-deleted → tag/deleteTag; notes re-pushed without it
+    srv.clear_pushes();
+    assert_eq!(s.delete_tag("team").unwrap(), 45);
+    incr_sync(&api, &s, &NoProgress).unwrap();
+    let pushes = srv.pushes();
+    assert!(
+        pushes.iter().any(|p| p.endpoint == "tag/deleteTag" && p.fields["tag"] == json!("team")),
+        "tag/deleteTag pushed"
+    );
+    let ups: Vec<&leanote_fakeserver::RecordedPush> =
+        pushes.iter().filter(|p| p.endpoint == "note/updateNote").collect();
+    assert_eq!(ups.len(), 45);
+    assert!(ups.iter().all(|p| tags_of(p).is_empty()), "tag stripped from every note");
+}

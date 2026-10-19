@@ -317,3 +317,179 @@ fn trash_restore_hard_delete_and_empty() {
     let work_count = counts.iter().find(|(id, _)| *id == work_nb.notebook_id).map(|(_, c)| *c);
     assert_eq!(work_count, Some(1));
 }
+
+// ---- Ticket 11: notebook & tag management ----
+
+fn nb_id(s: &Store, title: &str) -> leanote_core::Id {
+    s.notebooks()
+        .unwrap()
+        .into_iter()
+        .find(|nb| nb.title == title)
+        .unwrap_or_else(|| panic!("notebook {title} missing"))
+        .notebook_id
+}
+
+/// Notebook ids of one sibling group in Seq order.
+fn group_seq(s: &Store, parent: &str) -> Vec<(String, i64)> {
+    let mut v: Vec<(String, i64)> = s
+        .notebooks()
+        .unwrap()
+        .into_iter()
+        .filter(|nb| nb.parent_notebook_id == parent)
+        .map(|nb| (nb.title, nb.seq))
+        .collect();
+    v.sort_by_key(|(_, seq)| *seq);
+    v
+}
+
+#[test]
+fn notebook_crud_flags_and_seq() {
+    let s = store("t11_crud");
+    let a = s.create_notebook("A", "").unwrap();
+    let b = s.create_notebook("B", "").unwrap();
+    assert!(a.is_new && a.is_dirty, "create sets LocalIsNew+IsDirty (JS addNotebook)");
+    assert_eq!((a.seq, b.seq), (0, 1), "Seq = max sibling + 1");
+    // nested: seq independent per parent group
+    let a1 = s.create_notebook("A1", &a.notebook_id).unwrap();
+    assert_eq!(a1.seq, 0);
+    assert_eq!(a1.parent_notebook_id, a.notebook_id.to_string());
+    // rename: dirty, new title
+    assert_eq!(s.rename_notebook(&b.notebook_id, "B2").unwrap(), 1);
+    let b2 = s.notebooks().unwrap().into_iter().find(|nb| nb.notebook_id == b.notebook_id).unwrap();
+    assert_eq!((b2.title.as_str(), b2.is_dirty), ("B2", true));
+}
+
+#[test]
+fn delete_notebook_trashes_notes_not_lost() {
+    let s = store("t11_delete");
+    let a = s.create_notebook("A", "").unwrap();
+    add(&s, "n1", "c", &[], "A");
+    add(&s, "n2", "c", &[], "A");
+    let child = s.create_notebook("A-child", &a.notebook_id).unwrap();
+    add(&s, "n3", "c", &[], "A-child");
+    let before = s.note_count().unwrap();
+
+    s.delete_notebook(&a.notebook_id).unwrap();
+
+    // notes survive in trash, dirty for the deleteTrash push
+    let trash = s.list_trash().unwrap();
+    assert_eq!(trash.len(), 3, "all notes of the subtree land in trash");
+    assert!(trash.iter().all(|n| n.is_trash));
+    assert_eq!(s.note_count().unwrap(), before, "nothing hard-deleted");
+    let dirty: i64 = s
+        .raw_query_row("SELECT COUNT(*) FROM notes WHERE IsTrash=1 AND IsDirty=1")
+        .unwrap();
+    assert_eq!(dirty, 3);
+    // notebook subtree soft-deleted (hidden from nav, dirty for the push)
+    let nbs = s.notebooks().unwrap();
+    assert!(nbs.iter().all(|nb| nb.notebook_id != a.notebook_id && nb.notebook_id != child.notebook_id));
+    let deleted_rows: i64 = s
+        .raw_query_row("SELECT COUNT(*) FROM notebooks WHERE LocalIsDelete=1 AND IsDirty=1")
+        .unwrap();
+    assert_eq!(deleted_rows, 2, "parent + child notebook rows soft-deleted");
+}
+
+#[test]
+fn move_notebook_rewrites_both_sibling_groups() {
+    let s = store("t11_move");
+    let a = s.create_notebook("A", "").unwrap();
+    let b = s.create_notebook("B", "").unwrap();
+    let c = s.create_notebook("C", "").unwrap();
+    let b1 = s.create_notebook("B1", &b.notebook_id).unwrap();
+    let _b2 = s.create_notebook("B2", &b.notebook_id).unwrap();
+
+    // 1. reorder within root: C to the front via explicit sibling order
+    s.move_notebook(
+        &c.notebook_id,
+        "",
+        0,
+        &[c.notebook_id.to_string(), a.notebook_id.to_string(), b.notebook_id.to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+        group_seq(&s, ""),
+        vec![("C".into(), 0), ("A".into(), 1), ("B".into(), 2)]
+    );
+    assert!(
+        s.notebooks().unwrap().iter().all(|nb| nb.is_dirty),
+        "the whole rewritten group is dirty for the updateNotebook push"
+    );
+
+    // 2. reparent by index: A under B at index 1 (between B1 and B2)
+    s.move_notebook(&a.notebook_id, &b.notebook_id.to_string(), 1, &[]).unwrap();
+    assert_eq!(
+        group_seq(&s, ""),
+        vec![("C".into(), 0), ("B".into(), 1)],
+        "old root group re-packed 0..n-1 after A left"
+    );
+    assert_eq!(
+        group_seq(&s, &b.notebook_id.to_string()),
+        vec![("B1".into(), 0), ("A".into(), 1), ("B2".into(), 2)]
+    );
+    let a_row = s.notebooks().unwrap().into_iter().find(|nb| nb.title == "A").unwrap();
+    assert_eq!(a_row.parent_notebook_id, b.notebook_id.to_string());
+    assert!(a_row.is_dirty);
+    let _ = b1;
+}
+
+#[test]
+fn tag_rename_and_delete_are_global() {
+    let s = store("t11_tags");
+    add(&s, "n1", "c", &["rust", "gpui"], "AI札");
+    add(&s, "n2", "c", &["rust"], "AI札");
+    add(&s, "n3", "c", &["rustlang", "other"], "AI札");
+
+    // rename: whole-tag match only ("rustlang" untouched), notes dirty
+    assert_eq!(s.rename_tag("rust", "rust2").unwrap(), 2);
+    let n1 = s.get_note_any(&s.list_notes().unwrap()[0].note_id.clone()).unwrap();
+    let _ = n1;
+    let by_title = |t: &str| {
+        s.list_notes()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.title == t)
+            .unwrap()
+    };
+    assert_eq!(by_title("n1").tags, vec!["rust2", "gpui"]);
+    assert_eq!(by_title("n2").tags, vec!["rust2"]);
+    assert_eq!(by_title("n3").tags, vec!["rustlang", "other"], "no substring hit");
+    assert!(by_title("n1").is_dirty && by_title("n2").is_dirty);
+    // n3 is a fresh add_note (IsDirty=1 from creation); the rename must
+    // not touch it — verified by its unchanged Tags.
+    let tag_titles: Vec<String> = s.tags().unwrap().into_iter().map(|t| t.tag).collect();
+    assert!(tag_titles.contains(&"rust2".to_string()) && !tag_titles.contains(&"rust".to_string()));
+
+    // delete: removed everywhere, tag row gone from live list
+    assert_eq!(s.delete_tag("rust2").unwrap(), 2);
+    assert_eq!(by_title("n1").tags, vec!["gpui"]);
+    assert_eq!(by_title("n2").tags, Vec::<String>::new());
+    let live: Vec<String> = s.tags().unwrap().into_iter().map(|t| t.tag).collect();
+    assert!(!live.contains(&"rust2".to_string()));
+    let deleted_row: i64 = s
+        .raw_query_row("SELECT COUNT(*) FROM tags WHERE Tag='rust2' AND LocalIsDelete=1 AND IsDirty=1")
+        .unwrap();
+    assert_eq!(deleted_row, 1, "tag row soft-deleted + dirty → deleteTag push");
+}
+
+#[test]
+fn dirty_flags_ready_for_sync_push() {
+    let s = store("t11_push");
+    // notebook create/rename/move leave IsDirty=1 rows the push phase reads
+    let a = s.create_notebook("A", "").unwrap();
+    s.rename_notebook(&a.notebook_id, "A2").unwrap();
+    let dirty_nb: i64 = s.raw_query_row("SELECT COUNT(*) FROM notebooks WHERE IsDirty=1").unwrap();
+    assert_eq!(dirty_nb, 1);
+    s.move_notebook(&a.notebook_id, "", 0, &[a.notebook_id.to_string()]).unwrap();
+    assert_eq!(
+        s.raw_query_row("SELECT COUNT(*) FROM notebooks WHERE IsDirty=1").unwrap(),
+        1
+    );
+    // tag ops mark notes dirty
+    add(&s, "n", "c", &["t"], "A2");
+    s.rename_tag("t", "t2").unwrap();
+    s.delete_tag("t2").unwrap();
+    assert_eq!(
+        s.raw_query_row("SELECT COUNT(*) FROM notes WHERE IsDirty=1").unwrap(),
+        1
+    );
+}

@@ -8,12 +8,13 @@ use crate::i18n::{self, Lang};
 use crate::theme::{self, Material};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable};
 use gpui_kit::prelude::*;
-use gpui_kit::{px, SharedString, Task, Window};
+use gpui_kit::{px, AnyElement, SharedString, Task, Window};
 use leanote_core::sync::{Api, SyncProgress, SyncStats};
 use std::sync::{Arc, Mutex};
 
@@ -49,6 +50,18 @@ enum ConflictChoice {
     KeepBoth,
 }
 
+/// In-flight nav edit (ticket 11): one at a time.
+enum NavEdit {
+    /// Create a notebook under this parent ("" = root).
+    NewNotebook { parent: String, name: gpui_kit::Entity<InputState> },
+    /// Rename this notebook.
+    RenameNotebook { id: leanote_core::Id, name: gpui_kit::Entity<InputState> },
+    /// Move this notebook: picking the target parent.
+    MoveNotebook { id: leanote_core::Id },
+    /// Rename this tag.
+    RenameTag { old: String, name: gpui_kit::Entity<InputState> },
+}
+
 /// What the middle list is filtered to (left-nav selection).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NavSelection {
@@ -79,6 +92,8 @@ pub struct AppShell {
     /// Set after a successful Convert to Markdown; cleared when the
     /// selection changes. Rendered as a one-line feedback next to the badge.
     converted_note: Option<leanote_core::Id>,
+    // --- Ticket 11 nav management ---
+    nav_edit: Option<NavEdit>,
 }
 
 /// Progress sink that forwards full_sync lines into a channel the UI drains.
@@ -150,6 +165,7 @@ impl AppShell {
             tags_open: true,
             selected: None,
             converted_note: None,
+            nav_edit: None,
         }
     }
 
@@ -405,6 +421,121 @@ impl AppShell {
     }
 }
 
+impl AppShell {
+    // ---- Ticket 11: nav management actions (context menus + inline input) ----
+
+    fn begin_new_notebook(
+        &mut self,
+        parent: String,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        let name = cx.new(|cx| InputState::new(window, cx));
+        self.nav_edit = Some(NavEdit::NewNotebook { parent, name });
+        cx.notify();
+    }
+
+    fn begin_rename_notebook(
+        &mut self,
+        id: leanote_core::Id,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        let name = cx.new(|cx| InputState::new(window, cx));
+        self.nav_edit = Some(NavEdit::RenameNotebook { id, name });
+        cx.notify();
+    }
+
+    fn begin_move_notebook(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
+        self.nav_edit = Some(NavEdit::MoveNotebook { id });
+        cx.notify();
+    }
+
+    fn begin_rename_tag(
+        &mut self,
+        old: String,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        let name = cx.new(|cx| InputState::new(window, cx));
+        self.nav_edit = Some(NavEdit::RenameTag { old, name });
+        cx.notify();
+    }
+
+    /// Apply the in-flight edit (Enter / OK button). Empty input no-ops.
+    fn apply_nav_edit(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        let edit = self.nav_edit.take();
+        match edit {
+            Some(NavEdit::NewNotebook { parent, name }) => {
+                let title = name.read(cx).value().to_string();
+                let title = title.trim();
+                if !title.is_empty() {
+                    if let Some(store) = self.store() {
+                        let _ = store.create_notebook(title, &parent);
+                    }
+                }
+            }
+            Some(NavEdit::RenameNotebook { id, name }) => {
+                let title = name.read(cx).value().to_string();
+                let title = title.trim();
+                if !title.is_empty() {
+                    if let Some(store) = self.store() {
+                        let _ = store.rename_notebook(&id, title);
+                    }
+                }
+            }
+            Some(NavEdit::RenameTag { old, name }) => {
+                let new = name.read(cx).value().to_string();
+                let new = new.trim();
+                if !new.is_empty() && new != old {
+                    if let Some(store) = self.store() {
+                        let _ = store.rename_tag(&old, new);
+                    }
+                    if self.nav == NavSelection::Tag(old.clone()) {
+                        self.nav = NavSelection::Tag(new.to_string());
+                    }
+                }
+            }
+            // MoveNotebook resolves directly in move_notebook_to
+            Some(NavEdit::MoveNotebook { .. }) | None => {}
+        }
+        cx.notify();
+    }
+
+    /// Context-menu "Move to…" target chosen: reparent as the last child.
+    /// (Full drag-reorder is the drag-drop ticket's UI; Seq rewriting and
+    /// the sibling-group push semantics are identical either way.)
+    fn move_notebook_to(&mut self, id: leanote_core::Id, parent: String, cx: &mut gpui_kit::Context<Self>) {
+        if let Some(store) = self.store() {
+            let _ = store.move_notebook(&id, &parent, usize::MAX, &[]);
+        }
+        self.nav_edit = None;
+        cx.notify();
+    }
+
+    fn delete_notebook_nav(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
+        if let Some(store) = self.store() {
+            let _ = store.delete_notebook(&id);
+        }
+        if self.nav == NavSelection::Notebook(id.to_string()) {
+            self.nav = NavSelection::AllNotes;
+            self.selected = None;
+        }
+        cx.notify();
+    }
+
+    fn delete_tag_nav(&mut self, tag: String, cx: &mut gpui_kit::Context<Self>) {
+        if let Some(store) = self.store() {
+            let _ = store.delete_tag(&tag);
+        }
+        if self.nav == NavSelection::Tag(tag) {
+            self.nav = NavSelection::AllNotes;
+            self.selected = None;
+        }
+        cx.notify();
+    }
+}
+
 impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) -> impl IntoElement {
         let dark = self.dark(window);
@@ -453,7 +584,7 @@ impl Render for AppShell {
             }
             Phase::Shell { .. } => {
                 body = body
-                    .child(self.render_nav(dark, &t, cx))
+                    .child(self.render_nav(dark, &t, window, cx))
                     .child(self.render_list(dark, &t, cx))
                     .child(self.render_reader(dark, &t, cx));
             }
@@ -642,10 +773,13 @@ impl AppShell {
         &mut self,
         dark: bool,
         t: &dyn Fn(i18n::Key) -> &'static str,
+        window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) -> gpui_kit::Div {
         let fg = theme::foreground(dark);
         let (notebooks_open, tags_open) = (self.notebooks_open, self.tags_open);
+        let shell = cx.weak_entity();
+        let lang = self.lang;
 
         let all = NavNode { id: "all".into(), title: t(i18n::Key::NavAllNotes).into(), count: 0, depth: 0 };
         let mut all_count = 0i64;
@@ -683,13 +817,113 @@ impl AppShell {
             .child(trash_row)
             .child(self.group_header(dark, t(i18n::Key::NavNotebooks), notebooks_open, Group::Notebooks, cx));
 
+        // Ticket 11: right-click menu on the Notebooks group header —
+        // "New Notebook" at root level.
+        nav = nav.child(
+            self.group_header(dark, t(i18n::Key::NavNotebooks), notebooks_open, Group::Notebooks, cx)
+                .context_menu({
+                    let shell = shell.clone();
+                    move |menu, _window, _cx| {
+                        let shell = shell.clone();
+                        menu.item(
+                            PopupMenuItem::new(i18n::t(lang, i18n::Key::NewNotebook)).on_click(
+                                move |_ev, window, cx| {
+                                    let _ = shell.update(cx, |this, cx| {
+                                        this.begin_new_notebook(String::new(), window, cx)
+                                    });
+                                },
+                            ),
+                        )
+                    }
+                }),
+        );
+
         if notebooks_open {
+            // Ticket 11: inline editor row when creating/renaming.
+            if let Some(NavEdit::NewNotebook { parent, .. }) = &self.nav_edit {
+                // render at the parent's nesting depth; root edit on top
+                let depth = if parent.is_empty() {
+                    0
+                } else {
+                    self.notebook_nav_nodes()
+                        .iter()
+                        .find(|n| n.id == *parent)
+                        .map(|n| n.depth + 1)
+                        .unwrap_or(0)
+                };
+                let _ = depth;
+                // row itself is drawn in the loop below via nav_edit_row
+            }
             for node in self.notebook_nav_nodes() {
                 let sel = NavSelection::Notebook(node.id.clone());
-                nav = nav.child(
-                    self.nav_row(dark, &node, "notebook", Some(IconName::FolderClosed), self.nav == sel, cx)
-                        .when(node.depth > 0, |el| el),
+                let is_sel = self.nav == sel;
+                let row = self.nav_row(
+                    dark,
+                    &node,
+                    "notebook",
+                    Some(IconName::FolderClosed),
+                    is_sel,
+                    cx,
                 );
+                // nested-create affordance + management menu per notebook row
+                let id = leanote_core::Id(node.id.clone());
+                let title = node.title.clone();
+                nav = nav.child(
+                    row.context_menu({
+                        let shell = shell.clone();
+                        let id2 = id.clone();
+                        let title2 = title.clone();
+                        move |menu, _window, _cx| {
+                            let shell_new = shell.clone();
+                            let shell_ren = shell.clone();
+                            let shell_mv = shell.clone();
+                            let shell_del = shell.clone();
+                            let id_new = id2.to_string();
+                            let id_ren = id2.clone();
+                            let id_mv = id2.clone();
+                            let id_del = id2.clone();
+                            let _ = title2;
+                            menu
+                                .item(
+                                    PopupMenuItem::new(i18n::t(lang, i18n::Key::NewNotebook))
+                                        .on_click(move |_ev, window, cx| {
+                                            let _ = shell_new.update(cx, |this, cx| {
+                                                this.begin_new_notebook(id_new.clone(), window, cx)
+                                            });
+                                        }),
+                                )
+                                .item(
+                                    PopupMenuItem::new(i18n::t(lang, i18n::Key::RenameNotebook))
+                                        .on_click(move |_ev, window, cx| {
+                                            let _ = shell_ren.update(cx, |this, cx| {
+                                                this.begin_rename_notebook(id_ren.clone(), window, cx)
+                                            });
+                                        }),
+                                )
+                                .item(
+                                    PopupMenuItem::new(i18n::t(lang, i18n::Key::MoveNotebookTo))
+                                        .on_click(move |_ev, _window, cx| {
+                                            let _ = shell_mv.update(cx, |this, cx| {
+                                                this.begin_move_notebook(id_mv.clone(), cx)
+                                            });
+                                        }),
+                                )
+                                .item(
+                                    PopupMenuItem::new(i18n::t(lang, i18n::Key::DeleteNotebook))
+                                        .on_click(move |_ev, _window, cx| {
+                                            let _ = shell_del.update(cx, |this, cx| {
+                                                this.delete_notebook_nav(id_del.clone(), cx)
+                                            });
+                                        }),
+                                )
+                        }
+                    })
+                    .when(node.depth > 0, |el| el),
+                );
+            }
+            // Ticket 11: inline create/rename editor row.
+            if let Some(edit_row) = self.nav_edit_row(dark, t, "notebook", window, cx) {
+                nav = nav.child(edit_row);
             }
         }
 
@@ -698,11 +932,183 @@ impl AppShell {
         if tags_open {
             for node in self.tag_nav_nodes() {
                 let sel = NavSelection::Tag(node.id.clone());
-                nav = nav.child(self.nav_row(dark, &node, "tag", None, self.nav == sel, cx));
+                let is_sel = self.nav == sel;
+                let row = self.nav_row(dark, &node, "tag", None, is_sel, cx);
+                let tag = node.id.clone();
+                nav = nav.child(row.context_menu({
+                    let shell = shell.clone();
+                    move |menu, _window, _cx| {
+                        let shell_ren = shell.clone();
+                        let shell_del = shell.clone();
+                        let tag_ren = tag.clone();
+                        let tag_del = tag.clone();
+                        menu
+                            .item(
+                                PopupMenuItem::new(i18n::t(lang, i18n::Key::RenameTag)).on_click(
+                                    move |_ev, window, cx| {
+                                        let _ = shell_ren.update(cx, |this, cx| {
+                                            this.begin_rename_tag(tag_ren.clone(), window, cx)
+                                        });
+                                    },
+                                ),
+                            )
+                            .item(
+                                PopupMenuItem::new(i18n::t(lang, i18n::Key::DeleteTag)).on_click(
+                                    move |_ev, _window, cx| {
+                                        let _ = shell_del.update(cx, |this, cx| {
+                                            this.delete_tag_nav(tag_del.clone(), cx)
+                                        });
+                                    },
+                                ),
+                            )
+                    }
+                }));
+            }
+            // tag rename editor
+            if let Some(edit_row) = self.nav_edit_row(dark, t, "tag", window, cx) {
+                nav = nav.child(edit_row);
             }
         }
 
+        // "Move to…" picker replaces the notebook list while choosing
+        if let Some(NavEdit::MoveNotebook { id }) = &self.nav_edit {
+            let moved = id.clone();
+            let mut picker = gpui_kit::base::v_flex().gap_1();
+            for (pid, ptitle, pdepth) in self.notebook_move_targets(&moved) {
+                let shell2 = shell.clone();
+                let pid2 = pid.clone();
+                let moved2 = moved.clone();
+                picker = picker.child(
+                    gpui_kit::base::h_flex()
+                        .id(format!("mv-{pid}"))
+                        .h_8()
+                        .px_3()
+                        .ml(px(12. * pdepth as f32))
+                        .rounded(px(theme::RADIUS_SELECTION))
+                        .on_click(move |_, _, cx| {
+                            let _ = shell2.update(cx, |this, cx| {
+                                this.move_notebook_to(moved2.clone(), pid2.clone(), cx)
+                            });
+                        })
+                        .child(Label::new(format!("{}{}", "　".repeat(pdepth), ptitle)).text_size(px(14.))),
+                );
+            }
+            // cancel
+            let shell3 = shell.clone();
+            picker = picker.child(
+                Button::new("mv-cancel")
+                    .label(t(i18n::Key::Cancel).to_string())
+                    .on_click(move |_, _, cx| {
+                        let _ = shell3.update(cx, |this, cx| {
+                            this.nav_edit = None;
+                            cx.notify();
+                        });
+                    }),
+            );
+            nav = nav.child(picker);
+        }
+
         nav
+    }
+
+    /// Flat (id, title, depth) of every valid move target: root + all
+    /// notebooks except the moved one and its descendants (no cycles).
+    fn notebook_move_targets(&self, moved: &leanote_core::Id) -> Vec<(String, String, usize)> {
+        let Some(store) = self.store() else { return Vec::new() };
+        let Ok(nbs) = store.notebooks() else { return Vec::new() };
+        let by_id: std::collections::HashMap<String, String> =
+            nbs.iter().map(|nb| (nb.notebook_id.to_string(), nb.parent_notebook_id.clone())).collect();
+        // descendants of `moved` are invalid targets
+        let mut banned = std::collections::HashSet::new();
+        banned.insert(moved.to_string());
+        loop {
+            let mut grew = false;
+            for (id, parent) in &by_id {
+                if banned.contains(parent) && !banned.contains(id) {
+                    banned.insert(id.clone());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        let mut out = vec![(String::new(), i18n::t(self.lang, i18n::Key::RootLevel).to_string(), 0usize)];
+        for node in self.notebook_nav_nodes() {
+            if !banned.contains(&node.id) {
+                out.push((node.id.clone(), node.title.clone(), node.depth as usize + 1));
+            }
+        }
+        out
+    }
+
+    /// Input + OK/Cancel row for the in-flight New/Rename edit.
+    /// `group` filters: "notebook" renders NewNotebook/RenameNotebook,
+    /// "tag" renders RenameTag.
+    fn nav_edit_row(
+        &mut self,
+        _dark: bool,
+        t: &dyn Fn(i18n::Key) -> &'static str,
+        group: &str,
+        _window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> Option<AnyElement> {
+        // borrow dance: take the input entity handle out temporarily
+        let (input, indent) = match self.nav_edit.as_ref()? {
+            NavEdit::NewNotebook { parent, name } if group == "notebook" => {
+                let depth = if parent.is_empty() {
+                    0
+                } else {
+                    self.notebook_nav_nodes()
+                        .iter()
+                        .find(|n| n.id == *parent)
+                        .map(|n| n.depth as usize + 1)
+                        .unwrap_or(0)
+                };
+                (name.clone(), depth)
+            }
+            NavEdit::RenameNotebook { .. } if group == "notebook" => {
+                if let Some(NavEdit::RenameNotebook { name, .. }) = self.nav_edit.as_ref() {
+                    (name.clone(), 1)
+                } else {
+                    unreachable!()
+                }
+            }
+            NavEdit::RenameTag { name, .. } if group == "tag" => (name.clone(), 1),
+            _ => return None,
+        };
+        let shell = cx.weak_entity();
+        let ok = Button::new(SharedString::from(format!("nav-edit-ok-{group}")))
+            .label(t(i18n::Key::Confirm).to_string())
+            .small()
+            .primary()
+            .on_click(move |_ev, _window, cx| {
+                let _ = shell.update(cx, |this: &mut AppShell, cx| this.apply_nav_edit(cx));
+            });
+        let shell = cx.weak_entity();
+        let cancel = Button::new(SharedString::from(format!("nav-edit-cancel-{group}")))
+            .label(t(i18n::Key::Cancel).to_string())
+            .small()
+            .on_click(move |_ev, _window, cx| {
+                let _ = shell.update(cx, |this: &mut AppShell, cx| {
+                    this.nav_edit = None;
+                    cx.notify();
+                });
+            });
+        Some(
+            gpui_kit::base::h_flex()
+                .id(SharedString::from(format!("nav-edit-{group}")))
+                .gap_1()
+                .h_8()
+                .px_3()
+                .ml(px(12. * indent as f32))
+                .rounded(px(theme::RADIUS_SELECTION))
+                .child(Input::new(&input).appearance(true).bordered(true).h_8())
+                .child(ok)
+                .child(cancel)
+                .when(false, |el| el)
+                .into_any_element(),
+        )
     }
 
     /// Middle list: two-row rows (title + meta), Wake 336px.
