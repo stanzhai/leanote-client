@@ -5,8 +5,9 @@
 use leanote_core::Store;
 use leanote_http::{mcp, serve};
 
+static DIR_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 async fn spawn() -> (reqwest::Client, u16) {
-    let dir = std::env::temp_dir().join(format!("mcp-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let dir = std::env::temp_dir().join(format!("mcp-test-{}-{}", std::process::id(), DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let store = Store::open(dir, "user1".into()).expect("store");
     let port = serve(store, 0).await.expect("bind");
     (reqwest::Client::new(), port)
