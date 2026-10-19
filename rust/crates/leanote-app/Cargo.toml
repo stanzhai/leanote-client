@@ -11,6 +11,8 @@ path = "src/main.rs"
 leanote-core = { path = "../leanote-core" }
 leanote-fakeserver = { path = "../../fake-server" }
 gpui-kit = "0.7.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+tray-icon = "0.26"
 anyhow = "1"
 futures = "0.3"
 http = "1"

@@ -317,6 +317,7 @@ fn cmd_sync(args: &[String]) -> i32 {
     let account = match leanote_core::sync::Api::login(&host, &email, &password, &store) {
         Ok(a) => a,
         Err(e) => {
+            leanote_core::logging::log("sync", &format!("login {host}: {e}"));
             eprintln!("Error: {}", e);
             return 1;
         }
@@ -343,6 +344,7 @@ fn cmd_sync(args: &[String]) -> i32 {
             0
         }
         Err(e) => {
+            leanote_core::logging::log("sync", &e.to_string());
             eprintln!("Error: {}", e);
             1
         }

@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 pub const PORT: u16 = 59590;
 /// The one window handle we own; set at open_window time.
-static WINDOW: OnceLock<gpui_kit::AnyWindowHandle> = OnceLock::new();
+pub(crate) static WINDOW: OnceLock<gpui_kit::AnyWindowHandle> = OnceLock::new();
 
 pub fn remember_window(handle: gpui_kit::AnyWindowHandle) {
     let _ = WINDOW.set(handle);

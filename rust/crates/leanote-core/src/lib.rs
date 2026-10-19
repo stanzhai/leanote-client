@@ -9,7 +9,8 @@ use std::fmt;
 use std::path::PathBuf;
 
 pub mod html2md;
- pub mod sync;
+pub mod logging;
+pub mod sync;
 
 use rusqlite::{params, Connection, OptionalExtension};
 

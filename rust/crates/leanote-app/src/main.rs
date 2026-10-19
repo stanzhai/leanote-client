@@ -8,6 +8,7 @@ mod i18n;
 mod search_overlay;
 mod single_instance;
 mod theme;
+mod tray;
 mod window_state;
 
 use app_shell::AppShell;
@@ -184,6 +185,8 @@ fn boot_fake_server() {
 }
 
 fn main() {
+    // Crashes land in logs/app.log before anything else can go wrong.
+    leanote_core::logging::install_panic_hook();
     let dir = data_dir();
     let _ = std::fs::create_dir_all(&dir);
 
@@ -283,6 +286,8 @@ fn main() {
         .expect("open window");
         single_instance::remember_window(handle);
         single_instance::listen(listener, cx);
+        // Ticket 16: tray icon + 显示/退出 menu (left-click → show).
+        tray::init(cx);
 
         // Demo helper: auto-submit the fake login for screenshots.
         if std::env::var("LEANOTE_FAKE_AUTOSUBMIT").ok().as_deref() == Some("1") {

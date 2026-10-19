@@ -240,6 +240,7 @@ pub async fn serve(store: Store, port: u16) -> std::io::Result<u16> {
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, router(store)).await {
             eprintln!("[leanote] Local server error: {e}");
+            leanote_core::logging::log("http", &e.to_string());
         }
     });
     Ok(bound)

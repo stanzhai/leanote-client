@@ -283,6 +283,7 @@ impl AppShell {
                         shell.phase = Phase::Shell;
                     }
                     Err(e) => {
+                        leanote_core::logging::log("sync", &e);
                         shell.phase = Phase::Failed { error: e.into() };
                     }
                 }
