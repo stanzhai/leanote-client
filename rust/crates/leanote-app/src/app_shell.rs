@@ -553,6 +553,9 @@ fn home_dir() -> std::path::PathBuf {
     std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
+}
+
+impl AppShell {
     /// Ticket 12: one-way HTML → Markdown conversion of the selected
     /// rich-text note. Persisted (content rewritten, IsMarkdown=1, dirty)
     /// so the next push sends Markdown to the server; the reader re-renders
