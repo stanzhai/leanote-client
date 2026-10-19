@@ -3,6 +3,7 @@
 //! read-only Markdown reader, star toggle, trash actions.
 
 use crate::browse::{self, NavNode};
+use crate::conflict_bar;
 use crate::i18n::{self, Lang};
 use crate::theme::{self, Material};
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -38,6 +39,14 @@ pub enum Phase {
 enum Group {
     Notebooks,
     Tags,
+}
+
+/// Which conflict-bar button was pressed (ticket 14).
+#[derive(Clone, Copy)]
+enum ConflictChoice {
+    UseLocal,
+    UseServer,
+    KeepBoth,
 }
 
 /// What the middle list is filtered to (left-nav selection).
@@ -317,6 +326,35 @@ impl AppShell {
     fn toggle_star(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
         if let Some(store) = self.store() {
             let _ = store.toggle_star(&id);
+        }
+        cx.notify();
+    }
+
+    /// Ticket 14 conflict bar actions. All three clear the conflict row; the
+    /// store methods decide what happens to the note itself.
+    fn resolve_conflict(
+        &mut self,
+        how: ConflictChoice,
+        server_note_id: String,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if let Some(store) = self.store() {
+            match how {
+                ConflictChoice::UseLocal => {
+                    let _ = store.resolve_conflict_use_local(&server_note_id);
+                }
+                ConflictChoice::UseServer => {
+                    let _ = store.resolve_conflict_use_server(&server_note_id);
+                }
+                ConflictChoice::KeepBoth => {
+                    let suffix = conflict_bar::keep_both_suffix(self.lang);
+                    if let Ok(Some(new_id)) =
+                        store.resolve_conflict_keep_both(&server_note_id, suffix)
+                    {
+                        self.selected = Some(new_id);
+                    }
+                }
+            }
         }
         cx.notify();
     }
@@ -770,17 +808,51 @@ impl AppShell {
             .bg(theme::material(Material::Background, dark))
             .pt(px(TITLEBAR_H));
 
+        // Ticket 14: adjudication bar when this note (or any note) has an
+        // unresolved conflict. Built before the selection check so it also
+        // shows with nothing selected.
+        let conflicts = self
+            .store()
+            .and_then(|s| s.list_conflicts().ok())
+            .unwrap_or_default();
+        let bar = conflict_bar::bar_state(
+            &conflicts,
+            self.selected.as_ref().map(|id| id.to_string()).as_deref(),
+        )
+        .map(|c| {
+            let (sid, sid2, sid3) = (
+                c.server_note_id.clone(),
+                c.server_note_id.clone(),
+                c.server_note_id.clone(),
+            );
+            conflict_bar::render(
+                dark,
+                self.lang,
+                c,
+                cx.listener(move |this, _ev, _window, cx| {
+                    this.resolve_conflict(ConflictChoice::UseLocal, sid.clone(), cx)
+                }),
+                cx.listener(move |this, _ev, _window, cx| {
+                    this.resolve_conflict(ConflictChoice::UseServer, sid2.clone(), cx)
+                }),
+                cx.listener(move |this, _ev, _window, cx| {
+                    this.resolve_conflict(ConflictChoice::KeepBoth, sid3.clone(), cx)
+                }),
+            )
+        });
+
         let note = self
             .selected
             .as_ref()
             .and_then(|id| self.store().and_then(|s| s.get_note_any(id).ok().flatten()));
 
         let Some(n) = note else {
+            let mut empty = gpui_kit::base::v_flex().w(px(READER_W)).mx_auto().gap_2();
+            if let Some(bar) = bar {
+                empty = empty.child(bar);
+            }
             return pane.child(
-                gpui_kit::base::v_flex()
-                    .w(px(READER_W))
-                    .mx_auto()
-                    .gap_2()
+                empty
                     .child(small_label(i18n::t(self.lang, i18n::Key::NoSelection), muted))
                     .child(Label::new(t(i18n::Key::NoSelection)).text_size(px(16.)).text_color(fg)),
             );
@@ -851,31 +923,36 @@ impl AppShell {
         }
 
         let src = browse::reader_markdown_src(&n.title, &n.content, n.is_markdown);
-        pane.child(
-            gpui_kit::base::v_flex()
-                .w(px(READER_W))
-                .mx_auto()
-                .gap_2()
-                .min_h_0()
-                .child(
-                    gpui_kit::base::h_flex()
-                        .gap_2()
-                        .child(small_label(
-                            browse::note_meta(&nb_name, &n.tags, n.updated_time),
-                            muted,
-                        ))
-                        .child(gpui_kit::base::h_flex().flex_1()),
-                )
-                .child(toolbar)
-                // GFM tables + strikethrough ship in TextView's default GFM
-                // parse options; `.scrollable` keeps the whole pane from
-                // scrolling away under the toolbar.
-                .child(
-                    TextView::markdown("reader", src)
-                        .scrollable(true)
-                        .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
-                ),
-        )
+
+
+        let mut col = gpui_kit::base::v_flex()
+            .w(px(READER_W))
+            .mx_auto()
+            .gap_2()
+            .min_h_0();
+        if let Some(bar) = bar {
+            col = col.child(bar);
+        }
+        col = col
+            .child(
+                gpui_kit::base::h_flex()
+                    .gap_2()
+                    .child(small_label(
+                        browse::note_meta(&nb_name, &n.tags, n.updated_time),
+                        muted,
+                    ))
+                    .child(gpui_kit::base::h_flex().flex_1()),
+            )
+            .child(toolbar)
+            // GFM tables + strikethrough ship in TextView's default GFM
+            // parse options; `.scrollable` keeps the whole pane from
+            // scrolling away under the toolbar.
+            .child(
+                TextView::markdown("reader", src)
+                    .scrollable(true)
+                    .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
+            );
+        pane.child(col)
     }
 }
 

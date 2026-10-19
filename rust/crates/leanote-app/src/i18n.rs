@@ -64,6 +64,13 @@ keys! {
     RichTextReadonly => ("富文本（只读）", "Rich text (read only)"),
     ConvertToMarkdown => ("转换为 Markdown", "Convert to Markdown"),
     ConvertedToMarkdown => ("已转换为 Markdown", "Converted to Markdown"),
+    // Ticket 14: conflict adjudication bar.
+    ConflictTitle => ("检测到同步冲突", "Sync conflict detected"),
+    ConflictLocal => ("本地版本", "Local version"),
+    ConflictServer => ("服务器版本", "Server version"),
+    UseLocal => ("用本地", "Use local"),
+    UseServer => ("用服务器", "Use server"),
+    KeepBoth => ("两边保留", "Keep both"),
 }
 
 #[cfg(test)]
@@ -104,5 +111,7 @@ mod tests {
         Key::NavTrash, Key::NavNotebooks, Key::NavTags, Key::NoSelection,
         Key::EmptyNotes, Key::Restore, Key::HardDelete, Key::EmptyTrash,
         Key::RichTextReadonly, Key::ConvertToMarkdown, Key::ConvertedToMarkdown,
+        Key::ConflictTitle, Key::ConflictLocal, Key::ConflictServer,
+        Key::UseLocal, Key::UseServer, Key::KeepBoth,
     ];
 }
