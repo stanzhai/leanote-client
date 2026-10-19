@@ -1,13 +1,16 @@
 //! The main window: login form (right pane) → full-sync progress → Wake
-//! three-pane shell (ADR-0003).
+//! three-pane shell (ADR-0003). Ticket 09: selectable nav + filtered list +
+//! read-only Markdown reader, star toggle, trash actions.
 
+use crate::browse::{self, NavNode};
 use crate::i18n::{self, Lang};
 use crate::theme::{self, Material};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme, Disableable};
+use gpui_kit::component::text::TextView;
+use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::{px, SharedString, Task, Window};
 use leanote_core::sync::{Api, SyncProgress, SyncStats};
@@ -25,10 +28,26 @@ pub enum Phase {
     SigningIn,
     /// Progress lines from full_sync, newest last.
     Syncing { lines: Vec<SharedString> },
-    /// Sync done → three-pane shell. stats for the summary line.
-    Shell { stats: SyncStats },
+    /// Sync done → three-pane shell.
+    Shell,
     /// Login or sync failed → back to login with an error line.
     Failed { error: SharedString },
+}
+
+#[derive(Clone, Copy)]
+enum Group {
+    Notebooks,
+    Tags,
+}
+
+/// What the middle list is filtered to (left-nav selection).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NavSelection {
+    AllNotes,
+    Starred,
+    Trash,
+    Notebook(String),
+    Tag(String),
 }
 
 pub struct AppShell {
@@ -40,6 +59,13 @@ pub struct AppShell {
     password: gpui_kit::Entity<InputState>,
     /// Login+sync futures; dropped (cancelled) with the entity.
     _task: Option<Task<()>>,
+    // --- Ticket 09 browse state ---
+    nav: NavSelection,
+    notebooks_open: bool,
+    tags_open: bool,
+    /// Note currently shown in the reader (kept across list re-filters
+    /// until the selection changes).
+    selected: Option<leanote_core::Id>,
 }
 
 /// Progress sink that forwards full_sync lines into a channel the UI drains.
@@ -96,7 +122,7 @@ impl AppShell {
             // Returning user: straight to the shell (startup incr-sync is
             // ticket 04 territory, not this one).
             phase: if signed_in {
-                Phase::Shell { stats: SyncStats { notebooks: 0, notes: 0, contents: 0, tags: 0 } }
+                Phase::Shell
             } else {
                 Phase::Login
             },
@@ -106,6 +132,10 @@ impl AppShell {
             email,
             password,
             _task: None,
+            nav: NavSelection::AllNotes,
+            notebooks_open: true,
+            tags_open: true,
+            selected: None,
         }
     }
 
@@ -186,8 +216,8 @@ impl AppShell {
             };
             let _ = this.update(cx, |shell, cx| {
                 match result {
-                    Ok(stats) => {
-                        shell.phase = Phase::Shell { stats };
+                    Ok(_) => {
+                        shell.phase = Phase::Shell;
                     }
                     Err(e) => {
                         shell.phase = Phase::Failed { error: e.into() };
@@ -202,12 +232,123 @@ impl AppShell {
         window.appearance() == gpui_kit::WindowAppearance::Dark
             || window.appearance() == gpui_kit::WindowAppearance::VibrantDark
     }
+
+    fn store(&self) -> Option<leanote_core::Store> {
+        // Re-open per read: cheap (WAL) and always fresh after star/trash ops.
+        leanote_core::Store::open(self.data_dir.clone(), "user1".into()).ok()
+    }
+
+    /// Notes for the current nav selection, in list order.
+    fn visible_notes(&self) -> Vec<leanote_core::Note> {
+        let Some(store) = self.store() else { return Vec::new() };
+        let res = match &self.nav {
+            NavSelection::AllNotes => store.list_notes_filtered(None, false),
+            NavSelection::Starred => store.list_notes_filtered(None, true),
+            NavSelection::Trash => store.list_trash(),
+            NavSelection::Notebook(id) => {
+                store.list_notes_filtered(Some(&leanote_core::Id(id.clone())), false)
+            }
+            NavSelection::Tag(tag) => store.list_notes_by_tag(tag),
+        };
+        res.unwrap_or_default()
+    }
+
+    fn notebook_names(&self) -> std::collections::HashMap<String, String> {
+        self.store()
+            .and_then(|s| s.notebooks().ok())
+            .map(|nbs| {
+                nbs.into_iter()
+                    .map(|nb| (nb.notebook_id.to_string(), nb.title))
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Nav-tree rows for the Notebooks group (nesting + Seq + counts).
+    fn notebook_nav_nodes(&self) -> Vec<NavNode> {
+        let Some(store) = self.store() else { return Vec::new() };
+        let (Ok(nbs), Ok(count_rows)) = (store.notebooks(), store.notebook_note_counts()) else {
+            return Vec::new();
+        };
+        let counts: std::collections::HashMap<String, i64> =
+            count_rows.into_iter().map(|(id, c)| (id.to_string(), c)).collect();
+        browse::notebook_nodes(
+            &nbs.iter()
+                .map(|nb| (nb.notebook_id.to_string(), nb.title.clone(), nb.parent_notebook_id.clone(), nb.seq))
+                .collect::<Vec<_>>(),
+            &counts,
+        )
+    }
+
+    /// Nav rows for the Tags group: tag name → live note count via
+    /// list_notes_by_tag (the tags table's Count stays 1 after sync).
+    fn tag_nav_nodes(&self) -> Vec<NavNode> {
+        let Some(store) = self.store() else { return Vec::new() };
+        let Ok(tags) = store.tags() else { return Vec::new() };
+        tags.into_iter()
+            .filter(|t| !t.is_deleted)
+            .map(|t| NavNode {
+                count: store.list_notes_by_tag(&t.tag).map(|n| n.len() as i64).unwrap_or(0),
+                id: t.tag.clone(),
+                title: format!("# {}", t.tag),
+                depth: 0,
+            })
+            .collect()
+    }
+
+    fn select_nav(&mut self, nav: NavSelection, cx: &mut gpui_kit::Context<Self>) {
+        self.nav = nav;
+        self.selected = None; // new filter → no stale reader content
+        cx.notify();
+    }
+
+    fn select_note(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
+        self.selected = Some(id);
+        cx.notify();
+    }
+
+    /// Star is local-only: toggle_star never touches IsDirty (GLOSSARY).
+    fn toggle_star(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
+        if let Some(store) = self.store() {
+            let _ = store.toggle_star(&id);
+        }
+        cx.notify();
+    }
+
+    fn restore_selected(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
+        // Back to its ORIGINAL notebook (JS moveNote on a trashed note keeps
+        // NotebookId; restore_note only clears trash flags + marks dirty).
+        if let Some(store) = self.store() {
+            if let Ok(Some(n)) = store.get_note_any(&id) {
+                let _ = store.restore_note(&id, &n.notebook_id);
+            }
+        }
+        self.selected = None;
+        cx.notify();
+    }
+
+    fn hard_delete_selected(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
+        if let Some(store) = self.store() {
+            let _ = store.hard_delete_note(&id);
+        }
+        self.selected = None;
+        cx.notify();
+    }
+
+    fn empty_trash(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        if let Some(store) = self.store() {
+            let _ = store.empty_trash();
+        }
+        self.selected = None;
+        cx.notify();
+    }
 }
 
 impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) -> impl IntoElement {
         let dark = self.dark(window);
-        let t = |k: i18n::Key| i18n::t(self.lang, k);
+        let lang = self.lang;
+        let t = move |k: i18n::Key| i18n::t(lang, k);
         let base_bg = theme::material(Material::Base, dark);
         let list_bg = theme::material(Material::List, dark);
 
@@ -249,11 +390,11 @@ impl Render for AppShell {
                     .child(gpui_kit::base::v_flex().w(px(MID_W)).h_full().flex_none().bg(list_bg))
                     .child(render_syncing(dark, lines, &t));
             }
-            Phase::Shell { stats } => {
+            Phase::Shell { .. } => {
                 body = body
-                    .child(render_nav(dark, &t))
-                    .child(self.render_list(dark, &t))
-                    .child(render_reader(dark, stats, &t));
+                    .child(self.render_nav(dark, &t, cx))
+                    .child(self.render_list(dark, &t, cx))
+                    .child(self.render_reader(dark, &t, cx));
             }
         }
 
@@ -291,8 +432,6 @@ fn render_login(
         .gap_1()
         .child(small_label(t(i18n::Key::Password), muted))
         .child(Input::new(password).appearance(true).bordered(true));
-
-
 
     let register = gpui_kit::component::link::Link::new("register")
         .href("https://leanote.com/register")
@@ -358,56 +497,177 @@ fn render_syncing(dark: bool, lines: &[SharedString], t: &dyn Fn(i18n::Key) -> &
         .into_element()
 }
 
-/// Left nav: identity area + All/Starred/Trash + Notebooks/Tags groups.
-fn render_nav(dark: bool, t: &dyn Fn(i18n::Key) -> &'static str) -> impl IntoElement {
-    let fg = theme::foreground(dark);
-    let muted = theme::muted_foreground(dark);
-    let item = |label: &str, selected: bool| {
-        gpui_kit::base::h_flex()
+impl AppShell {
+    /// One clickable nav row; `id` doubles as the element id.
+    fn nav_row(
+        &self,
+        dark: bool,
+        node: &NavNode,
+        kind: &str,
+        icon: Option<IconName>,
+        selected: bool,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        let fg = theme::foreground(dark);
+        let sel_fg = theme::accent_foreground();
+        let indent = px(12. * node.depth as f32);
+        let mut row = gpui_kit::base::h_flex()
+            .id(node.id.clone())
             .px_3()
             .h_8()
+            .ml(indent)
             .rounded(px(theme::RADIUS_SELECTION))
             .when(selected, |el| el.bg(theme::accent()))
-            .child(
-                Label::new(label)
-                    .text_size(px(14.))
-                    .text_color(if selected { theme::accent_foreground() } else { fg }),
+            .on_click({
+                let sel: NavSelection = match kind {
+                    "notebook" => NavSelection::Notebook(node.id.clone()),
+                    "tag" => NavSelection::Tag(node.id.clone()),
+                    "starred" => NavSelection::Starred,
+                    "trash" => NavSelection::Trash,
+                    _ => NavSelection::AllNotes,
+                };
+                cx.listener(move |this, _ev, _window, cx| this.select_nav(sel.clone(), cx))
+            });
+        if let Some(icon) = icon {
+            row = row.child(
+                Icon::new(icon)
+                    .xsmall()
+                    .text_color(if selected { sel_fg } else { theme::muted_foreground(dark) }),
+            );
+        }
+        row.child(
+            Label::new(node.title.clone())
+                .text_size(px(14.))
+                .text_color(if selected { sel_fg } else { fg }),
+        )
+        .child(gpui_kit::base::h_flex().flex_1())
+        .child(
+            small_label(
+                node.count.to_string(),
+                if selected { sel_fg } else { theme::muted_foreground(dark) },
             )
-    };
-    gpui_kit::base::v_flex()
-        .w(px(LEFT_W))
-        .h_full()
-        .flex_none()
-        .bg(theme::material(Material::Base, dark))
-        .pt(px(TITLEBAR_H)) // below the transparent titlebar
-        .px_3()
-        .gap_1()
-        .child(Label::new(t(i18n::Key::AppName)).text_size(px(16.)).text_color(fg))
-        .child(item(t(i18n::Key::NavAllNotes), true))
-        .child(item(t(i18n::Key::NavStarred), false))
-        .child(item(t(i18n::Key::NavTrash), false))
-        .child(
-            gpui_kit::base::v_flex()
-                .mt_3()
-                .gap_1()
-                .child(Label::new(t(i18n::Key::NavNotebooks)).text_size(px(11.)).text_color(muted)),
+            .into_any_element(),
         )
-        .child(
-            gpui_kit::base::v_flex()
-                .mt_3()
-                .gap_1()
-                .child(Label::new(t(i18n::Key::NavTags)).text_size(px(11.)).text_color(muted)),
-        )
-        .into_element()
-}
+    }
 
-impl AppShell {
+    /// Collapsible group header (Notebooks / Tags).
+    fn group_header(
+        &self,
+        dark: bool,
+        label: &str,
+        _open: bool,
+        group: Group,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        let muted = theme::muted_foreground(dark);
+        gpui_kit::base::h_flex()
+            .id(label.to_string())
+            .mt_3()
+            .h_6()
+            .gap_1()
+            .on_click(cx.listener(move |this, _ev, _window, cx| {
+                match group {
+                    Group::Notebooks => this.notebooks_open = !this.notebooks_open,
+                    Group::Tags => this.tags_open = !this.tags_open,
+                }
+                cx.notify();
+            }))
+            .child(Icon::new(IconName::ChevronRight).xsmall().text_color(muted))
+            .child(Label::new(label).text_size(px(11.)).text_color(muted))
+    }
+
+    /// Left nav: identity area + All/Starred/Trash + Notebooks/Tags groups.
+    fn render_nav(
+        &mut self,
+        dark: bool,
+        t: &dyn Fn(i18n::Key) -> &'static str,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> gpui_kit::Div {
+        let fg = theme::foreground(dark);
+        let (notebooks_open, tags_open) = (self.notebooks_open, self.tags_open);
+
+        let all = NavNode { id: "all".into(), title: t(i18n::Key::NavAllNotes).into(), count: 0, depth: 0 };
+        let mut all_count = 0i64;
+        if let Some(store) = self.store() {
+            all_count = store.list_notes_filtered(None, false).map(|n| n.len() as i64).unwrap_or(0);
+        }
+        let all = NavNode { count: all_count, ..all };
+
+        let mut starred_count = 0i64;
+        if let Some(store) = self.store() {
+            starred_count = store.list_notes_filtered(None, true).map(|n| n.len() as i64).unwrap_or(0);
+        }
+        let mut trash_count = 0i64;
+        if let Some(store) = self.store() {
+            trash_count = store.list_trash().map(|n| n.len() as i64).unwrap_or(0);
+        }
+        let starred = NavNode { id: "starred".into(), title: t(i18n::Key::NavStarred).into(), count: starred_count, depth: 0 };
+        let trash = NavNode { id: "trash".into(), title: t(i18n::Key::NavTrash).into(), count: trash_count, depth: 0 };
+
+        let all_row = self.nav_row(dark, &all, "fixed", Some(IconName::BookOpen), self.nav == NavSelection::AllNotes, cx);
+        let starred_row = self.nav_row(dark, &starred, "starred", Some(IconName::Star), self.nav == NavSelection::Starred, cx);
+        let trash_row = self.nav_row(dark, &trash, "trash", Some(IconName::Delete), self.nav == NavSelection::Trash, cx);
+
+        let mut nav = gpui_kit::base::v_flex()
+            .w(px(LEFT_W))
+            .h_full()
+            .flex_none()
+            .bg(theme::material(Material::Base, dark))
+            .pt(px(TITLEBAR_H)) // below the transparent titlebar
+            .px_3()
+            .gap_1()
+            .child(Label::new(t(i18n::Key::AppName)).text_size(px(16.)).text_color(fg))
+            .child(all_row)
+            .child(starred_row)
+            .child(trash_row)
+            .child(self.group_header(dark, t(i18n::Key::NavNotebooks), notebooks_open, Group::Notebooks, cx));
+
+        if notebooks_open {
+            for node in self.notebook_nav_nodes() {
+                let sel = NavSelection::Notebook(node.id.clone());
+                nav = nav.child(
+                    self.nav_row(dark, &node, "notebook", Some(IconName::FolderClosed), self.nav == sel, cx)
+                        .when(node.depth > 0, |el| el),
+                );
+            }
+        }
+
+        nav = nav.child(self.group_header(dark, t(i18n::Key::NavTags), tags_open, Group::Tags, cx));
+
+        if tags_open {
+            for node in self.tag_nav_nodes() {
+                let sel = NavSelection::Tag(node.id.clone());
+                nav = nav.child(self.nav_row(dark, &node, "tag", None, self.nav == sel, cx));
+            }
+        }
+
+        nav
+    }
+
     /// Middle list: two-row rows (title + meta), Wake 336px.
-    fn render_list(&self, dark: bool, t: &dyn Fn(i18n::Key) -> &'static str) -> impl IntoElement {
+    fn render_list(
+        &mut self,
+        dark: bool,
+        t: &dyn Fn(i18n::Key) -> &'static str,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> gpui_kit::Div {
         let fg = theme::foreground(dark);
         let muted = theme::muted_foreground(dark);
-        let notes = self.notes_snapshot();
+        let sel_fg = theme::accent_foreground();
+        let notebook_names = self.notebook_names();
+        let notes = self.visible_notes();
         let count = notes.len();
+        let title = match &self.nav {
+            NavSelection::AllNotes => t(i18n::Key::NavAllNotes),
+            NavSelection::Starred => t(i18n::Key::NavStarred),
+            NavSelection::Trash => t(i18n::Key::NavTrash),
+            NavSelection::Notebook(id) => notebook_names
+                .get(id)
+                .map(|s| s.as_str())
+                .unwrap_or(t(i18n::Key::NavNotebooks)),
+            NavSelection::Tag(tag) => tag.as_str(),
+        };
+
         let mut list = gpui_kit::base::v_flex()
             .w(px(MID_W))
             .h_full()
@@ -416,73 +676,168 @@ impl AppShell {
             .pt(px(TITLEBAR_H))
             .px_3()
             .gap_1()
-            .child(Label::new(format!("{} · {}", t(i18n::Key::NotesListTitle), count)).text_size(px(16.)).text_color(fg));
+            .child(
+                Label::new(format!("{} · {}", title, count))
+                    .text_size(px(16.))
+                    .text_color(fg),
+            );
+
         if notes.is_empty() {
             list = list.child(small_label(t(i18n::Key::EmptyNotes), muted));
         } else {
-            for (title, meta) in &notes {
+            for n in &notes {
+                let meta = browse::note_meta(
+                    notebook_names.get(&n.notebook_id.to_string()).map(|s| s.as_str()).unwrap_or(""),
+                    &n.tags,
+                    n.updated_time,
+                );
+                let is_sel = self.selected.as_ref() == Some(&n.note_id);
+                let star = n.star;
+                let id = n.note_id.clone();
+                let id2 = n.note_id.clone();
                 list = list.child(
                     gpui_kit::base::v_flex()
+                        .id(n.note_id.to_string())
                         .px_2()
                         .py_2()
                         .rounded(px(theme::RADIUS_SELECTION))
-                        .child(Label::new(title.clone()).text_size(px(14.)).text_color(fg))
-                        .child(small_label(meta.clone(), muted)),
+                        .when(is_sel, |el| el.bg(theme::accent()))
+                        .on_click(cx.listener(move |this, _ev, _window, cx| this.select_note(id2.clone(), cx)))
+                        .child(
+                            gpui_kit::base::h_flex()
+                                .child(
+                                    Label::new(n.title.clone())
+                                        .text_size(px(14.))
+                                        .text_color(if is_sel { sel_fg } else { fg }),
+                                )
+                                .child(gpui_kit::base::h_flex().flex_1())
+                                .when(star, |el| {
+                                    el.child(
+                                        Icon::new(IconName::StarFill)
+                                            .xsmall()
+                                            .text_color(if is_sel { sel_fg } else { theme::accent() }),
+                                    )
+                                }),
+                        )
+                        .child(small_label(meta, if is_sel { sel_fg } else { muted })),
                 );
+                let _ = (id, star);
             }
         }
-        list.into_element()
+        list
     }
 
-    /// (title, meta) pairs for the middle list, from the store.
-    fn notes_snapshot(&self) -> Vec<(SharedString, SharedString)> {
-        let Ok(store) = leanote_core::Store::open(self.data_dir.clone(), "user1".into()) else {
-            return Vec::new();
-        };
-        let Ok(notes) = store.list_notes() else {
-            return Vec::new();
-        };
-        notes
-            .into_iter()
-            .map(|n| {
-                let meta = format!("{} {}", i18n::t(self.lang, i18n::Key::Updated), fmt_time(n.updated_time));
-                (SharedString::from(n.title), SharedString::from(meta))
-            })
-            .collect()
-    }
-}
+    /// Right pane: remainder width, 720px centered reading column, read-only
+    /// Markdown via TextView (CommonMark + GFM incl. tables/strikethrough/
+    /// fenced code highlight/links/blockquotes; remote images over http).
+    fn render_reader(
+        &mut self,
+        dark: bool,
+        t: &dyn Fn(i18n::Key) -> &'static str,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> gpui_kit::Div {
+        let fg = theme::foreground(dark);
+        let muted = theme::muted_foreground(dark);
+        let notebook_names = self.notebook_names();
 
-/// Right pane: remainder width, 720px centered reading column.
-fn render_reader(dark: bool, stats: &SyncStats, t: &dyn Fn(i18n::Key) -> &'static str) -> impl IntoElement {
-    let fg = theme::foreground(dark);
-    let muted = theme::muted_foreground(dark);
-    gpui_kit::base::v_flex()
-        .flex_1()
-        .h_full()
-        .min_w_0()
-        .bg(theme::material(Material::Background, dark))
-        .pt(px(TITLEBAR_H))
-        .child(
+        let pane = gpui_kit::base::v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .bg(theme::material(Material::Background, dark))
+            .pt(px(TITLEBAR_H));
+
+        let note = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.store().and_then(|s| s.get_note_any(id).ok().flatten()));
+
+        let Some(n) = note else {
+            return pane.child(
+                gpui_kit::base::v_flex()
+                    .w(px(READER_W))
+                    .mx_auto()
+                    .gap_2()
+                    .child(small_label(i18n::t(self.lang, i18n::Key::NoSelection), muted))
+                    .child(Label::new(t(i18n::Key::NoSelection)).text_size(px(16.)).text_color(fg)),
+            );
+        };
+
+        let is_trash_view = self.nav == NavSelection::Trash;
+        let nb_name = notebook_names
+            .get(&*n.notebook_id.to_string())
+            .cloned()
+            .unwrap_or_else(|| n.notebook_id.to_string());
+
+        // Toolbar: star toggle (live notes) / trash actions (trash view).
+        let id = n.note_id.clone();
+        let star_btn = if n.star {
+            Button::new("star-toggle")
+                .icon(IconName::StarFill)
+                .ghost()
+                .on_click(cx.listener(move |this, _ev, _window, cx| this.toggle_star(id.clone(), cx)))
+        } else {
+            Button::new("star-toggle")
+                .icon(IconName::Star)
+                .ghost()
+                .on_click(cx.listener(move |this, _ev, _window, cx| this.toggle_star(id.clone(), cx)))
+        };
+
+        let mut toolbar = gpui_kit::base::h_flex().gap_2().child(star_btn);
+        if is_trash_view {
+            let rid = n.note_id.clone();
+            toolbar = toolbar.child(
+                Button::new("restore")
+                    .label(t(i18n::Key::Restore))
+                    .outline()
+                    .on_click(cx.listener(move |this, _ev, _window, cx| this.restore_selected(rid.clone(), cx))),
+            );
+            let did = n.note_id.clone();
+            toolbar = toolbar.child(
+                Button::new("hard-delete")
+                    .label(t(i18n::Key::HardDelete))
+                    .outline()
+                    .on_click(cx.listener(move |this, _ev, _window, cx| this.hard_delete_selected(did.clone(), cx))),
+            );
+            toolbar = toolbar.child(
+                Button::new("empty-trash")
+                    .label(t(i18n::Key::EmptyTrash))
+                    .outline()
+                    .on_click(cx.listener(|this, _ev, _window, cx| this.empty_trash(cx))),
+            );
+        }
+
+        let src = browse::reader_markdown_src(&n.title, &n.content, n.is_markdown);
+        pane.child(
             gpui_kit::base::v_flex()
                 .w(px(READER_W))
                 .mx_auto()
                 .gap_2()
-                .child(small_label(
-                    format!(
-                        "{} {} · {} {} · {} {}",
-                        stats.notes, t(i18n::Key::NotesCount),
-                        stats.notebooks, t(i18n::Key::NotebooksCount),
-                        stats.tags, t(i18n::Key::TagsCount),
-                    ),
-                    muted,
-                ))
-                .child(Label::new(t(i18n::Key::NoSelection)).text_size(px(16.)).text_color(fg)),
+                .min_h_0()
+                .child(
+                    gpui_kit::base::h_flex()
+                        .gap_2()
+                        .child(small_label(
+                            browse::note_meta(&nb_name, &n.tags, n.updated_time),
+                            muted,
+                        ))
+                        .child(gpui_kit::base::h_flex().flex_1()),
+                )
+                .child(toolbar)
+                // GFM tables + strikethrough ship in TextView's default GFM
+                // parse options; `.scrollable` keeps the whole pane from
+                // scrolling away under the toolbar.
+                .child(
+                    TextView::markdown("reader", src)
+                        .scrollable(true)
+                        .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
+                ),
         )
-        .into_element()
+    }
 }
 
 /// epoch ms → "YYYY-MM-DD" (display only; store keeps epoch ms).
-fn fmt_time(ms: i64) -> String {
+pub(crate) fn fmt_time(ms: i64) -> String {
     let days = ms.div_euclid(86_400_000);
     // Howard Hinnant civil_from_days.
     let z = days + 719_468;
@@ -496,6 +851,26 @@ fn fmt_time(ms: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_time_known_dates() {
+        assert_eq!(fmt_time(0), "1970-01-01");
+        assert_eq!(fmt_time(1_765_235_200_000), "2025-12-08");
+        assert_eq!(fmt_time(86_399_999), "1970-01-01");
+        assert_eq!(fmt_time(86_400_000), "1970-01-02");
+    }
+
+    #[test]
+    fn nav_selection_compares_by_identity() {
+        assert_eq!(NavSelection::Notebook("nb1".into()), NavSelection::Notebook("nb1".into()));
+        assert_ne!(NavSelection::Notebook("nb1".into()), NavSelection::Tag("nb1".into()));
+        assert_eq!(NavSelection::Tag("rust".into()), NavSelection::Tag("rust".into()));
+    }
 }
 
 // Window-state glue used by main.rs.

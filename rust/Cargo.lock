@@ -3488,7 +3488,10 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 name = "leanote-app"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "futures",
  "gpui-kit",
+ "http",
  "leanote-core",
  "leanote-fakeserver",
  "serde",
@@ -3496,6 +3499,7 @@ dependencies = [
  "smol",
  "sys-locale",
  "tokio",
+ "ureq 3.4.2",
 ]
 
 [[package]]
