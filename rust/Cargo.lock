@@ -3515,6 +3515,7 @@ dependencies = [
  "http",
  "leanote-core",
  "leanote-fakeserver",
+ "markdown",
  "serde",
  "serde_json",
  "smol",

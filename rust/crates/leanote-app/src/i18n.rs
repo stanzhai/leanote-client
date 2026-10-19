@@ -60,6 +60,22 @@ keys! {
     Restore => ("恢复", "Restore"),
     HardDelete => ("彻底删除", "Delete forever"),
     EmptyTrash => ("清空废纸篓", "Empty trash"),
+    // Ticket 13: ⌘K search overlay.
+    SearchPlaceholder => ("搜索笔记…", "Search notes…"),
+    SearchNoResults => ("没有匹配的笔记", "No matching notes"),
+    SearchEmptyHint => ("输入关键词搜索标题、内容与标签", "Type to search titles, content and tags"),
+    SearchFootnote => ("↑↓ 选择   ↩ 打开   esc 关闭", "↑↓ navigate   ↩ open   esc close"),
+    // Ticket 10: editor toolbar + history.
+    NewNote => ("新建笔记", "New note"),
+    Edit => ("编辑", "Edit"),
+    Done => ("完成", "Done"),
+    EditorPreview => ("预览", "Preview"),
+    EditorSource => ("源码", "Source"),
+    Save => ("保存", "Save"),
+    History => ("历史版本", "History"),
+    RestoreVersion => ("恢复此版本", "Restore this version"),
+    HistoryEmpty => ("暂无历史版本", "No history yet"),
+    Saved => ("已保存", "Saved"),
     // Ticket 12: rich-text notes render read-only as converted Markdown.
     RichTextReadonly => ("富文本（只读）", "Rich text (read only)"),
     ConvertToMarkdown => ("转换为 Markdown", "Convert to Markdown"),
@@ -81,6 +97,13 @@ keys! {
     DeleteTag => ("删除标签", "Delete Tag"),
     Confirm => ("确定", "OK"),
     Cancel => ("取消", "Cancel"),
+    // Ticket 15: export actions + PDF-fallback reason.
+    ExportHtml => ("导出 HTML", "Export HTML"),
+    ExportMarkdown => ("导出 Markdown", "Export Markdown"),
+    ExportPdf => ("导出 PDF", "Export PDF"),
+    ExportBackup => ("导出备份 (.leanote)", "Export backup (.leanote)"),
+    PdfFellBack => ("服务器导出 PDF 失败，已导出 HTML", "Server PDF export failed, exported HTML instead"),
+    NotSynced => ("笔记尚未同步到服务器", "Note is not synced to the server"),
 }
 
 #[cfg(test)]
@@ -119,11 +142,16 @@ mod tests {
         Key::SignIn, Key::SigningIn, Key::Register, Key::LoginFailed, Key::SyncingTitle,
         Key::SyncingSubtitle, Key::SyncDone, Key::SyncFailed, Key::NavAllNotes, Key::NavStarred,
         Key::NavTrash, Key::NavNotebooks, Key::NavTags, Key::NoSelection,
-        Key::EmptyNotes, Key::Restore, Key::HardDelete, Key::EmptyTrash,
+        Key::EmptyNotes, Key::Restore, Key::HardDelete, Key::EmptyTrash, Key::NewNote,
+        Key::Edit, Key::Done, Key::EditorPreview, Key::EditorSource, Key::Save,
+        Key::History, Key::RestoreVersion, Key::HistoryEmpty, Key::Saved,
         Key::RichTextReadonly, Key::ConvertToMarkdown, Key::ConvertedToMarkdown,
+        Key::ExportHtml, Key::ExportMarkdown, Key::ExportPdf, Key::ExportBackup,
+        Key::PdfFellBack, Key::NotSynced,
         Key::ConflictTitle, Key::ConflictLocal, Key::ConflictServer,
         Key::UseLocal, Key::UseServer, Key::KeepBoth,
         Key::NewNotebook, Key::RenameNotebook, Key::DeleteNotebook, Key::MoveNotebookTo,
         Key::RootLevel, Key::RenameTag, Key::DeleteTag, Key::Confirm, Key::Cancel,
+        Key::SearchPlaceholder, Key::SearchNoResults, Key::SearchEmptyHint, Key::SearchFootnote,
     ];
 }

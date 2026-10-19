@@ -493,3 +493,90 @@ fn dirty_flags_ready_for_sync_push() {
         1
     );
 }
+
+// --- ticket 10: note history ---
+
+fn save(s: &Store, id: &Id, content: &str) {
+    s.save_note_with_history(
+        id,
+        NoteUpdate { content: Some(content.to_string()), ..Default::default() },
+    )
+    .unwrap();
+}
+
+#[test]
+fn history_consecutive_identical_saves_dedup() {
+    let s = store("hist_dedup");
+    let n = add(&s, "T", "v1", &[], "Inbox");
+    save(&s, &n.note_id, "v2");
+    save(&s, &n.note_id, "v2"); // identical to last snapshot target — no new row
+    save(&s, &n.note_id, "v2");
+    assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM note_history").unwrap(), 1);
+    assert_eq!(s.list_history(&n.note_id).unwrap()[0].content, "v1");
+    // same content twice in a row with a DIFFERENT other save between → kept
+    save(&s, &n.note_id, "v3");
+    save(&s, &n.note_id, "v1");
+    assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM note_history").unwrap(), 3);
+}
+
+#[test]
+fn history_caps_at_20_rows_dropping_oldest() {
+    let s = store("hist_trim");
+    let n = add(&s, "T", "v0", &[], "Inbox");
+    for i in 1..=25 {
+        save(&s, &n.note_id, &format!("v{i}"));
+    }
+    let h = s.list_history(&n.note_id).unwrap();
+    assert_eq!(h.len(), 20);
+    assert_eq!(h[0].content, "v24", "newest snapshot is the last pre-change content");
+    assert_eq!(h[19].content, "v5", "oldest five trimmed");
+    assert!(!h.iter().any(|x| x.content == "v4"));
+}
+
+#[test]
+fn restore_makes_old_version_the_latest_and_dirty() {
+    let s = store("hist_restore");
+    let n = add(&s, "Old title", "old body", &[], "Inbox");
+    save(&s, &n.note_id, "new body");
+    let h = s.list_history(&n.note_id).unwrap();
+    assert_eq!(h.len(), 1);
+
+    let restored = s.restore_history(&n.note_id, &h[0].history_id).unwrap().unwrap();
+    assert_eq!(restored.content, "old body");
+    assert_eq!(restored.title, "Old title");
+    assert!(restored.is_dirty, "restore is a server-visible change");
+
+    // restoring records the replaced "new body" as the newest history row
+    let h2 = s.list_history(&n.note_id).unwrap();
+    assert_eq!(h2[0].content, "new body");
+    assert_eq!(h2.len(), 2);
+    // and restoring back again flips content again (bounce is lossless)
+    let back = s.restore_history(&n.note_id, &h2[0].history_id).unwrap().unwrap();
+    assert_eq!(back.content, "new body");
+    assert!(s.restore_history(&n.note_id, &Id("bogus".into())).unwrap().is_none());
+}
+
+#[test]
+fn hard_delete_purges_history_rows() {
+    let s = store("hist_purge");
+    let n = add(&s, "T", "v1", &[], "Inbox");
+    save(&s, &n.note_id, "v2");
+    assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM note_history").unwrap(), 1);
+    assert_eq!(s.hard_delete_note(&n.note_id).unwrap(), 1);
+    assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM note_history").unwrap(), 0);
+    assert!(s.list_history(&n.note_id).unwrap().is_empty());
+    assert!(s.purge_history(&n.note_id).is_ok());
+}
+
+#[test]
+fn save_with_history_no_change_writes_nothing() {
+    let s = store("hist_noop");
+    let n = add(&s, "T", "v1", &[], "Inbox");
+    let saved = s
+        .save_note_with_history(&n.note_id, NoteUpdate::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.content, "v1");
+    assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM note_history").unwrap(), 0);
+    assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM notes").unwrap(), 1);
+}

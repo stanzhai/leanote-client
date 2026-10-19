@@ -513,6 +513,87 @@ async fn incr_pull_delta_only_no_duplicates_on_rerun() {
     assert_eq!(s.last_sync_usn().unwrap(), last);
 }
 
+// ---- ticket 10: editor save with history + sync round trip ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn editor_save_with_history_pushes_via_cli_sync() {
+    let (srv, dir, s, _api) = synced("t10_editor_edit").await;
+
+    // Offline editor save: content edited through save_note_with_history.
+    let edited = "# Note 42\n\nedited offline";
+    s.save_note_with_history(
+        &Id("note0042".into()),
+        NoteUpdate {
+            title: Some("Note 42".into()),
+            content: Some(edited.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .unwrap();
+    // pre-change snapshot recorded
+    let hist = s.list_history(&Id("note0042".into())).unwrap();
+    assert_eq!(hist.len(), 1, "one history row for the replaced content");
+    assert_eq!(hist[0].content, "# Note 42\n\nbody 42");
+
+    // `leanote sync` runs (pull-only full pass), then the incr round pushes
+    // the dirty edit as updateNote with the new content.
+    let bin = env!("CARGO_BIN_EXE_leanote");
+    let out = Command::new(bin)
+        .args(["sync", "--host", &srv.url(), "--email", EMAIL, "--password", PWD])
+        .env("LEANOTE_RUST_DATA", &dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let api2 = Api::login(&srv.url(), EMAIL, PWD, &s).unwrap();
+    incr_sync(&Api::for_account(&api2), &s, &NoProgress).unwrap();
+
+    let pushes = srv.pushes();
+    let up = find_push(&pushes, "note/updateNote");
+    assert_eq!(up.fields["NoteId"].as_str().unwrap(), "note0042");
+    assert_eq!(up.fields["Content"].as_str().unwrap(), edited);
+    // history survives the sync round trip
+    assert_eq!(s.list_history(&Id("note0042".into())).unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_note_pushes_add_note_via_cli_sync() {
+    let (srv, dir, s, _api) = synced("t10_editor_new").await;
+
+    s.add_note(NewNote {
+        title: "Ticket10 note".into(),
+        content: "# fresh\n\nfrom editor".into(),
+        tags: vec![],
+        notebook_title: "Notebook 2".into(),
+        is_markdown: true,
+    })
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_leanote");
+    let out = Command::new(bin)
+        .args(["sync", "--host", &srv.url(), "--email", EMAIL, "--password", PWD])
+        .env("LEANOTE_RUST_DATA", &dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let api2 = Api::login(&srv.url(), EMAIL, PWD, &s).unwrap();
+    incr_sync(&Api::for_account(&api2), &s, &NoProgress).unwrap();
+
+    let pushes = srv.pushes();
+    let add = find_push(&pushes, "note/addNote");
+    assert_eq!(add.fields["Title"].as_str().unwrap(), "Ticket10 note");
+    assert_eq!(add.fields["Content"].as_str().unwrap(), "# fresh\n\nfrom editor");
+}
 /// Ticket 12 end-to-end: legacy rich-text note → read-side convert →
 /// explicit 转存 → incr sync pushes updateNote with the converted Markdown.
 #[tokio::test(flavor = "multi_thread")]
