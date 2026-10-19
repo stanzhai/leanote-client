@@ -46,3 +46,8 @@ Linux/Windows：本机无交叉工具链与真机，验收口径 = host `cargo c
 ### 测试
 
 workspace 143 passed / 0 failed（基线 140 + logging 3）。
+
+### 合并与验证（Merge16）
+
+- **Merged:** `eedbe4a1` → `integration/rust-rewrite`（fast-forward，无冲突；原 worktree amend 后 `ticket/16` tip = `eedbe4a1`，文件 `Commit:` 行改为 "merged via integration/rust-rewrite" 断开自引用回填环）
+- 验证：`cargo test --manifest-path rust/Cargo.toml` = **143 passed / 0 failed**；`cargo build --release -p leanote-app` OK（4 warnings，均为既有）；`bash rust/scripts/acceptance-macos.sh` = **15 PASS / 0 FAIL**（打包产物在本 checkout 重建后全绿）
