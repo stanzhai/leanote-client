@@ -11,7 +11,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
-use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable};
+use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, WindowExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::{px, SharedString, Task, Window};
 use leanote_core::sync::{Api, SyncProgress, SyncStats};
@@ -75,6 +75,9 @@ pub struct AppShell {
     /// Note currently shown in the reader (kept across list re-filters
     /// until the selection changes).
     selected: Option<leanote_core::Id>,
+    /// Ticket 13: ⌘K search overlay (dialog-hosted palette + last rows).
+    search: crate::search_overlay::SearchOverlay,
+    search_rows: Vec<crate::search_overlay::ResultRow>,
     // --- Ticket 12 rich-text state ---
     /// Set after a successful Convert to Markdown; cleared when the
     /// selection changes. Rendered as a one-line feedback next to the badge.
@@ -149,6 +152,8 @@ impl AppShell {
             notebooks_open: true,
             tags_open: true,
             selected: None,
+            search: crate::search_overlay::SearchOverlay::new(window, cx),
+            search_rows: Vec::new(),
             converted_note: None,
         }
     }
@@ -242,9 +247,13 @@ impl AppShell {
         }));
     }
 
-    fn dark(&self, window: &Window) -> bool {
+    pub(crate) fn dark(&self, window: &Window) -> bool {
         window.appearance() == gpui_kit::WindowAppearance::Dark
             || window.appearance() == gpui_kit::WindowAppearance::VibrantDark
+    }
+
+    pub(crate) fn lang(&self) -> i18n::Lang {
+        self.lang
     }
 
     fn store(&self) -> Option<leanote_core::Store> {
@@ -320,6 +329,51 @@ impl AppShell {
         self.selected = Some(id);
         self.converted_note = None;
         cx.notify();
+    }
+
+    /// Ticket 13: ⌘K toggles the overlay from any phase (dialog layer is
+    /// window-level, not pane-level).
+    pub fn toggle_search(&self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        self.search.toggle(&cx.entity(), window, cx);
+    }
+
+    /// Overlay rows as of the last committed query (re-render source).
+    pub(crate) fn overlay_rows(&self) -> &[crate::search_overlay::ResultRow] {
+        &self.search_rows
+    }
+
+    /// Committed query → unified core search → rows. IME-safe: the palette
+    /// only calls this on `InputEvent::Change` (committed text).
+    pub(crate) fn run_overlay_search(&mut self, query: &str, cx: &mut gpui_kit::Context<Self>) {
+        self.search_rows = if crate::search_overlay::should_search(query, false) {
+            self.search_store(query)
+        } else {
+            Vec::new()
+        };
+        cx.notify();
+    }
+
+    /// ↩ on a row: open the note in the reader (`selected` drives it), then
+    /// close the overlay. The middle list keeps its filter/nav untouched.
+    pub(crate) fn confirm_overlay(
+        &mut self,
+        index: gpui_kit::component::IndexPath,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if let Some(row) = self.search_rows.get(index.row) {
+            let id = leanote_core::Id(row.note_id.clone());
+            self.select_note(id, cx);
+        }
+        window.close_dialog(cx);
+    }
+
+    fn search_store(&self, query: &str) -> Vec<crate::search_overlay::ResultRow> {
+        let Some(store) = self.store() else { return Vec::new() };
+        let hits = store.search(query, crate::search_overlay::RESULT_LIMIT).unwrap_or_default();
+        crate::search_overlay::format_rows(&hits, |id| {
+            store.notebook_title(id).unwrap_or_else(|_| id.to_string())
+        })
     }
 
     /// Star is local-only: toggle_star never touches IsDirty (GLOSSARY).
@@ -414,7 +468,16 @@ impl Render for AppShell {
         let list_bg = theme::material(Material::List, dark);
 
         // Whole window: material[0] shows through the 44px transparent titlebar.
-        let root = gpui_kit::base::v_flex().size_full().bg(base_bg).text_color(cx.theme().foreground);
+        let root = gpui_kit::base::v_flex()
+            .size_full()
+            .bg(base_bg)
+            .text_color(cx.theme().foreground)
+            .on_action(
+                cx.listener(|this, _: &crate::search_overlay::ToggleSearch, window, cx| {
+                    // Any phase: the dialog layer is window-level.
+                    this.toggle_search(window, cx);
+                }),
+            );
 
         // 44px strip shares sidebar material — drawn by the root bg.
         let titlebar = gpui_kit::base::h_flex().h(px(TITLEBAR_H)).w_full().flex_none();

@@ -4,6 +4,7 @@ mod app_shell;
 mod browse;
 mod conflict_bar;
 mod i18n;
+mod search_overlay;
 mod single_instance;
 mod theme;
 mod window_state;
@@ -205,6 +206,12 @@ fn main() {
         .run(move |cx| {
         gpui_kit::init(cx);
 
+        // Ticket 13: ⌘K / Ctrl+K toggle the global search overlay.
+        cx.bind_keys([
+            gpui_kit::KeyBinding::new("cmd-k", search_overlay::ToggleSearch, None),
+            gpui_kit::KeyBinding::new("ctrl-k", search_overlay::ToggleSearch, None),
+        ]);
+
         // Theme: follow system first (loads registered theme), then overlay
         // Wake tokens. Re-applied on every appearance change.
         Theme::sync_system_appearance(None, cx);
@@ -284,6 +291,7 @@ fn main() {
             })
             .detach();
         }
+
     });
 }
 
