@@ -310,9 +310,11 @@ impl Store {
     /// - IsDirty/UpdatedTime only when Title/Content/Tags actually differ
     /// - no-op update (nothing differed) → Ok(Some(old)), nothing written
     /// - tags upsert only for a non-empty new tag list
-    /// - `notebook_title` is accepted but intentionally ignored: JS
-    ///   updateNoteOrContent's updateFields never persists NotebookId, so a
-    ///   notebook-only move is a no-op there too.
+    /// - `notebook_title` is a *title* (local-server semantics). The CLI
+    ///   offline path also routes its resolved notebook *id* through this
+    ///   field: when the value matches an existing notebook id, the note is
+    ///   moved (JS CLI persists NotebookId); when it matches no id but does
+    ///   match a title, it resolves to that id; otherwise ignored.
     pub fn update_note(&self, id: &Id, upd: NoteUpdate) -> rusqlite::Result<Option<Note>> {
         let Some(old) = self.get_note_any(id)? else {
             return Ok(None);
@@ -320,8 +322,33 @@ impl Store {
         let title = upd.title.clone().unwrap_or_else(|| old.title.clone());
         let content = upd.content.clone().unwrap_or_else(|| old.content.clone());
         let tags = upd.tags.clone().unwrap_or_else(|| old.tags.clone());
-        let dirty =
-            title != old.title || content != old.content || tags_csv(&tags) != tags_csv(&old.tags);
+        // JS CLI cmdEditInternal assigns fields.NotebookId = matched id.
+        let notebook_id = match &upd.notebook_title {
+            Some(v) => match self
+                .conn
+                .query_row(
+                    "SELECT NotebookId FROM notebooks WHERE NotebookId=?1",
+                    [v],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                Some(id) => Some(id),
+                None => self
+                    .conn
+                    .query_row(
+                        "SELECT NotebookId FROM notebooks WHERE Title=?1 AND LocalIsDelete=0",
+                        [v],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+            },
+            None => None,
+        };
+        let dirty = title != old.title
+            || content != old.content
+            || tags_csv(&tags) != tags_csv(&old.tags)
+            || notebook_id.as_deref().map_or(false, |id| id != &*old.notebook_id);
         if !dirty {
             return Ok(Some(old));
         }
@@ -335,6 +362,7 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE notes SET Title=?2, Content=?3, \"Desc\"=?4, Abstract=?5, Tags=?6,
+                NotebookId=COALESCE(?8, NotebookId),
                 IsDirty=1, LocalIsDelete=0, UpdatedTime=?7
              WHERE NoteId=?1",
             params![
@@ -344,7 +372,8 @@ impl Store {
                 desc,
                 abstract_,
                 tags_csv(&tags),
-                now
+                now,
+                notebook_id,
             ],
         )?;
         if let Some(t) = upd.tags.clone().filter(|t| !t.is_empty()) {
@@ -365,10 +394,10 @@ impl Store {
         stmt.query_row([id.to_string()], row_to_note).optional()
     }
 
-    /// JS local_server findNoteByPrefix: exact id first (any state), else
-    /// prefix matches in insertion order, first non-trash/non-deleted wins.
+    /// JS leanote_data findNote+resolveNote: exact id first (non-trash
+    /// only), else prefix matches in insertion order, first live one wins.
     pub fn find_note_by_prefix(&self, prefix: &str) -> rusqlite::Result<Option<Note>> {
-        if let Some(n) = self.get_note_any(&Id(prefix.to_string()))? {
+        if let Some(n) = self.get_note(&Id(prefix.to_string()))? {
             return Ok(Some(n));
         }
         let mut stmt = self.conn.prepare(
@@ -384,6 +413,48 @@ impl Store {
             }
         }
         Ok(None)
+    }
+
+    /// JS deleteNote (leanote_data.js): trash + local-delete flags, never a
+    /// hard delete, dirty so sync pushes it.
+    pub fn trash_note(&self, id: &Id) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE notes SET IsTrash=1, LocalIsDelete=1, IsDirty=1, UpdatedTime=?2 WHERE NoteId=?1",
+            params![id.to_string(), now_ms()],
+        )
+    }
+
+    /// Live notebook by exact title for this user (MCP list/update filters).
+    pub fn find_notebook_by_title(&self, title: &str) -> rusqlite::Result<Option<Notebook>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT NotebookId, UserId, Title, ParentNotebookId, Seq, LocalIsNew, IsDirty, LocalIsDelete
+             FROM notebooks WHERE UserId=?1 AND Title=?2 AND LocalIsDelete=0 ORDER BY rowid",
+        )?;
+        stmt.query_row(
+            params![self.user_id, title],
+            |r| {
+                Ok(Notebook {
+                    notebook_id: Id(r.get(0)?),
+                    user_id: r.get(1)?,
+                    title: r.get(2)?,
+                    parent_notebook_id: r.get(3)?,
+                    seq: r.get(4)?,
+                    is_new: r.get::<_, i64>(5)? != 0,
+                    is_dirty: r.get::<_, i64>(6)? != 0,
+                    is_deleted: r.get::<_, i64>(7)? != 0,
+                })
+            },
+        )
+        .optional()
+    }
+
+    /// MCP update_note "notebook" move (JS updateNoteFields): the /api
+    /// updateNote path intentionally ignores notebook moves, MCP honors them.
+    pub fn set_notebook(&self, id: &Id, notebook_id: &Id) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE notes SET NotebookId=?2, IsDirty=1, UpdatedTime=?3 WHERE NoteId=?1",
+            params![id.to_string(), notebook_id.to_string(), now_ms()],
+        )
     }
 
     /// Unified search (spec §30): case-insensitive substring over

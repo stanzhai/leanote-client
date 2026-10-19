@@ -5,6 +5,7 @@ use leanote_core::{NewNote, PrefixError, Store};
 use std::io::{Read, Write};
 
 pub fn run(argv: Vec<String>) -> i32 {
+    shim_switch(); // first-run PATH switch to this binary (no-op afterwards)
     // JS: first arg that is a known subcommand wins; default "add".
     // `serve` is Rust-only (dev helper to run the local HTTP server).
     const SUBCOMMANDS: [&str; 8] =
@@ -41,11 +42,13 @@ pub fn run(argv: Vec<String>) -> i32 {
         None => argv.clone(),
     };
 
-    // sync takes no stdin; skip the piped read to avoid blocking on a tty-less
-    // pipe that never closes (tests pipe nothing, but be safe)
-    if cmd == "sync" {
-        return cmd_sync(&cmd_args);
-    }
+    // Every subcommand probes the local HTTP API first (JS checkAPI, ~300ms);
+    // sync/serve never use it.
+    let api = if cmd == "sync" || cmd == "serve" {
+        Api::Offline
+    } else {
+        probe_api()
+    };
 
     // Read stdin when piped (JS: !process.stdin.isTTY).
     let piped = if !atty_stdin() {
@@ -53,20 +56,15 @@ pub fn run(argv: Vec<String>) -> i32 {
     } else {
         String::new()
     };
+
     match cmd {
-        "add" => cmd_add(&cmd_args, &piped),
+        "add" => cmd_add(&cmd_args, &piped, api),
         "list" => cmd_list(&cmd_args),
         "show" => cmd_show(&cmd_args),
-        "search" => {
-            eprintln!("Error: search is not implemented yet");
-            1
-        }
+        "search" => cmd_search(&cmd_args),
         "sync" => cmd_sync(&cmd_args),
         "serve" => cmd_serve(&cmd_args),
-        "edit" => {
-            eprintln!("Error: edit is not implemented yet");
-            1
-        }
+        "edit" => cmd_edit(&cmd_args, &piped, api),
         _ => {
             eprintln!("Unknown command: {}", cmd);
             print_global_help();
@@ -76,6 +74,43 @@ pub fn run(argv: Vec<String>) -> i32 {
 }
 
 
+/// One-shot `GET /api/ping` against the local app (300ms) — invisible: the
+/// mode only routes writes; stdout is identical either way.
+enum Api {
+    Online(ureq::Agent),
+    Offline,
+}
+
+fn api_port() -> u16 {
+    // LEANOTE_PORT moves the local API off the default 8912 — the user's real
+    // Electron app legitimately owns 8912; tests use this for isolation.
+    std::env::var("LEANOTE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(leanote_http::DEFAULT_PORT)
+}
+
+fn probe_api() -> Api {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_millis(300))
+        .build();
+    match agent.get(&format!("http://{}:{}/api/ping", leanote_http::HOST, api_port())).call() {
+        Ok(_) => Api::Online(agent),
+        Err(_) => Api::Offline,
+    }
+}
+
+/// POST JSON like the JS callAPI; returns the parsed body.
+fn api_post(agent: &ureq::Agent, path: &str, body: &serde_json::Value) -> Option<serde_json::Value> {
+    let resp = match agent
+        .post(&format!("http://{}:{}{}", leanote_http::HOST, api_port(), path))
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+    {
+        Ok(r) => r,
+        // JS callAPI resolves the parsed body even on non-2xx (API error path).
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(_) => return None,
+    };
+    resp.into_json().ok()
+}
 
 fn atty_stdin() -> bool {
     // No libc dependency: poll stdin. A pipe/file always reports readiness
@@ -153,7 +188,7 @@ fn parse_tags(s: &str) -> Vec<String> {
     s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).map(String::from).collect()
 }
 
-fn cmd_add(args: &[String], piped: &str) -> i32 {
+fn cmd_add(args: &[String], piped: &str, api: Api) -> i32 {
     let mut opts = parse_add_args(args);
     if opts.help {
         print_help("add");
@@ -184,6 +219,33 @@ fn cmd_add(args: &[String], piped: &str) -> i32 {
         }
     };
     let target_notebook = if opts.notebook.is_empty() { "AI札".to_string() } else { opts.notebook.clone() };
+    let tags_str = if !opts.tags.is_empty() {
+        format!(" [{}]", opts.tags.join(", "))
+    } else {
+        String::new()
+    };
+
+    // HTTP mode: POST /api/note/addNote (JS addNote wrapper). Identical stdout;
+    // transport failure falls through to the direct store write below.
+    if let Api::Online(agent) = &api {
+        let mut payload = serde_json::json!({
+            "title": opts.title,
+            "content": opts.content,
+            "tags": opts.tags,
+        });
+        if !opts.notebook.is_empty() {
+            payload["notebook"] = serde_json::Value::String(opts.notebook.clone());
+        }
+        if let Some(res) = api_post(agent, "/api/note/addNote", &payload) {
+            if res.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
+                println!("Added: \"{}\" -> {}{}", opts.title, target_notebook, tags_str);
+                return 0;
+            }
+            eprintln!("API error: {}", res.get("error").and_then(|e| e.as_str()).unwrap_or(""));
+            return 1;
+        }
+    }
+
     match store.add_note(NewNote {
         title: opts.title.clone(),
         content: opts.content.clone(),
@@ -192,15 +254,7 @@ fn cmd_add(args: &[String], piped: &str) -> i32 {
         is_markdown: true,
     }) {
         Ok(_) => {
-            let tags_str = if !opts.tags.is_empty() {
-                format!(" [{}]", opts.tags.join(", "))
-            } else {
-                String::new()
-            };
-            println!(
-                "Added: \"{}\" -> {}{}",
-                opts.title, target_notebook, tags_str
-            );
+            println!("Added: \"{}\" -> {}{}", opts.title, target_notebook, tags_str);
             0
         }
         Err(e) => {
@@ -296,7 +350,7 @@ impl leanote_core::sync::SyncProgress for PrintProgress {
 // --- serve (Rust-only: run the local HTTP /api server; dev/test helper) ---
 
 fn cmd_serve(args: &[String]) -> i32 {
-    let mut port: u16 = leanote_http::DEFAULT_PORT;
+    let mut port: u16 = api_port();
     let mut i = 0;
     while i < args.len() {
         if (args[i] == "-p" || args[i] == "--port") && i + 1 < args.len() {
@@ -534,6 +588,314 @@ fn cmd_show(args: &[String]) -> i32 {
     }
     0
 }
+
+// --- search ---
+
+struct SearchOpts {
+    keyword: String,
+    limit: i64,
+    help: bool,
+}
+
+fn parse_search_args(argv: &[String]) -> SearchOpts {
+    let mut o = SearchOpts { keyword: String::new(), limit: 20, help: false };
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--limit" | "-N" => {
+                i += 1;
+                let raw = argv.get(i).cloned().unwrap_or_default();
+                o.limit = raw.parse::<i64>().unwrap_or(20);
+            }
+            "--help" | "-h" => o.help = true,
+            a if !a.starts_with('-') => o.keyword = a.to_string(),
+            _ => {}
+        }
+        i += 1;
+    }
+    o
+}
+
+fn cmd_search(args: &[String]) -> i32 {
+    let opts = parse_search_args(args);
+    if opts.help {
+        print_help("search");
+        return 0;
+    }
+    if opts.keyword.is_empty() {
+        eprintln!("Error: <keyword> is required.");
+        return 1;
+    }
+
+    let store = match open_store() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return 1;
+        }
+    };
+
+    let hits = match store.search(&opts.keyword, usize::MAX) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return 1;
+        }
+    };
+    let limit = if opts.limit > 0 { opts.limit as usize } else { 20 };
+    let mut count = 0;
+    for h in hits.iter().take(limit) {
+        count += 1;
+        let n = &h.note;
+        let notebook = store
+            .notebook_title(&n.notebook_id)
+            .unwrap_or_else(|_| n.notebook_id.to_string());
+        let tags = if !n.tags.is_empty() { format!(" [{}]", n.tags.join(", ")) } else { String::new() };
+        let title = if n.title.is_empty() { "(untitled)".to_string() } else { n.title.clone() };
+        println!("{}  {}  {}", n.note_id, format_time(n.updated_time), title);
+        println!("       {}", h.excerpt);
+        println!("       {}{}", notebook, tags);
+    }
+    if count == 0 {
+        println!("No notes matching \"{}\".", opts.keyword);
+    } else if hits.len() > limit {
+        println!("... ({} more, use -N to show more)", hits.len() - limit);
+    }
+    0
+}
+
+// --- edit ---
+
+struct EditOpts {
+    note_id: String,
+    title: Option<String>,
+    content: Option<String>,
+    tags: Option<Vec<String>>,
+    notebook: Option<String>,
+    help: bool,
+}
+
+fn parse_edit_args(argv: &[String]) -> EditOpts {
+    let mut o = EditOpts {
+        note_id: String::new(),
+        title: None,
+        content: None,
+        tags: None,
+        notebook: None,
+        help: false,
+    };
+    let mut i = 0;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        match a {
+            "--title" | "-t" => {
+                i += 1;
+                o.title = Some(argv.get(i).cloned().unwrap_or_default());
+            }
+            "--content" | "-c" => {
+                i += 1;
+                o.content = Some(argv.get(i).cloned().unwrap_or_default());
+            }
+            "--tags" | "-g" => {
+                i += 1;
+                let raw = argv.get(i).cloned().unwrap_or_default();
+                o.tags = Some(parse_tags(&raw));
+            }
+            "--notebook" | "-n" => {
+                i += 1;
+                o.notebook = Some(argv.get(i).cloned().unwrap_or_default());
+            }
+            "--help" | "-h" => o.help = true,
+            a if !a.starts_with('-') => o.note_id = a.to_string(),
+            _ => {}
+        }
+        i += 1;
+    }
+    o
+}
+
+/// JS cmdEditInternal: notebook lookup happens before the "no fields" check,
+/// unknown title is fatal; piped content replaces -c unconditionally.
+fn cmd_edit(args: &[String], piped: &str, api: Api) -> i32 {
+    let mut opts = parse_edit_args(args);
+    if opts.help {
+        print_help("edit");
+        return 0;
+    }
+    if !piped.is_empty() {
+        opts.content = Some(piped.to_string());
+    }
+
+    if opts.note_id.is_empty() {
+        eprintln!("Error: <note-id> is required.");
+        return 1;
+    }
+
+    // JS: -n resolves to a NotebookId first; unknown title is fatal.
+    let notebook_id = match opts.notebook.as_deref() {
+        Some(nb) => {
+            let store = match open_store() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    return 1;
+                }
+            };
+            match store.notebooks().unwrap_or_default().into_iter().find(|n| n.title == nb) {
+                Some(found) => Some(found.notebook_id.to_string()),
+                None => {
+                    eprintln!("Error: Notebook \"{}\" not found.", nb);
+                    return 1;
+                }
+            }
+        }
+        None => None,
+    };
+
+    if opts.title.is_none()
+        && opts.content.is_none()
+        && opts.tags.is_none()
+        && opts.notebook.is_none()
+    {
+        eprintln!("Error: No fields to update.");
+        return 1;
+    }
+
+    // HTTP mode: POST /api/note/updateNote (JS editNote wrapper). The server
+    // does prefix resolution + dirty marking; stdout identical to offline.
+    if let Api::Online(agent) = &api {
+        let mut payload = serde_json::json!({ "noteId": opts.note_id });
+        if let Some(t) = &opts.title {
+            payload["title"] = serde_json::Value::String(t.clone());
+        }
+        if let Some(c) = &opts.content {
+            payload["content"] = serde_json::Value::String(c.clone());
+        }
+        if let Some(g) = &opts.tags {
+            payload["tags"] = serde_json::json!(g);
+        }
+        if let Some(nb) = &opts.notebook {
+            payload["notebook"] = serde_json::Value::String(nb.clone());
+        }
+        if let Some(res) = api_post(agent, "/api/note/updateNote", &payload) {
+            if res.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
+                println!("Updated: {}...", prefix8(&opts.note_id));
+                return 0;
+            }
+            eprintln!("API error: {}", res.get("error").and_then(|e| e.as_str()).unwrap_or(""));
+            return 1;
+        }
+        // transport failure -> fall through to direct store write
+    }
+
+    let store = match open_store() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return 1;
+        }
+    };
+
+    // JS updateNDB predicate: first note (newest-first list) whose id equals
+    // or starts with the argument — no ambiguity error.
+    let notes = match store.list_notes() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return 1;
+        }
+    };
+    let Some(target) = notes
+        .iter()
+        .find(|n| *n.note_id == opts.note_id || n.note_id.starts_with(opts.note_id.as_str()))
+        .map(|n| n.note_id.clone())
+    else {
+        eprintln!("Error: Note \"{}\" not found.", opts.note_id);
+        return 1;
+    };
+
+    match store.update_note(
+        &leanote_core::Id(target.to_string()),
+        leanote_core::NoteUpdate {
+            title: opts.title.clone(),
+            content: opts.content.clone(),
+            tags: opts.tags.clone(),
+            // NoteUpdate.notebook_title is a title in the http handler; here
+            // we already hold the resolved id, so hand the id through.
+            notebook_title: notebook_id,
+        },
+    ) {
+        Ok(Some(_)) => {
+            println!("Updated: {}...", prefix8(&opts.note_id));
+            0
+        }
+        Ok(None) => {
+            eprintln!("Error: Note \"{}\" not found.", opts.note_id);
+            1
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            1
+        }
+    }
+}
+
+/// JS substring(0, 8) over the user-provided id argument (never the resolved id).
+fn prefix8(s: &str) -> String {
+    s.chars().take(8).collect()
+}
+
+// --- first-run shim switch (spec: 首启把 ~/bin/leanote 指向 Rust 二进制) ---
+
+/// Only rewrite `~/bin/leanote` when it is absent or is the known Electron
+/// shim (references leanote.js); a user-owned script is refused. One-shot via
+/// a marker file in the data dir.
+fn shim_switch() {
+    if std::env::var_os("LEANOTE_NO_SHIM_SWITCH").is_some() {
+        return;
+    }
+    let Ok(home) = std::env::var("HOME") else { return };
+    if home.is_empty() {
+        return;
+    }
+    let data_dir = std::env::var("LEANOTE_RUST_DATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| leanote_core::app_data_dir());
+    let marker = data_dir.join("shim-switched");
+    if marker.exists() {
+        return;
+    }
+    let Ok(bin) = std::env::current_exe() else { return };
+    let shim = std::path::Path::new(&home).join("bin").join("leanote");
+
+    if let Ok(current) = std::fs::read_to_string(&shim) {
+        if !current.contains("leanote.js") {
+            eprintln!(
+                "[leanote] {} is not the known Electron shim; leaving it untouched",
+                shim.display()
+            );
+            let _ = std::fs::create_dir_all(&data_dir);
+            let _ = std::fs::write(&marker, b"");
+            return;
+        }
+    }
+
+    let script = format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", bin.display());
+    match std::fs::write(&shim, script) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755));
+            }
+            eprintln!("[leanote] Shim updated: {} -> {}", shim.display(), bin.display());
+        }
+        Err(e) => eprintln!("[leanote] Could not update shim {}: {}", shim.display(), e),
+    }
+    let _ = std::fs::create_dir_all(&data_dir);
+    let _ = std::fs::write(&marker, b"");
+}
+
 
 // --- formatting (mirrors JS formatTime: local time, ms timestamps) ---
 

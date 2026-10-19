@@ -42,7 +42,7 @@ EOF
 # --- identical fixtures on both sides ---
 seed() { # $1 = side dir
   local NB="$1/Library/Application Support/leanote/nedb55/user1"
-  mkdir -p "$NB" "$1/Library/Application Support/leanote-rust"
+  mkdir -p "$1/bin" "$NB" "$1/Library/Application Support/leanote-rust"
   printf '{"Ok":true,"UserId":"user1","_id":"u1","IsActive":true}\n' > "$1/Library/Application Support/leanote/nedb55/users.db"
   printf '{"_id":"n1","NotebookId":"notebookaaaa000000000001","Title":"AI札","Seq":-1,"UserId":"user1","ParentNotebookId":"","LocalIsNew":true,"IsDirty":true}\n' > "$NB/notebooks.db"
   cat > "$NB/notes.db" <<'NEOF'
@@ -56,6 +56,11 @@ NEOF
   : > "$NB/tags.db"
 }
 JH="$SB/js"; RH="$SB/rs"
+# The shim switch is exercised by its own test; keep byte-comparison clean.
+export LEANOTE_NO_SHIM_SWITCH=1
+# The Rust CLI probes 127.0.0.1:8912; the user's real Electron app may own it.
+# Point the Rust side at a dead port so both CLIs take their offline path.
+export LEANOTE_PORT=8913
 seed "$JH"; seed "$RH"
 sqlite3 "$RH/Library/Application Support/leanote-rust/leanote.db" "
 CREATE TABLE IF NOT EXISTS notebooks (NotebookId TEXT PRIMARY KEY, UserId TEXT NOT NULL, Title TEXT NOT NULL, ParentNotebookId TEXT NOT NULL DEFAULT '', Seq INTEGER NOT NULL DEFAULT 0, Usn INTEGER NOT NULL DEFAULT 0, LocalIsNew INTEGER NOT NULL DEFAULT 0, IsDirty INTEGER NOT NULL DEFAULT 0, LocalIsDelete INTEGER NOT NULL DEFAULT 0, ServerNotebookId TEXT DEFAULT NULL);
@@ -131,7 +136,35 @@ cmp_case show bbbb3
 cmp_case show zzzz
 cmp_case show
 cmp_case show ""
-cmp_case --help
+cmp_case search hello
+cmp_case search note
+cmp_case search ai
+cmp_case search zz
+cmp_case search -N 1 note
+cmp_case search note -N 1
+cmp_case search
+cmp_case search --help
+cmp_case edit --help
+cmp_case help search
+cmp_case help edit
+cmp_case help show
+cmp_case help list
+cmp_case edit
+cmp_case edit aaaa11111111111111111111
+cmp_case edit aaaa1 -t "New Title"
+cmp_case edit aaaa1 -c "Fresh content # with hash"
+cmp_case edit aaaa1 -g "urgent, work"
+cmp_case edit aaaa1 -n "Work"
+cmp_case edit aaaa1 -n "Nope"
+cmp_case edit aaaa1 -n "Work" -t "Both"
+cmp_case edit cccc1 -t "Amb first"
+cmp_case edit zzzz -t "Nope"
+STDIN_DATA="piped edit body" cmp_case edit aaaa1
+STDIN_DATA="piped wins" cmp_case edit aaaa1 -c "flag body"
+cmp_case search hash
+cmp_case search urgent
+cmp_case search Amb
+cmp_case search "body two"
 cmp_case help
 cmp_case help add
 cmp_case add --help

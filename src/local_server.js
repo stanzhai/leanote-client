@@ -42,6 +42,35 @@ function start(services, opts) {
     var mcpOnly = !!opts.mcpOnly; // 测试用：只挂 /mcp，不需 services
     var port = opts.port || DEFAULT_PORT;
 
+    // 测试桥：LEANOTE_RUST_MCP=1 时由 Rust 进程实际监听（ticket 06 验收：
+    // 用未修改的 tests/test_mcp_*.js 直接打 Rust 实现）。默认关闭，行为不变。
+    if (process.env.LEANOTE_RUST_MCP) {
+        var path = require('path');
+        var child = require('child_process').spawn(
+            path.join(__dirname, '..', 'rust', 'target', 'debug', 'leanote'),
+            ['serve', '--port', String(port)],
+            { stdio: 'inherit', env: process.env },
+        );
+        // 测试直接 process.exit()，不杀子进程会占住端口，影响下次运行
+        process.on('exit', function () { try { child.kill(); } catch (e) {} });
+        child.on('error', function (e) { console.log('[leanote] rust server spawn failed:', e.message); });
+        server = child; // 占位：避免重复 start()
+        // 等端口就绪再返回（测试只等 400ms，Rust 冷启动可能更慢）
+        var net = require('net');
+        var t0 = Date.now();
+        (function waitReady() {
+            var probe = net.connect(port, HOST, function () {
+                probe.destroy();
+                console.log('[leanote] Local server on ' + HOST + ':' + port + ' (/api, /mcp) [rust]');
+            });
+            probe.on('error', function () {
+                if (Date.now() - t0 > 5000) { console.log('[leanote] rust server not ready'); return; }
+                setTimeout(waitReady, 50);
+            });
+        })();
+        setInterval(function () {}, 1 << 30); // 子进程存活期间保持事件循环
+        return;
+    }
     server = http.createServer(function (req, res) {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');

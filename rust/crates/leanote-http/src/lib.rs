@@ -10,7 +10,7 @@
 //! map sorts keys — byte parity requires manual order.
 
 use axum::body::Bytes;
-use axum::extract::{FromRequest, Request, State};
+use axum::extract::{FromRequest, Request};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -28,39 +28,26 @@ pub const DEFAULT_PORT: u16 = 8912;
 /// rusqlite's Connection is Send but not Sync, so the store is shared behind
 /// a mutex. ponytail: single lock is fine — local single-user server.
 pub type AppState = Arc<Mutex<Store>>;
+pub mod mcp;
 
 pub fn router(store: Store) -> Router {
+    let state = mcp::McpState::new(store);
+    mcp::spawn_session_reaper(&state);
     Router::new()
         .route(
             "/api/ping",
             get(|| async { json_response(StatusCode::OK, r#"{"success":true}"#.to_string()) }),
         )
-        .fallback(|State(state): State<AppState>, req: Request| async move {
-            let method = req.method().clone();
-            let path = req.uri().path().to_string();
-            let body = match Body::from_request(req, &()).await {
-                Ok(b) => b.0,
-                Err(resp) => return resp,
-            };
-            // Store calls are blocking SQLite — keep them off the async core.
-            let resp = tokio::task::spawn_blocking(move || {
-                let store = state.lock().expect("store lock");
-                api_dispatch(&store, method, &path, body)
-            })
-            .await;
-            match resp {
-                Ok(r) => r,
-                Err(e) => json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(r#"{{"success":false,"error":"{e}}}"#),
-                ),
-            }
-        })
+        // /mcp, /sse, /messages share the store handle with /api/*.
+        .route("/mcp", axum::routing::any(mcp::mcp_route))
+        .route("/sse", axum::routing::any(mcp::sse_route))
+        .route("/messages", axum::routing::post(mcp::messages_route))
+        .fallback(mcp::api_fallback)
         .layer(axum::middleware::from_fn(cors))
-        .with_state(Arc::new(Mutex::new(store)))
+        .with_state(state)
 }
 
-struct Body(Bytes);
+pub(crate) struct Body(pub Bytes);
 
 #[axum::async_trait]
 impl<S: Send + Sync> FromRequest<S> for Body {
@@ -104,7 +91,7 @@ fn cors_headers(headers: &mut HeaderMap) {
 /// JS sendJSON: compact JSON (JSON.stringify), Content-Type
 /// `application/json` (no charset). `(status, String)` would set
 /// `text/plain; charset=utf-8`, so set the header explicitly.
-fn json_response(status: StatusCode, body: String) -> Response {
+pub(crate) fn json_response(status: StatusCode, body: String) -> Response {
     let mut resp = (status, body).into_response();
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -135,7 +122,7 @@ fn ok_note(note_id: &str) -> (StatusCode, String) {
 /// JS handleApi: the try block covers JSON.parse of addNote/updateNote
 /// bodies, so invalid JSON → 400 `{"success":false,"error":"<message>"}`;
 /// anything else unmatched → 404 Unknown endpoint.
-fn api_dispatch(store: &Store, method: Method, path: &str, body: Bytes) -> Response {
+pub(crate) fn api_dispatch(store: &Store, method: Method, path: &str, body: Bytes) -> Response {
     let is_add = method == Method::POST && path == "/api/note/addNote";
     let is_update = method == Method::POST && path == "/api/note/updateNote";
     let data: Value = if is_add || is_update {
