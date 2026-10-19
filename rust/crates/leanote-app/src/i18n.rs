@@ -62,6 +62,11 @@ keys! {
     Restore => ("恢复", "Restore"),
     HardDelete => ("彻底删除", "Delete forever"),
     EmptyTrash => ("清空废纸篓", "Empty trash"),
+    // Ticket 13: ⌘K search overlay.
+    SearchPlaceholder => ("搜索笔记…", "Search notes…"),
+    SearchNoResults => ("没有匹配的笔记", "No matching notes"),
+    SearchEmptyHint => ("输入关键词搜索标题、内容与标签", "Type to search titles, content and tags"),
+    SearchFootnote => ("↑↓ 选择   ↩ 打开   esc 关闭", "↑↓ navigate   ↩ open   esc close"),
 }
 
 #[cfg(test)]
@@ -101,5 +106,6 @@ mod tests {
         Key::SyncingSubtitle, Key::SyncDone, Key::SyncFailed, Key::NavAllNotes, Key::NavStarred,
         Key::NavTrash, Key::NavNotebooks, Key::NavTags, Key::NoSelection,
         Key::EmptyNotes,
+        Key::SearchPlaceholder, Key::SearchNoResults, Key::SearchEmptyHint, Key::SearchFootnote,
     ];
 }
