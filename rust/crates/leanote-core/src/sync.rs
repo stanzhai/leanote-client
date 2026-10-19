@@ -176,6 +176,38 @@ impl Api {
         Ok(v.get("Content").and_then(Value::as_str).unwrap_or("").to_string())
     }
 
+    /// GET note/exportPdf → raw PDF bytes (src/api.js `exportPdf`: the body
+    /// is the file, NOT JSON; the server signals failure with a JSON
+    /// `{Ok:false, Msg}` object, which JS detects via `typeof body == 'object'`).
+    pub fn export_pdf(&self, server_note_id: &str) -> Result<Vec<u8>, SyncError> {
+        use std::io::Read;
+        let resp = self
+            .agent
+            .get(&self.url("note/exportPdf", &[("noteId", server_note_id.to_string())]))
+            .call()
+            .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+        let is_json = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("application/json"));
+        let mut body = Vec::new();
+        resp.into_body()
+            .reader()
+            .read_to_end(&mut body)
+            .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+        if is_json {
+            // `{"Ok":false,"Msg":...}` → surface the server's own Msg.
+            let v: Value = serde_json::from_slice(&body)
+                .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+            Self::ok_or_api(v).map(|_| body)
+        } else if body.starts_with(b"%PDF") {
+            Ok(body)
+        } else {
+            Err(SyncError::Unconnected("response is not a PDF".into()))
+        }
+    }
+
     // -- Push endpoints (JS Sync.sendNotebook/sendNote/sendTagChanges forms).
     // Raw `Value` returns: the caller branches on Ok/Msg/Usn/ids, unlike the
     // pull endpoints which only care about payload.
@@ -1262,6 +1294,18 @@ impl Store {
                 },
             )
             .optional()
+    }
+
+    /// Local note id → server note id (None = never synced to the server).
+    pub fn note_server_id(&self, note_id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT ServerNoteId FROM notes WHERE NoteId=?1",
+                params![note_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|o| o.flatten())
     }
 
     pub fn delete_note_by_server_id(&self, server_note_id: &str) -> rusqlite::Result<()> {

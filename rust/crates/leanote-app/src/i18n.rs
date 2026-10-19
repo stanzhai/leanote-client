@@ -62,6 +62,17 @@ keys! {
     Restore => ("恢复", "Restore"),
     HardDelete => ("彻底删除", "Delete forever"),
     EmptyTrash => ("清空废纸篓", "Empty trash"),
+    // Ticket 12: rich-text notes render read-only as converted Markdown.
+    RichTextReadonly => ("富文本（只读）", "Rich text (read only)"),
+    ConvertToMarkdown => ("转存为 Markdown", "Convert to Markdown"),
+    ConvertedToMarkdown => ("已转存为 Markdown", "Converted to Markdown"),
+    // Ticket 15: export actions + PDF-fallback reason.
+    ExportHtml => ("导出 HTML", "Export HTML"),
+    ExportMarkdown => ("导出 Markdown", "Export Markdown"),
+    ExportPdf => ("导出 PDF", "Export PDF"),
+    ExportBackup => ("导出备份 (.leanote)", "Export backup (.leanote)"),
+    PdfFellBack => ("服务器导出 PDF 失败，已导出 HTML", "Server PDF export failed, exported HTML instead"),
+    NotSynced => ("笔记尚未同步到服务器", "Note is not synced to the server"),
 }
 
 #[cfg(test)]
@@ -100,6 +111,10 @@ mod tests {
         Key::SignIn, Key::SigningIn, Key::Register, Key::LoginFailed, Key::SyncingTitle,
         Key::SyncingSubtitle, Key::SyncDone, Key::SyncFailed, Key::NavAllNotes, Key::NavStarred,
         Key::NavTrash, Key::NavNotebooks, Key::NavTags, Key::NoSelection,
-        Key::EmptyNotes,
+        Key::EmptyNotes, Key::NotesListTitle, Key::NotesCount, Key::NotebooksCount,
+        Key::TagsCount, Key::Updated, Key::Restore, Key::HardDelete, Key::EmptyTrash,
+        Key::RichTextReadonly, Key::ConvertToMarkdown, Key::ConvertedToMarkdown,
+        Key::ExportHtml, Key::ExportMarkdown, Key::ExportPdf, Key::ExportBackup,
+        Key::PdfFellBack, Key::NotSynced,
     ];
 }

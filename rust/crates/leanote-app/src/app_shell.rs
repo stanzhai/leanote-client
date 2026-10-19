@@ -66,6 +66,9 @@ pub struct AppShell {
     /// Note currently shown in the reader (kept across list re-filters
     /// until the selection changes).
     selected: Option<leanote_core::Id>,
+    /// Ticket 15: export outcome shown inline in the reader toolbar
+    /// (e.g. PDF-fell-back-to-HTML reason). Cleared on selection change.
+    export_status: Option<SharedString>,
 }
 
 /// Progress sink that forwards full_sync lines into a channel the UI drains.
@@ -136,6 +139,7 @@ impl AppShell {
             notebooks_open: true,
             tags_open: true,
             selected: None,
+            export_status: None,
         }
     }
 
@@ -342,6 +346,116 @@ impl AppShell {
         self.selected = None;
         cx.notify();
     }
+
+    // --- Ticket 15: export HTML / Markdown / PDF / .leanote backup ---
+
+    /// Native save panel → run `f` off the UI thread → outcome lands in
+    /// `export_status` (label under the toolbar). Cancel = no-op.
+    fn export_with_panel(
+        &mut self,
+        suggested: String,
+        cx: &mut gpui_kit::Context<Self>,
+        f: impl FnOnce(std::path::PathBuf) -> Result<(), String> + Send + 'static,
+    ) {
+        let rx = cx.prompt_for_new_path(&home_dir(), Some(&suggested));
+        self._task = Some(cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = rx.await else { return };
+            let done = cx.background_spawn(async move { f(path.clone()).map(|()| path) });
+            let _ = this.update(cx, |shell, cx| {
+                shell.export_status = Some(match done.await {
+                    Ok(path) => {
+                        format!("{} {}", i18n::t(shell.lang, i18n::Key::ExportDone), path.display()).into()
+                    }
+                    Err(reason) => reason.into(),
+                });
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Selected note → HTML (`md=false`) or Markdown (`md=true`) file.
+    fn export_selected_file(&mut self, md: bool, cx: &mut gpui_kit::Context<Self>) {
+        let Some(n) = self.selected_note() else { return };
+        let name = format!(
+            "{}.{}",
+            crate::export::safe_filename(&n.title),
+            if md { "md" } else { "html" }
+        );
+        self.export_with_panel(name, cx, move |path| {
+            let body = if md {
+                crate::export::note_to_markdown_file(&n)
+            } else {
+                crate::export::note_to_html(&n)
+            };
+            std::fs::write(&path, body).map_err(|e| e.to_string())
+        });
+    }
+
+    /// Selected note → PDF via the server's exportPdf endpoint (src/api.js
+    /// authority). Any failure — not synced, no account, transport, server
+    /// error — falls back to a local HTML export with the reason shown.
+    fn export_selected_pdf(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        let Some(n) = self.selected_note() else { return };
+        let (server_id, account) = match self.store() {
+            Some(store) => (
+                store.note_server_id(n.note_id.to_string()).ok().flatten(),
+                store.active_account().ok().flatten(),
+            ),
+            None => (None, None),
+        };
+        let not_synced = i18n::t(self.lang, i18n::Key::NotSynced).to_string();
+        let fell_back = i18n::t(self.lang, i18n::Key::PdfFellBack).to_string();
+        let name = format!("{}.pdf", crate::export::safe_filename(&n.title));
+        self.export_with_panel(name, cx, move |path| {
+            let pdf = match (&server_id, &account) {
+                (Some(sid), Some(acc)) => Some(Api::for_account(acc).export_pdf(sid)),
+                _ => None,
+            };
+            match pdf {
+                Some(Ok(bytes)) => std::fs::write(&path, bytes).map_err(|e| e.to_string()),
+                _ => {
+                    // Fallback: HTML at the .pdf path with extension swapped.
+                    let reason = if server_id.is_none() {
+                        not_synced.clone()
+                    } else {
+                        fell_back.clone()
+                    };
+                    std::fs::write(
+                        path.with_extension("html"),
+                        crate::export::note_to_html(&n),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Err(reason)
+                }
+            }
+        });
+    }
+
+    /// Whole library → one `.leanote` JSON backup (JS export-leanote plugin
+    /// shape; notebooks + every live note).
+    fn export_backup(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        let name = "leanote-backup.leanote".to_string();
+        let dir = self.data_dir.clone();
+        let user = "user1".to_string();
+        self.export_with_panel(name, cx, move |path| {
+            let store = leanote_core::Store::open(dir, user).map_err(|e| e.to_string())?;
+            std::fs::write(&path, crate::export::backup_to_leanote_json(&store))
+                .map_err(|e| e.to_string())
+        });
+    }
+
+    fn selected_note(&self) -> Option<leanote_core::Note> {
+        let id = self.selected.as_ref()?;
+        self.store().and_then(|s| s.get_note_any(id).ok().flatten())
+    }
+}
+
+
+/// Save-panel default directory (std only).
+fn home_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 impl Render for AppShell {
@@ -526,8 +640,6 @@ impl AppShell {
                     "trash" => NavSelection::Trash,
                     _ => NavSelection::AllNotes,
                 };
-                cx.listener(move |this, _ev, _window, cx| this.select_nav(sel.clone(), cx))
-            });
         if let Some(icon) = icon {
             row = row.child(
                 Icon::new(icon)
@@ -640,6 +752,16 @@ impl AppShell {
                 nav = nav.child(self.nav_row(dark, &node, "tag", None, self.nav == sel, cx));
             }
         }
+
+        // Ticket 15: whole-library .leanote backup, pinned to the nav bottom.
+        nav = nav
+            .child(gpui_kit::base::v_flex().flex_1())
+            .child(
+                Button::new("export-backup")
+                    .label(t(i18n::Key::ExportBackup))
+                    .ghost()
+                    .on_click(cx.listener(|this, _ev, _window, cx| this.export_backup(cx))),
+            );
 
         nav
     }
@@ -804,6 +926,36 @@ impl AppShell {
                     .label(t(i18n::Key::EmptyTrash))
                     .outline()
                     .on_click(cx.listener(|this, _ev, _window, cx| this.empty_trash(cx))),
+            );
+        }
+
+        // Ticket 15: export actions (live notes only).
+        if !is_trash_view {
+            toolbar = toolbar
+                .child(
+                    Button::new("export-html")
+                        .label(t(i18n::Key::ExportHtml))
+                        .outline()
+                        .on_click(cx.listener(|this, _ev, _window, cx| this.export_selected_file(false, cx))),
+                )
+                .child(
+                    Button::new("export-markdown")
+                        .label(t(i18n::Key::ExportMarkdown))
+                        .outline()
+                        .on_click(cx.listener(|this, _ev, _window, cx| this.export_selected_file(true, cx))),
+                )
+                .child(
+                    Button::new("export-pdf")
+                        .label(t(i18n::Key::ExportPdf))
+                        .outline()
+                        .on_click(cx.listener(|this, _ev, _window, cx| this.export_selected_pdf(cx))),
+                );
+        }
+        if let Some(status) = self.export_status.clone() {
+            toolbar = toolbar.child(
+                Label::new(status)
+                    .text_size(px(12.))
+                    .text_color(theme::muted_foreground(dark)),
             );
         }
 
