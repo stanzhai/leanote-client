@@ -56,13 +56,12 @@ keys! {
     NavNotebooks => ("笔记本", "Notebooks"),
     NavTags => ("标签", "Tags"),
     // Shell: middle list + right pane.
-    NotesListTitle => ("笔记", "Notes"),
     NoSelection => ("选择一条笔记", "Select a note"),
     EmptyNotes => ("没有笔记", "No notes yet"),
-    NotesCount => ("条笔记", "notes"),
-    NotebooksCount => ("个笔记本", "notebooks"),
-    TagsCount => ("个标签", "tags"),
-    Updated => ("更新于", "Updated"),
+    // Ticket 09: reader toolbar + trash actions.
+    Restore => ("恢复", "Restore"),
+    HardDelete => ("彻底删除", "Delete forever"),
+    EmptyTrash => ("清空废纸篓", "Empty trash"),
 }
 
 #[cfg(test)]
@@ -100,7 +99,7 @@ mod tests {
         Key::AppName, Key::LoginTitle, Key::LoginSubtitle, Key::Host, Key::Email, Key::Password,
         Key::SignIn, Key::SigningIn, Key::Register, Key::LoginFailed, Key::SyncingTitle,
         Key::SyncingSubtitle, Key::SyncDone, Key::SyncFailed, Key::NavAllNotes, Key::NavStarred,
-        Key::NavTrash, Key::NavNotebooks, Key::NavTags, Key::NotesListTitle, Key::NoSelection,
-        Key::EmptyNotes, Key::NotesCount, Key::NotebooksCount, Key::TagsCount, Key::Updated,
+        Key::NavTrash, Key::NavNotebooks, Key::NavTags, Key::NoSelection,
+        Key::EmptyNotes,
     ];
 }

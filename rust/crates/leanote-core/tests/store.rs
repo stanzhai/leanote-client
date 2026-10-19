@@ -205,3 +205,115 @@ fn convert_to_markdown_rewrites_content_flags_dirty() {
     // unknown id → None
     assert!(s.convert_to_markdown(&Id("nope".into())).unwrap().is_none());
 }
+
+// --- ticket 09: browse queries, star, trash lifecycle ---
+
+#[test]
+fn filtered_queries_return_right_sets() {
+    let s = store("browse");
+    let a = add(&s, "A", "c", &["rust"], "Inbox");
+    let b = add(&s, "B", "c", &["rust", "gpui"], "Work");
+    add(&s, "C", "c", &["design"], "Work");
+    // newest-first ordering (B then A, by UpdatedTime tie → rowid)
+    let all: Vec<String> = s.list_notes().unwrap().into_iter().map(|n| n.title).collect();
+    assert_eq!(all, vec!["C", "B", "A"]);
+    let work: Vec<String> = s
+        .list_notes_filtered(Some(&b.notebook_id), false)
+        .unwrap()
+        .into_iter()
+        .map(|n| n.title)
+        .collect();
+    assert_eq!(work.len(), 2);
+    assert!(work.contains(&"B".to_string()) && work.contains(&"C".to_string()));
+    let inbox: Vec<String> = s
+        .list_notes_filtered(Some(&a.notebook_id), false)
+        .unwrap()
+        .into_iter()
+        .map(|n| n.title)
+        .collect();
+    assert_eq!(inbox, vec!["A"]);
+    // tag matches whole tags only
+    let rust: Vec<String> = s.list_notes_by_tag("rust").unwrap().into_iter().map(|n| n.title).collect();
+    assert_eq!(rust, vec!["B", "A"]);
+    assert!(s.list_notes_by_tag("ru").unwrap().is_empty());
+    let gpui: Vec<String> = s.list_notes_by_tag("gpui").unwrap().into_iter().map(|n| n.title).collect();
+    assert_eq!(gpui, vec!["B"]);
+}
+
+#[test]
+fn toggle_star_flips_star_without_setting_isdirty() {
+    let s = store("star");
+    let n = add(&s, "A", "c", &[], "Inbox");
+    assert!(!n.star && n.is_dirty);
+    // Simulate a synced (clean) note the way full_sync does: apply_sync_notes
+    // writes IsDirty=0. Re-apply the row for the same NoteId.
+    let clean_row = serde_json::json!({
+        "NoteId": n.note_id.to_string(),
+        "NotebookId": n.notebook_id.to_string(),
+        "Title": "A",
+        "Tags": [],
+        "IsMarkdown": true,
+        "IsTrash": false,
+        "IsDeleted": false,
+        "Usn": 1,
+    });
+    s.apply_sync_notes(&[clean_row], 0).unwrap();
+    assert_eq!(s.raw_query_row("SELECT IsDirty FROM notes").unwrap(), 0);
+    let to = s.toggle_star(&n.note_id).unwrap().unwrap();
+    assert!(to, "first toggle stars");
+    let after = s.get_note_any(&n.note_id).unwrap().unwrap();
+    assert!(after.star);
+    assert!(!after.is_dirty, "JS Note.star sets Star+UpdatedTime only, never IsDirty");
+    let to2 = s.toggle_star(&n.note_id).unwrap().unwrap();
+    assert!(!to2, "second toggle unstars");
+    let after2 = s.get_note_any(&n.note_id).unwrap().unwrap();
+    assert!(!after2.star && !after2.is_dirty);
+    // starred filter only sees starred notes
+    assert!(s.list_notes_filtered(None, true).unwrap().is_empty());
+    s.toggle_star(&n.note_id).unwrap();
+    let starred: Vec<String> = s
+        .list_notes_filtered(None, true)
+        .unwrap()
+        .into_iter()
+        .map(|n| n.title)
+        .collect();
+    assert_eq!(starred, vec!["A"]);
+    assert!(s.toggle_star(&Id("missing".into())).unwrap().is_none());
+}
+
+#[test]
+fn trash_restore_hard_delete_and_empty() {
+    let s = store("trashops");
+    let keep = add(&s, "keep", "c", &[], "Inbox");
+    let t1 = add(&s, "t1", "c", &[], "Inbox");
+    let t2 = add(&s, "t2", "c", &[], "Work");
+    let work_nb = s.notebooks().unwrap().into_iter().find(|nb| nb.title == "Work").unwrap();
+    // trash two
+    s.trash_note(&t1.note_id).unwrap();
+    s.trash_note(&t2.note_id).unwrap();
+    let trash: Vec<String> = s.list_trash().unwrap().into_iter().map(|n| n.title).collect();
+    assert_eq!(trash.len(), 2);
+    assert!(s.list_notes().unwrap().iter().all(|n| n.title == "keep"));
+    // restore t2 back into its original notebook
+    assert_eq!(s.restore_note(&t2.note_id, &work_nb.notebook_id).unwrap(), 1);
+    let t2b = s.get_note_any(&t2.note_id).unwrap().unwrap();
+    assert!(!t2b.is_trash && !t2b.is_deleted && t2b.notebook_id == work_nb.notebook_id);
+    assert!(t2b.is_dirty, "restore is a server-visible change (JS moveNote sets IsDirty)");
+    // hard delete t1: row gone entirely
+    assert_eq!(s.hard_delete_note(&t1.note_id).unwrap(), 1);
+    assert!(s.get_note_any(&t1.note_id).unwrap().is_none());
+    assert_eq!(s.note_count().unwrap(), 2);
+    // empty trash clears the rest
+    s.trash_note(&keep.note_id).unwrap();
+    assert_eq!(s.empty_trash().unwrap(), 1);
+    assert!(s.list_trash().is_ok());
+    let hidden = s.get_note_any(&keep.note_id).unwrap().unwrap();
+    assert!(hidden.is_deleted && hidden.is_dirty && hidden.is_trash);
+    // notebook counts only live notes: Inbox's only note is trashed, so the
+    // GROUP BY emits no Inbox row at all.
+    let counts = s.notebook_note_counts().unwrap();
+    let inbox = s.notebooks().unwrap().into_iter().find(|nb| nb.title == "Inbox").unwrap();
+    assert!(!counts.iter().any(|(id, _)| *id == inbox.notebook_id));
+    let work_count = counts.iter().find(|(id, _)| *id == work_nb.notebook_id).map(|(_, c)| *c);
+    assert_eq!(work_count, Some(1));
+}
