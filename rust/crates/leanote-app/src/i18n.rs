@@ -1,7 +1,5 @@
 //! zh/en interface strings, following the system language (Q12: only zh/en).
 
-
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
     Zh,
@@ -62,6 +60,10 @@ keys! {
     Restore => ("恢复", "Restore"),
     HardDelete => ("彻底删除", "Delete forever"),
     EmptyTrash => ("清空废纸篓", "Empty trash"),
+    // Ticket 12: rich-text notes render read-only as converted Markdown.
+    RichTextReadonly => ("富文本（只读）", "Rich text (read only)"),
+    ConvertToMarkdown => ("转换为 Markdown", "Convert to Markdown"),
+    ConvertedToMarkdown => ("已转换为 Markdown", "Converted to Markdown"),
 }
 
 #[cfg(test)]
@@ -100,6 +102,7 @@ mod tests {
         Key::SignIn, Key::SigningIn, Key::Register, Key::LoginFailed, Key::SyncingTitle,
         Key::SyncingSubtitle, Key::SyncDone, Key::SyncFailed, Key::NavAllNotes, Key::NavStarred,
         Key::NavTrash, Key::NavNotebooks, Key::NavTags, Key::NoSelection,
-        Key::EmptyNotes,
+        Key::EmptyNotes, Key::Restore, Key::HardDelete, Key::EmptyTrash,
+        Key::RichTextReadonly, Key::ConvertToMarkdown, Key::ConvertedToMarkdown,
     ];
 }

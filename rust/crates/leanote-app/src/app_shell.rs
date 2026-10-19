@@ -66,6 +66,10 @@ pub struct AppShell {
     /// Note currently shown in the reader (kept across list re-filters
     /// until the selection changes).
     selected: Option<leanote_core::Id>,
+    // --- Ticket 12 rich-text state ---
+    /// Set after a successful Convert to Markdown; cleared when the
+    /// selection changes. Rendered as a one-line feedback next to the badge.
+    converted_note: Option<leanote_core::Id>,
 }
 
 /// Progress sink that forwards full_sync lines into a channel the UI drains.
@@ -136,6 +140,7 @@ impl AppShell {
             notebooks_open: true,
             tags_open: true,
             selected: None,
+            converted_note: None,
         }
     }
 
@@ -304,6 +309,7 @@ impl AppShell {
 
     fn select_note(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
         self.selected = Some(id);
+        self.converted_note = None;
         cx.notify();
     }
 
@@ -340,6 +346,23 @@ impl AppShell {
             let _ = store.empty_trash();
         }
         self.selected = None;
+        cx.notify();
+    }
+
+    /// Ticket 12: one-way HTML → Markdown conversion of the selected
+    /// rich-text note. Persisted (content rewritten, IsMarkdown=1, dirty)
+    /// so the next push sends Markdown to the server; the reader re-renders
+    /// straight from the converted store row.
+    fn convert_selected_to_markdown(
+        &mut self,
+        id: leanote_core::Id,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if let Some(store) = self.store() {
+            if matches!(store.convert_to_markdown(&id), Ok(Some(_))) {
+                self.converted_note = Some(id);
+            }
+        }
         cx.notify();
     }
 }
@@ -784,6 +807,26 @@ impl AppShell {
         };
 
         let mut toolbar = gpui_kit::base::h_flex().gap_2().child(star_btn);
+        // Ticket 12: rich-text notes are read-only Markdown renders; the
+        // only write path is the explicit convert action. No edit entry
+        // exists anywhere for them.
+        if !n.is_markdown {
+            let cid = n.note_id.clone();
+            toolbar = toolbar
+                .child(small_label(t(i18n::Key::RichTextReadonly), muted))
+                .child(
+                    Button::new("convert-md")
+                        .label(t(i18n::Key::ConvertToMarkdown))
+                        .outline()
+                        .on_click(cx.listener(move |this, _ev, _window, cx| {
+                            this.convert_selected_to_markdown(cid.clone(), cx)
+                        })),
+                );
+        }
+        if self.converted_note.as_ref() == Some(&n.note_id) {
+            toolbar =
+                toolbar.child(small_label(t(i18n::Key::ConvertedToMarkdown), muted));
+        }
         if is_trash_view {
             let rid = n.note_id.clone();
             toolbar = toolbar.child(
