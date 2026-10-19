@@ -6,7 +6,8 @@ use std::io::{Read, Write};
 
 pub fn run(argv: Vec<String>) -> i32 {
     // JS: first arg that is a known subcommand wins; default "add".
-    const SUBCOMMANDS: [&str; 6] = ["add", "list", "show", "search", "edit", "help"];
+    // `serve` is Rust-only (dev helper to run the local HTTP server).
+    const SUBCOMMANDS: [&str; 7] = ["add", "list", "show", "search", "edit", "help", "serve"];
     let mut cmd = "add";
     let mut cmd_index: Option<usize> = None;
     for (i, a) in argv.iter().enumerate() {
@@ -54,6 +55,7 @@ pub fn run(argv: Vec<String>) -> i32 {
             eprintln!("Error: search is not implemented yet");
             1
         }
+        "serve" => cmd_serve(&cmd_args),
         "edit" => {
             eprintln!("Error: edit is not implemented yet");
             1
@@ -206,6 +208,44 @@ fn open_store() -> Result<Store, String> {
         leanote_core::app_data_dir().to_string_lossy().into_owned()
     });
     Store::open(std::path::PathBuf::from(dir), "user1".to_string()).map_err(|e| e.to_string())
+}
+
+// --- serve (Rust-only: run the local HTTP /api server; dev/test helper) ---
+
+fn cmd_serve(args: &[String]) -> i32 {
+    let mut port: u16 = leanote_http::DEFAULT_PORT;
+    let mut i = 0;
+    while i < args.len() {
+        if (args[i] == "-p" || args[i] == "--port") && i + 1 < args.len() {
+            i += 1;
+            match args[i].parse() {
+                Ok(p) => port = p,
+                Err(_) => {
+                    eprintln!("Error: invalid port {}", args[i]);
+                    return 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    let store = match open_store() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return 1;
+        }
+    };
+    match leanote_http::serve_blocking(store, port) {
+        Ok(()) => 0,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                eprintln!("[leanote] Port {} in use, CLI will use file I/O", port);
+            } else {
+                eprintln!("[leanote] Local server error: {}", e);
+            }
+            1
+        }
+    }
 }
 
 // --- list ---
