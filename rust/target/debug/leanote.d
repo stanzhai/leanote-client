@@ -1,1 +1,0 @@
-/Users/stan/Projects/leanote-rust-01/rust/target/debug/leanote: /Users/stan/Projects/leanote-rust-01/rust/crates/leanote-cli/src/cli.rs /Users/stan/Projects/leanote-rust-01/rust/crates/leanote-cli/src/main.rs /Users/stan/Projects/leanote-rust-01/rust/crates/leanote-core/src/lib.rs
