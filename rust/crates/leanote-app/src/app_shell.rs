@@ -361,13 +361,12 @@ impl AppShell {
         self._task = Some(cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(path))) = rx.await else { return };
             let done = cx.background_spawn(async move { f(path.clone()).map(|()| path) });
+            let status: SharedString = match done.await {
+                Ok(path) => path.display().to_string().into(),
+                Err(reason) => reason.into(),
+            };
             let _ = this.update(cx, |shell, cx| {
-                shell.export_status = Some(match done.await {
-                    Ok(path) => {
-                        format!("{} {}", i18n::t(shell.lang, i18n::Key::ExportDone), path.display()).into()
-                    }
-                    Err(reason) => reason.into(),
-                });
+                shell.export_status = Some(status);
                 cx.notify();
             });
         }));
@@ -398,7 +397,7 @@ impl AppShell {
         let Some(n) = self.selected_note() else { return };
         let (server_id, account) = match self.store() {
             Some(store) => (
-                store.note_server_id(n.note_id.to_string()).ok().flatten(),
+                store.note_server_id(&n.note_id.to_string()).ok().flatten(),
                 store.active_account().ok().flatten(),
             ),
             None => (None, None),
@@ -640,6 +639,8 @@ impl AppShell {
                     "trash" => NavSelection::Trash,
                     _ => NavSelection::AllNotes,
                 };
+                cx.listener(move |this, _ev, _window, cx| this.select_nav(sel.clone(), cx))
+            });
         if let Some(icon) = icon {
             row = row.child(
                 Icon::new(icon)

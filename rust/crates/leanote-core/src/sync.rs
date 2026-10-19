@@ -181,7 +181,7 @@ impl Api {
     /// `{Ok:false, Msg}` object, which JS detects via `typeof body == 'object'`).
     pub fn export_pdf(&self, server_note_id: &str) -> Result<Vec<u8>, SyncError> {
         use std::io::Read;
-        let resp = self
+        let mut resp = self
             .agent
             .get(&self.url("note/exportPdf", &[("noteId", server_note_id.to_string())]))
             .call()
@@ -192,7 +192,8 @@ impl Api {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.starts_with("application/json"));
         let mut body = Vec::new();
-        resp.into_body()
+        resp.body_mut()
+            .with_config()
             .reader()
             .read_to_end(&mut body)
             .map_err(|e| SyncError::Unconnected(e.to_string()))?;

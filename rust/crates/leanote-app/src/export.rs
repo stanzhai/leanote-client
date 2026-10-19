@@ -7,7 +7,7 @@
 //! a window; `Store` input for the backup is read once and mapped.
 
 use leanote_core::{Note, Notebook, Store};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 /// `Date.format("yyyy-MM-dd hh:mm:ss")` from the export plugin — UTC, same
 /// as the core store's timestamps.
@@ -54,7 +54,9 @@ fn escape_html(s: &str) -> String {
 /// Raw HTML in the source passes through, matching the JS template which
 /// splices note content in unescaped.
 pub fn markdown_to_html(src: &str) -> String {
-    markdown::to_html(src)
+    // GFM: leanote notes use pipe tables; the JS plugin's html.tpl loads the
+    // same dialect via marked.
+    markdown::to_html_with_options(src, &markdown::Options::gfm()).unwrap_or_default()
 }
 
 /// Markdown note → Markdown file. Content as stored, byte-for-byte —
@@ -231,8 +233,8 @@ pub fn backup_to_leanote_json(store: &Store) -> String {
             "parentNotebookId": nb.parent_notebook_id,
             "seq": nb.seq,
             "isDeleted": nb.is_deleted,
-            "createdTime": leanote_time(nb.created_time),
-            "updatedTime": leanote_time(nb.updated_time),
+            // Notebook carries no timestamps in the local schema; the JS
+            // importer ignores notebook times entirely (walks notes[] only).
         })).collect::<Vec<_>>(),
         "notes": note_rows,
     });
@@ -449,8 +451,8 @@ mod tests {
     #[test]
     fn leanote_time_format() {
         assert_eq!(leanote_time(0), "1970-01-01 00:00:00");
-        // 2025-12-09T04:00:00Z
-        assert_eq!(leanote_time(1_760_235_200_000), "2025-12-09 04:00:00");
+        // 1_765_252_800 s = 2025-12-09T04:00:00Z
+        assert_eq!(leanote_time(1_765_252_800_000), "2025-12-09 04:00:00");
     }
 
     #[test]
