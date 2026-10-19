@@ -174,3 +174,34 @@ fn trash_and_deleted_notes_are_hidden() {
     let titles: Vec<String> = s.list_notes().unwrap().into_iter().map(|n| n.title).collect();
     assert_eq!(titles, vec!["visible".to_string()]);
 }
+
+#[test]
+fn convert_to_markdown_rewrites_content_flags_dirty() {
+    let s = store("convert");
+    let n = s
+        .add_note(NewNote {
+            title: "rich".into(),
+            content: r#"<h1>Title</h1><ul><li>a</li></ul><p><s>x</s></p>"#.into(),
+            tags: vec![],
+            notebook_title: "nb".into(),
+            is_markdown: false,
+        })
+        .unwrap();
+    // simulate a synced clean row, as it would arrive after full_sync
+    s.note_set_not_dirty_not_delete(&n.note_id).unwrap();
+
+    let out = s.convert_to_markdown(&n.note_id).unwrap().expect("converted");
+    assert!(out.is_markdown);
+    assert!(out.is_dirty);
+    assert_eq!(out.title, "rich");
+    assert!(out.content.contains("# Title"), "{}", out.content);
+    assert!(out.content.contains("*   a"), "{}", out.content);
+    assert!(out.content.contains("~~x~~"), "{}", out.content);
+
+    // idempotent second call: already Markdown, untouched
+    let again = s.convert_to_markdown(&n.note_id).unwrap().unwrap();
+    assert_eq!(again.updated_time, out.updated_time);
+
+    // unknown id → None
+    assert!(s.convert_to_markdown(&Id("nope".into())).unwrap().is_none());
+}
