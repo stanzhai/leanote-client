@@ -2,6 +2,7 @@
 
 mod app_shell;
 mod browse;
+mod conflict_bar;
 mod i18n;
 mod single_instance;
 mod theme;

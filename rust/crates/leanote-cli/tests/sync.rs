@@ -512,3 +512,123 @@ async fn incr_pull_delta_only_no_duplicates_on_rerun() {
     assert!(srv.pushes().is_empty());
     assert_eq!(s.last_sync_usn().unwrap(), last);
 }
+
+/// Drive one incr_sync into a recorded conflict on note0042 (local edit vs
+/// server edit at higher usn, push answered "conflict"), exactly the race
+/// ticket 14 adjudicates. Returns after the conflict row exists.
+async fn conflicted(srv: &leanote_fakeserver::FakeServer, s: &Store) {
+    s.update_note(
+        &Id("note0042".into()),
+        NoteUpdate { content: Some("# Note 42\n\nlocal edit".into()), ..Default::default() },
+    )
+    .unwrap();
+    let (mut nb, mut notes, tags, mut contents) = dataset();
+    nb.clear();
+    for n in notes.iter_mut() {
+        if n["NoteId"] == json!("note0042") {
+            n["Usn"] = json!(1500);
+        }
+    }
+    contents.insert("note0042".into(), json!("# Note 42\n\nserver edit"));
+    srv.set_notebooks(nb);
+    srv.set_notes(notes);
+    srv.set_tags(tags);
+    srv.set_contents(contents);
+    srv.set_sync_usn(1002);
+    srv.inject_response(json!({"Ok": false, "Msg": "conflict"}));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incr_conflict_does_not_accumulate_across_rounds() {
+    let (srv, _dir, s, api) = synced("conf_noacc").await;
+    conflicted(&srv, &s).await;
+    incr_sync(&api, &s, &NoProgress).unwrap();
+    assert_eq!(s.list_conflicts().unwrap().len(), 1);
+
+    // re-run the same conflicting sync: still exactly one row (upsert keyed
+    // on ServerNoteId)
+    srv.inject_response(json!({"Ok": false, "Msg": "conflict"}));
+    incr_sync(&api, &s, &NoProgress).unwrap();
+    assert_eq!(s.list_conflicts().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incr_resolve_use_local_pushes_on_next_sync_and_clears() {
+    let (srv, _dir, s, api) = synced("conf_use_local").await;
+    conflicted(&srv, &s).await;
+    incr_sync(&api, &s, &NoProgress).unwrap();
+    assert_eq!(s.list_conflicts().unwrap().len(), 1);
+
+    assert!(s.resolve_conflict_use_local("note0042").unwrap());
+    assert!(s.list_conflicts().unwrap().is_empty(), "bar must disappear after resolution");
+
+    // next sync force-pushes the local version; server accepts
+    srv.clear_pushes();
+    incr_sync(&api, &s, &NoProgress).unwrap();
+    let pushes = srv.pushes();
+    let up = find_push(&pushes, "note/updateNote");
+    assert_eq!(up.fields["NoteId"].as_str().unwrap(), "note0042");
+    assert_eq!(up.fields["Content"].as_str().unwrap(), "# Note 42\n\nlocal edit");
+    let n = s.get_note_any(&Id("note0042".into())).unwrap().unwrap();
+    assert_eq!(n.content, "# Note 42\n\nlocal edit");
+    assert!(!n.is_dirty);
+    assert!(s.list_conflicts().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incr_resolve_use_server_overwrites_and_stays_clean() {
+    let (srv, _dir, s, api) = synced("conf_use_server").await;
+    conflicted(&srv, &s).await;
+    incr_sync(&api, &s, &NoProgress).unwrap();
+    assert_eq!(s.list_conflicts().unwrap().len(), 1);
+
+    assert!(s.resolve_conflict_use_server("note0042").unwrap());
+    let n = s.get_note_any(&Id("note0042".into())).unwrap().unwrap();
+    assert_eq!(n.title, "Note 42");
+    assert_eq!(n.content, "# Note 42\n\nserver edit");
+    assert!(!n.is_dirty);
+    assert!(!n.is_new);
+
+    // next sync: nothing dirty to push, cursor already at server usn → no
+    // updateNote, no new conflict
+    srv.clear_pushes();
+    incr_sync(&api, &s, &NoProgress).unwrap();
+    assert!(
+        srv.pushes().iter().all(|p| p.endpoint != "note/updateNote"),
+        "server version wins: nothing left to push"
+    );
+    assert!(s.list_conflicts().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incr_resolve_keep_both_splits_and_pushes_copy_via_addnote() {
+    let (srv, _dir, s, api) = synced("conf_keep_both").await;
+    conflicted(&srv, &s).await;
+    incr_sync(&api, &s, &NoProgress).unwrap();
+    assert_eq!(s.list_conflicts().unwrap().len(), 1);
+
+    let new_id = s
+        .resolve_conflict_keep_both("note0042", "（本地副本）")
+        .unwrap()
+        .expect("new note id");
+    // original takes the server version, clean
+    let orig = s.get_note_any(&Id("note0042".into())).unwrap().unwrap();
+    assert_eq!(orig.content, "# Note 42\n\nserver edit");
+    assert!(!orig.is_dirty);
+    // the local version is a brand-new local note
+    let new = s.get_note_any(&new_id).unwrap().unwrap();
+    assert_eq!(new.title, "Note 42（本地副本）");
+    assert_eq!(new.content, "# Note 42\n\nlocal edit");
+    assert!(new.is_new && new.is_dirty);
+    assert_eq!(new.notebook_id, orig.notebook_id);
+    assert!(s.list_conflicts().unwrap().is_empty());
+
+    // next sync pushes the copy as addNote (LocalIsNew=1)
+    srv.clear_pushes();
+    incr_sync(&api, &s, &NoProgress).unwrap();
+    let pushes = srv.pushes();
+    let add = find_push(&pushes, "note/addNote");
+    assert_eq!(add.fields["Title"].as_str().unwrap(), "Note 42（本地副本）");
+    assert_eq!(add.fields["Content"].as_str().unwrap(), "# Note 42\n\nlocal edit");
+    assert!(s.list_conflicts().unwrap().is_empty());
+}

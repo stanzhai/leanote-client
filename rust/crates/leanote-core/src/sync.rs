@@ -1358,3 +1358,176 @@ impl Store {
         rows.collect()
     }
 }
+
+/// Private load target for the resolve ops.
+struct ConflictRaw {
+    local_note_id: String,
+    server_note: String,
+    local_title: String,
+    local_content: String,
+    server_content: String,
+}
+
+/// One conflict for the adjudication bar (ticket 14), both versions.
+#[derive(Clone, Debug)]
+pub struct ConflictRow {
+    pub server_note_id: String,
+    pub local_note_id: String,
+    pub server_title: String,
+    pub server_content: String,
+    pub server_updated_ms: i64,
+    pub local_title: String,
+    pub local_content: String,
+    pub local_updated_ms: i64,
+}
+
+impl Store {
+    /// Typed conflict list for the conflict bar; unresolved rows, oldest
+    /// first (same order as `conflicts()`). `local_updated_ms` joins the
+    /// local note's UpdatedTime for the bar's timestamps.
+    pub fn list_conflicts(&self) -> rusqlite::Result<Vec<ConflictRow>> {
+        let now = now_ms();
+        let mut stmt = self.conn.prepare(
+            "SELECT c.ServerNoteId, c.LocalNoteId, c.ServerNote, c.LocalTitle, c.LocalContent,
+                c.ServerContent, (SELECT UpdatedTime FROM notes n WHERE n.NoteId = c.LocalNoteId)
+             FROM sync_conflicts c WHERE c.Resolved=0 ORDER BY c.CreatedTime",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let server_note_id: String = r.get(0)?;
+            let local_note_id: String = r.get(1)?;
+            let server: String = r.get(2)?;
+            let local_title: String = r.get(3)?;
+            let local_content: String = r.get(4)?;
+            let server_content: String = r.get(5)?;
+            let local_updated_ms: Option<i64> = r.get(6)?;
+            let server: Value = serde_json::from_str(&server).unwrap_or(Value::Null);
+            Ok(ConflictRow {
+                server_note_id,
+                local_note_id,
+                server_title: str_field(&server, "Title"),
+                server_updated_ms: go_now_ms(server.get("UpdatedTime"), now),
+                local_title,
+                local_content,
+                server_content,
+                local_updated_ms: local_updated_ms.unwrap_or(0),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// 用本地: keep the local row as-is (still dirty → force-pushed by the
+    /// next `incr_sync`) and drop the conflict row. Returns false when no
+    /// such conflict exists.
+    pub fn resolve_conflict_use_local(&self, server_note_id: &str) -> rusqlite::Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM sync_conflicts WHERE ServerNoteId=?1 AND Resolved=0",
+            params![server_note_id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// 用服务器: overwrite the local note with the server version stored in
+    /// the conflict row, mark it clean, drop the conflict row.
+    pub fn resolve_conflict_use_server(&self, server_note_id: &str) -> rusqlite::Result<bool> {
+        let row = match self.load_conflict(server_note_id)? {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        let server: Value = serde_json::from_str(&row.server_note).unwrap_or(Value::Null);
+        let content = &row.server_content;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE notes SET Title=?2, Content=?3, \"Desc\"=?4, Abstract=?5,
+                IsDirty=0, LocalIsNew=0, LocalIsDelete=0, Usn=?6
+             WHERE NoteId=?1",
+            params![
+                row.local_note_id,
+                str_field(&server, "Title"),
+                content,
+                crate::plain_desc(content),
+                content.chars().take(500).collect::<String>(),
+                i64_field(&server, "Usn"),
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM sync_conflicts WHERE ServerNoteId=?1",
+            params![server_note_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// 两边保留: the original row takes the server version (clean); the
+    /// local version becomes a NEW note (own id, LocalIsNew=1, IsDirty=1,
+    /// `title` + `title_suffix`, same notebook, ServerNoteId NULL → pushed
+    /// via addNote next sync). Returns the new note's id.
+    pub fn resolve_conflict_keep_both(
+        &self,
+        server_note_id: &str,
+        title_suffix: &str,
+    ) -> rusqlite::Result<Option<Id>> {
+        let row = match self.load_conflict(server_note_id)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let server: Value = serde_json::from_str(&row.server_note).unwrap_or(Value::Null);
+        let now = now_ms();
+        let new_id = Id::new();
+        let local_title = format!("{}{}", row.local_title, title_suffix);
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE notes SET Title=?2, Content=?3, \"Desc\"=?4, Abstract=?5,
+                IsDirty=0, LocalIsNew=0, LocalIsDelete=0, Usn=?6
+             WHERE NoteId=?1",
+            params![
+                row.local_note_id,
+                str_field(&server, "Title"),
+                row.server_content,
+                crate::plain_desc(&row.server_content),
+                row.server_content.chars().take(500).collect::<String>(),
+                i64_field(&server, "Usn"),
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO notes (NoteId, UserId, NotebookId, Title, Content, \"Desc\",
+                Abstract, IsDirty, LocalIsNew, LocalIsDelete, Usn, CreatedTime, UpdatedTime)
+             SELECT ?2, UserId, NotebookId, ?3, ?4, ?5, ?6, 1, 1, 0, 0, ?7, ?7
+             FROM notes WHERE NoteId=?1",
+            params![
+                row.local_note_id,
+                new_id.0,
+                local_title,
+                row.local_content,
+                crate::plain_desc(&row.local_content),
+                row.local_content.chars().take(500).collect::<String>(),
+                now,
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM sync_conflicts WHERE ServerNoteId=?1",
+            params![server_note_id],
+        )?;
+        tx.commit()?;
+        Ok(Some(new_id))
+    }
+
+    /// Raw conflict columns for the resolve ops.
+    fn load_conflict(&self, server_note_id: &str) -> rusqlite::Result<Option<ConflictRaw>> {
+        self.conn
+            .query_row(
+                "SELECT LocalNoteId, ServerNote, LocalTitle, LocalContent, ServerContent
+                 FROM sync_conflicts WHERE ServerNoteId=?1 AND Resolved=0",
+                params![server_note_id],
+                |r| {
+                    Ok(ConflictRaw {
+                        local_note_id: r.get(0)?,
+                        server_note: r.get(1)?,
+                        local_title: r.get(2)?,
+                        local_content: r.get(3)?,
+                        server_content: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+    }
+}
