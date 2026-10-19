@@ -544,7 +544,7 @@ mod tests {
     /// real ureq client and fakeserver (checkbox 3 evidence).
     #[test]
     fn pdf_api_success_and_failure_against_fakeserver() {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
@@ -554,8 +554,13 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let store = leanote_core::Store::open(dir.clone(), "user1".into()).unwrap();
-            let account =
-                leanote_core::sync::Api::login(&fs.url(), "demo@leanote.com", "demo", &store).unwrap();
+            let account = leanote_core::sync::Api::login(
+                &fs.url(),
+                leanote_fakeserver::EMAIL,
+                leanote_fakeserver::PWD,
+                &store,
+            )
+            .unwrap();
             let api = leanote_core::sync::Api::for_account(&account);
 
             // Success: real %PDF body.
