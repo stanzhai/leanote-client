@@ -512,3 +512,63 @@ async fn incr_pull_delta_only_no_duplicates_on_rerun() {
     assert!(srv.pushes().is_empty());
     assert_eq!(s.last_sync_usn().unwrap(), last);
 }
+
+/// Ticket 12 end-to-end: legacy rich-text note → read-side convert →
+/// explicit 转存 → incr sync pushes updateNote with the converted Markdown.
+#[tokio::test(flavor = "multi_thread")]
+async fn convert_to_markdown_pushes_converted_content() {
+    let (srv, _dir, s, api) = synced("convert_e2e").await;
+
+    // a rich-text note straight off the server: IsMarkdown=false, HTML body
+    let html = concat!(
+        "<h2>归档</h2>",
+        "<ul><li>要点<ol><li>子项</li></ol></li></ul>",
+        "<table><thead><tr><th>列A</th><th>列B</th></tr></thead>",
+        "<tbody><tr><td>1</td><td>2</td></tr></tbody></table>",
+        "<p><strong>粗</strong> <em>斜</em> <code>x</code> <s>删</s></p>",
+        "<blockquote><p>引</p></blockquote>",
+    );
+    let rich_id = "note0500";
+    srv.set_notes({
+        let mut rows = dataset().0;
+        rows.push(json!({
+            "NoteId": rich_id, "NotebookId": "nb1", "Title": "Rich",
+            "IsTrash": false, "IsMarkdown": false, "Tags": [], "Files": [],
+            "IsDeleted": false, "IsDirty": false,
+            "CreatedTime": "2026-01-02T00:00:00Z", "UpdatedTime": "2026-01-02T00:00:00Z",
+            "Usn": 1000,
+        }));
+        rows
+    });
+    let mut contents = Map::new();
+    contents.insert(rich_id.to_string(), json!(html));
+    srv.set_contents(contents);
+    srv.set_sync_usn(1002);
+
+    // pull the rich note down (IsMarkdown=false lands as-is)
+    full_sync(&api, &s, &NoProgress).unwrap();
+    let note = s.get_note(&Id(rich_id.into())).unwrap().expect("synced");
+    assert!(!note.is_markdown);
+    assert_eq!(note.content, html);
+
+    // explicit convert (the GUI's 转存为 Markdown action)
+    let converted = s.convert_to_markdown(&Id(rich_id.into())).unwrap().unwrap();
+    assert!(converted.is_markdown && converted.is_dirty);
+    let expected = leanote_core::html2md::html_to_markdown(html);
+    assert!(expected.contains("## 归档") && expected.contains("~~删~~"));
+
+    incr_sync(&api, &s, &NoProgress).unwrap();
+
+    let pushes = srv.pushes();
+    let up = find_push(&pushes, "note/updateNote");
+    assert_eq!(up.fields["NoteId"].as_str().unwrap(), rich_id);
+    assert_eq!(up.fields["Content"].as_str().unwrap(), expected);
+    // note is clean again; IsMarkdown stays local (server keeps it false, JS parity)
+    assert_eq!(
+        s.raw_query_row(
+            "SELECT COUNT(*) FROM notes WHERE NoteId='note0500' AND IsDirty=0 AND IsMarkdown=1"
+        )
+        .unwrap(),
+        1
+    );
+}

@@ -1,7 +1,5 @@
 //! zh/en interface strings, following the system language (Q12: only zh/en).
 
-
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
     Zh,
@@ -67,6 +65,10 @@ keys! {
     SearchNoResults => ("没有匹配的笔记", "No matching notes"),
     SearchEmptyHint => ("输入关键词搜索标题、内容与标签", "Type to search titles, content and tags"),
     SearchFootnote => ("↑↓ 选择   ↩ 打开   esc 关闭", "↑↓ navigate   ↩ open   esc close"),
+    // Ticket 12: rich-text notes render read-only as converted Markdown.
+    RichTextReadonly => ("富文本（只读）", "Rich text (read only)"),
+    ConvertToMarkdown => ("转换为 Markdown", "Convert to Markdown"),
+    ConvertedToMarkdown => ("已转换为 Markdown", "Converted to Markdown"),
 }
 
 #[cfg(test)]
@@ -105,7 +107,8 @@ mod tests {
         Key::SignIn, Key::SigningIn, Key::Register, Key::LoginFailed, Key::SyncingTitle,
         Key::SyncingSubtitle, Key::SyncDone, Key::SyncFailed, Key::NavAllNotes, Key::NavStarred,
         Key::NavTrash, Key::NavNotebooks, Key::NavTags, Key::NoSelection,
-        Key::EmptyNotes,
+Key::EmptyNotes, Key::Restore, Key::HardDelete, Key::EmptyTrash,
+        Key::RichTextReadonly, Key::ConvertToMarkdown, Key::ConvertedToMarkdown,
         Key::SearchPlaceholder, Key::SearchNoResults, Key::SearchEmptyHint, Key::SearchFootnote,
     ];
 }

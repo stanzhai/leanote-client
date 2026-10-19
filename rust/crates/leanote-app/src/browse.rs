@@ -78,15 +78,21 @@ pub fn note_meta(notebook: &str, tags: &[String], updated_ms: i64) -> String {
     parts.join(" · ")
 }
 
-/// Markdown source handed to `TextView::markdown`. Ticket 09 is read-only:
-/// the store content passes through unmodified — leanote content is plain
-/// Markdown (non-markdown notes fall back to a fenced pre-wrap block so the
-/// raw text stays legible instead of swallowing blank lines as paragraphs).
+/// Markdown source handed to `TextView::markdown`. Markdown content passes
+/// through unmodified; non-Markdown (rich-text) notes are converted for
+/// display only (ticket 12) — the store keeps the original content until
+/// the user runs Convert to Markdown. Plain-text content has no HTML tags,
+/// so it converts to itself unchanged.
 pub fn reader_markdown_src(title: &str, content: &str, is_markdown: bool) -> String {
     if is_markdown {
         content.to_string()
     } else {
-        format!("# {title}\n\n```\n{content}\n```\n")
+        let body = leanote_core::html2md::html_to_markdown(content);
+        if body.trim().is_empty() {
+            format!("# {title}\n")
+        } else {
+            body
+        }
     }
 }
 
@@ -147,11 +153,19 @@ mod tests {
     }
 
     #[test]
-    fn reader_markdown_passthrough_and_fenced_fallback() {
+    fn reader_markdown_passthrough_and_conversion() {
         let src = "# T\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n~~gone~~";
         assert_eq!(reader_markdown_src("T", src, true), src);
-        let plain = reader_markdown_src("T", "line1\n\nline2  double space", false);
-        assert!(plain.starts_with("# T\n\n```\nline1"));
-        assert!(plain.ends_with("```\n"));
+        // Rich text converts to Markdown for display, never fenced.
+        let rich = reader_markdown_src("T", "<h2>H</h2><p><strong>b</strong></p>", false);
+        assert!(rich.contains("## H"), "{rich}");
+        assert!(rich.contains("**b**"), "{rich}");
+        assert!(!rich.contains("```"), "{rich}");
+        // Plain text (no tags) survives as a paragraph: htmd treats the
+        // blank line as a soft break, both lines stay legible.
+        let plain = reader_markdown_src("T", "line1\n\nline2", false);
+        assert!(plain.contains("line1") && plain.contains("line2"), "{plain}");
+        // Empty rich body falls back to the title so the pane isn't blank.
+        assert_eq!(reader_markdown_src("T", "   ", false), "# T\n");
     }
 }
