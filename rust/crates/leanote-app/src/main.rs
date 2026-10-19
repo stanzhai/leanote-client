@@ -1,6 +1,7 @@
 //! leanote-app: GPUI desktop shell (login → full sync → three-pane reader).
 
 mod app_shell;
+mod browse;
 mod i18n;
 mod single_instance;
 mod theme;
@@ -16,6 +17,78 @@ fn data_dir() -> PathBuf {
     std::env::var_os("LEANOTE_RUST_DATA")
         .map(PathBuf::from)
         .unwrap_or_else(leanote_core::app_data_dir)
+}
+
+/// ureq-backed `HttpClient` so `TextView::markdown` can fetch `Resource::Uri`
+/// images (gpui defaults to `NullHttpClient`, which rejects every URI).
+struct UreqHttpClient(ureq::Agent);
+
+impl gpui_kit::http_client::HttpClient for UreqHttpClient {
+    fn send(
+        &self,
+        req: gpui_kit::http_client::Request<gpui_kit::http_client::AsyncBody>,
+    ) -> futures::future::BoxFuture<
+        'static,
+        anyhow::Result<gpui_kit::http_client::Response<gpui_kit::http_client::AsyncBody>>,
+    > {
+        use futures::FutureExt as _;
+        use gpui_kit::http_client::{AsyncBody, RedirectPolicy};
+        use std::io::Read as _;
+
+        let follow = req
+            .extensions()
+            .get::<RedirectPolicy>()
+            .cloned()
+            .unwrap_or_default();
+        let agent = self.0.clone();
+        // Blocking ureq runs on smol's thread pool, off the UI thread.
+        async move {
+            smol::unblock(move || {
+            let (parts, body) = req.into_parts();
+            // AsyncBody is an in-memory cursor or async reader; image GETs
+            // carry empty bodies — drain on this worker thread's executor.
+            let mut send_body: Vec<u8> = Vec::new();
+            smol::block_on(async {
+                use smol::io::AsyncReadExt as _;
+                let mut body = body;
+                body.read_to_end(&mut send_body).await
+            })?;
+            let agent = match follow {
+                RedirectPolicy::FollowAll => agent,
+                RedirectPolicy::FollowLimit(n) => ureq::Agent::config_builder()
+                    .max_redirects(n)
+                    .build()
+                    .new_agent(),
+                RedirectPolicy::NoFollow => ureq::Agent::config_builder()
+                    .max_redirects(0)
+                    .build()
+                    .new_agent(),
+            };
+            let mut request = http::Request::builder()
+                .method(parts.method.as_str())
+                .uri(parts.uri.to_string());
+            for (name, value) in parts.headers.iter() {
+                request = request.header(name.as_str(), value.to_str().unwrap_or(""));
+            }
+            let (parts, mut body) = agent.run(request.body(send_body)?)?.into_parts();
+            let mut bytes = Vec::new();
+            body.as_reader().read_to_end(&mut bytes)?;
+            Ok(http::Response::builder()
+                .status(parts.status)
+                .body(AsyncBody::from(bytes))?)
+            })
+            .await
+        }
+        .boxed()
+    }
+
+    fn user_agent(&self) -> Option<&gpui_kit::http_client::http::HeaderValue> {
+        None
+    }
+
+    fn proxy(&self) -> Option<&gpui_kit::http_client::Url> {
+        None
+    }
 }
 
 static FAKE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -44,11 +117,14 @@ fn boot_fake_server() {
         rt.block_on(async {
             let server = leanote_fakeserver::start().await;
             let _ = FAKE_URL.set(server.url());
-            server.set_sync_usn(12);
+            server.set_sync_usn(17);
             server.set_notebooks(vec![
-                json!({"NotebookId":"nb1","Title":"Inbox","Seq":1,"ParentNotebookId":"","IsDeleted":false,"Usn":1,"CreatedTime":"2026-01-02T10:00:00","UpdatedTime":"2026-01-02T10:00:00"}),
-                json!({"NotebookId":"nb2","Title":"Work","Seq":2,"ParentNotebookId":"","IsDeleted":false,"Usn":2,"CreatedTime":"2026-01-03T10:00:00","UpdatedTime":"2026-01-03T10:00:00"}),
-                json!({"NotebookId":"nb3","Title":"Reading","Seq":3,"ParentNotebookId":"","IsDeleted":false,"Usn":3,"CreatedTime":"2026-01-04T10:00:00","UpdatedTime":"2026-01-04T10:00:00"}),
+                json!({"NotebookId":"nb2","Title":"Work","Seq":1,"ParentNotebookId":"","IsDeleted":false,"Usn":2,"CreatedTime":"2026-01-03T10:00:00","UpdatedTime":"2026-01-03T10:00:00"}),
+                // Nested children of Work: Seq order + nesting in nav (②).
+                json!({"NotebookId":"nb2a","Title":"Research","Seq":1,"ParentNotebookId":"nb2","IsDeleted":false,"Usn":5,"CreatedTime":"2026-01-03T11:30:00","UpdatedTime":"2026-01-03T11:30:00"}),
+                json!({"NotebookId":"nb2b","Title":"Meetings","Seq":2,"ParentNotebookId":"nb2","IsDeleted":false,"Usn":4,"CreatedTime":"2026-01-03T11:00:00","UpdatedTime":"2026-01-03T11:00:00"}),
+                json!({"NotebookId":"nb3","Title":"Reading","Seq":2,"ParentNotebookId":"","IsDeleted":false,"Usn":3,"CreatedTime":"2026-01-04T10:00:00","UpdatedTime":"2026-01-04T10:00:00"}),
+                json!({"NotebookId":"nb1","Title":"Inbox","Seq":3,"ParentNotebookId":"","IsDeleted":false,"Usn":1,"CreatedTime":"2026-01-02T10:00:00","UpdatedTime":"2026-01-02T10:00:00"}),
             ]);
             server.set_notes(vec![
                 json!({"NoteId":"n1","Title":"Welcome to Leanote","NotebookId":"nb1","Usn":4,"IsDeleted":false,"IsTrash":false,"IsMarkdown":true,"Tags":"[]","CreatedTime":"2026-01-05T10:00:00","UpdatedTime":"2026-01-05T10:00:00"}),
@@ -56,6 +132,13 @@ fn boot_fake_server() {
                 json!({"NoteId":"n3","Title":"GPUI notes","NotebookId":"nb2","Usn":6,"IsDeleted":false,"IsTrash":false,"IsMarkdown":true,"Tags":"[\"rust\",\"gpui\"]","CreatedTime":"2026-01-07T10:00:00","UpdatedTime":"2026-01-07T10:00:00"}),
                 json!({"NoteId":"n4","Title":"Reading list — 2026","NotebookId":"nb3","Usn":7,"IsDeleted":false,"IsTrash":false,"IsMarkdown":true,"Tags":"[]","CreatedTime":"2026-01-08T10:00:00","UpdatedTime":"2026-01-08T10:00:00"}),
                 json!({"NoteId":"n5","Title":"Wake design tokens","NotebookId":"nb3","Usn":8,"IsDeleted":false,"IsTrash":false,"IsMarkdown":true,"Tags":"[\"design\"]","CreatedTime":"2026-01-09T10:00:00","UpdatedTime":"2026-01-09T10:00:00"}),
+                // Markdown showcase: headings/table/strike/code/link/quote/img (③⑥).
+                json!({"NoteId":"n6","Title":"Markdown 渲染示例","NotebookId":"nb2a","Usn":13,"IsDeleted":false,"IsTrash":false,"IsMarkdown":true,"Tags":"[\"demo\"]","CreatedTime":"2026-01-10T10:00:00","UpdatedTime":"2026-01-10T10:00:00"}),
+                // Plain note → reader fences as code (read-only fallback).
+                json!({"NoteId":"n7","Title":"Plain text note","NotebookId":"nb1","Usn":14,"IsDeleted":false,"IsTrash":false,"IsMarkdown":false,"Tags":"[]","CreatedTime":"2026-01-11T10:00:00","UpdatedTime":"2026-01-11T10:00:00"}),
+                // Trash (⑤).
+                json!({"NoteId":"n8","Title":"Old draft (trash)","NotebookId":"nb2","Usn":15,"IsDeleted":false,"IsTrash":true,"IsMarkdown":true,"Tags":"[]","CreatedTime":"2026-01-12T10:00:00","UpdatedTime":"2026-01-12T10:00:00"}),
+                json!({"NoteId":"n9","Title":"Scratch (trash)","NotebookId":"nb3","Usn":16,"IsDeleted":false,"IsTrash":true,"IsMarkdown":true,"Tags":"[]","CreatedTime":"2026-01-13T10:00:00","UpdatedTime":"2026-01-13T10:00:00"}),
             ]);
             let mut contents = serde_json::Map::new();
             for (id, body) in [
@@ -64,6 +147,10 @@ fn boot_fake_server() {
                 ("n3", "# GPUI notes\n\nElement tree, entities, contexts."),
                 ("n4", "# Reading list — 2026\n\n- Wake paper\n- GPUI docs"),
                 ("n5", "# Wake design tokens\n\nMaterials, sizes, radii, spacing."),
+                ("n6", "# Heading 1\n\n## Heading 2\n\nParagraph with **bold**, *italic*, `inline code`, a [link](https://leanote.com) and ~~strikethrough~~.\n\n> A blockquote for emphasis.\n\n| Feature | Electron | Rust |\n| --- | --- | --- |\n| Panes | 3 | 3 |\n| Markdown | marked | TextView |\n\n```rust\nfn main() {\n    println!(\"hello, leanote\");\n}\n```\n\n- list item one\n- list item two\n  - nested item\n\nRemote image:\n\n![red dot](https://upload.wikimedia.org/wikipedia/commons/thumb/0/02/Red_circle.svg/120px-Red_circle.svg.png)"),
+                ("n7", "Plain text note\n\n  indented line\nline3"),
+                ("n8", "# Old draft\n\nRestore me from trash (⑤)."),
+                ("n9", "# Scratch\n\nHard-delete me."),
             ] {
                 contents.insert(id.to_string(), json!(body));
             }
@@ -73,6 +160,7 @@ fn boot_fake_server() {
                 json!({"TagId":"t2","Tag":"gpui","Usn":10,"IsDeleted":false}),
                 json!({"TagId":"t3","Tag":"design","Usn":11,"IsDeleted":false}),
                 json!({"TagId":"t4","Tag":"todo","Usn":12,"IsDeleted":false}),
+                json!({"TagId":"t5","Tag":"demo","Usn":17,"IsDeleted":false}),
             ]);
             // Serve until the process exits.
             std::future::pending::<()>().await;
@@ -99,7 +187,16 @@ fn main() {
         Err(()) => std::process::exit(0),
     };
 
-    gpui_kit::application().run(move |cx| {
+    gpui_kit::application()
+        .with_http_client(std::sync::Arc::new(UreqHttpClient(
+            ureq::Agent::config_builder()
+                .timeout_connect(Some(std::time::Duration::from_secs(10)))
+                .timeout_global(Some(std::time::Duration::from_secs(30)))
+                .http_status_as_error(false)
+                .build()
+                .new_agent(),
+        )))
+        .run(move |cx| {
         gpui_kit::init(cx);
 
         // Theme: follow system first (loads registered theme), then overlay
