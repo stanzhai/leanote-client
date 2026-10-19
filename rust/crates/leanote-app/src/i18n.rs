@@ -62,6 +62,17 @@ keys! {
     Restore => ("恢复", "Restore"),
     HardDelete => ("彻底删除", "Delete forever"),
     EmptyTrash => ("清空废纸篓", "Empty trash"),
+    // Ticket 10: editor toolbar + history.
+    NewNote => ("新建笔记", "New note"),
+    Edit => ("编辑", "Edit"),
+    Done => ("完成", "Done"),
+    EditorPreview => ("预览", "Preview"),
+    EditorSource => ("源码", "Source"),
+    Save => ("保存", "Save"),
+    History => ("历史版本", "History"),
+    RestoreVersion => ("恢复此版本", "Restore this version"),
+    HistoryEmpty => ("暂无历史版本", "No history yet"),
+    Saved => ("已保存", "Saved"),
 }
 
 #[cfg(test)]
@@ -100,6 +111,8 @@ mod tests {
         Key::SignIn, Key::SigningIn, Key::Register, Key::LoginFailed, Key::SyncingTitle,
         Key::SyncingSubtitle, Key::SyncDone, Key::SyncFailed, Key::NavAllNotes, Key::NavStarred,
         Key::NavTrash, Key::NavNotebooks, Key::NavTags, Key::NoSelection,
-        Key::EmptyNotes,
+        Key::EmptyNotes, Key::Restore, Key::HardDelete, Key::EmptyTrash, Key::NewNote,
+        Key::Edit, Key::Done, Key::EditorPreview, Key::EditorSource, Key::Save,
+        Key::History, Key::RestoreVersion, Key::HistoryEmpty, Key::Saved,
     ];
 }

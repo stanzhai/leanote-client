@@ -117,6 +117,17 @@ pub struct Tag {
     pub updated_time: i64,
 }
 
+/// One local content snapshot (ticket 10). Max 20 per note, consecutive
+/// identical content deduped.
+#[derive(Clone, Debug)]
+pub struct NoteHistory {
+    pub history_id: Id,
+    pub note_id: Id,
+    pub title: String,
+    pub content: String,
+    pub created_time: i64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Account {
     pub user_id: String,
@@ -300,8 +311,9 @@ impl Store {
     }
 
     /// Hard delete (JS deleteTrash local-user branch): row removed, nothing
-    /// left to push. History purge lands with ticket 10's history table.
+    /// left to push. Local history goes with it.
     pub fn hard_delete_note(&self, id: &Id) -> rusqlite::Result<usize> {
+        self.conn.execute("DELETE FROM note_history WHERE NoteId=?1", [id.to_string()])?;
         self.conn.execute("DELETE FROM notes WHERE NoteId=?1", [id.to_string()])
     }
 
@@ -486,6 +498,109 @@ impl Store {
         }
         tx.commit()?;
         self.get_note(id)
+    }
+
+    // --- ticket 10: local note history ---
+
+    /// Save title+content snapshot (inside an open tx): skip when identical
+    /// to the newest row, else insert and trim to the 20 newest.
+    fn push_history(
+        tx: &rusqlite::Transaction<'_>,
+        user_id: &str,
+        note_id: &Id,
+        title: &str,
+        content: &str,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        let last: Option<String> = tx
+            .query_row(
+                "SELECT Content FROM note_history WHERE NoteId=?1
+                 ORDER BY CreatedTime DESC, rowid DESC LIMIT 1",
+                [note_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if last.as_deref() == Some(content) {
+            return Ok(());
+        }
+        tx.execute(
+            "INSERT INTO note_history (HistoryId, NoteId, UserId, Title, Content, CreatedTime)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![Id::new().to_string(), note_id.to_string(), user_id, title, content, now],
+        )?;
+        tx.execute(
+            "DELETE FROM note_history WHERE NoteId=?1 AND HistoryId NOT IN (
+                SELECT HistoryId FROM note_history WHERE NoteId=?1
+                ORDER BY CreatedTime DESC, rowid DESC LIMIT 20)",
+            [note_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Update with an auto history row: when content actually changed, the
+    /// pre-change content is snapshotted (dedup + trim inside), then the
+    /// note row updates exactly like [`Store::update_note`] — IsDirty=1 so
+    /// the next sync pushes it.
+    pub fn save_note_with_history(
+        &self,
+        id: &Id,
+        upd: NoteUpdate,
+    ) -> rusqlite::Result<Option<Note>> {
+        let Some(old) = self.get_note_any(id)? else {
+            return Ok(None);
+        };
+        let now = now_ms();
+        if upd.content.as_deref().is_some_and(|c| c != old.content) {
+            let tx = self.conn.unchecked_transaction()?;
+            Self::push_history(&tx, &self.user_id, id, &old.title, &old.content, now)?;
+            tx.commit()?; // drop(tx) would ROLLBACK the snapshot
+        }
+        self.update_note(id, upd)
+    }
+
+    /// History rows newest-first, capped at 20 by construction.
+    pub fn list_history(&self, note_id: &Id) -> rusqlite::Result<Vec<NoteHistory>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT HistoryId, NoteId, Title, Content, CreatedTime FROM note_history
+             WHERE NoteId=?1 ORDER BY CreatedTime DESC, rowid DESC LIMIT 20",
+        )?;
+        let rows = stmt.query_map([note_id.to_string()], |r| {
+            Ok(NoteHistory {
+                history_id: Id(r.get(0)?),
+                note_id: Id(r.get(1)?),
+                title: r.get(2)?,
+                content: r.get(3)?,
+                created_time: r.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Restore an old version: it becomes the latest note content (dirty, so
+    /// sync pushes it) and itself gets a fresh history row — restoring twice
+    /// bounces between the same two versions without losing either.
+    pub fn restore_history(&self, note_id: &Id, history_id: &Id) -> rusqlite::Result<Option<Note>> {
+        let Some(h) = self
+            .list_history(note_id)?
+            .into_iter()
+            .find(|h| h.history_id == *history_id)
+        else {
+            return Ok(None);
+        };
+        self.save_note_with_history(
+            note_id,
+            NoteUpdate {
+                title: Some(h.title),
+                content: Some(h.content),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Drop all local history rows for a note (UI "clear history").
+    pub fn purge_history(&self, note_id: &Id) -> rusqlite::Result<usize> {
+        self.conn
+            .execute("DELETE FROM note_history WHERE NoteId=?1", [note_id.to_string()])
     }
 
     /// Note by exact id regardless of trash/deleted state (JS getNote uses
@@ -856,7 +971,16 @@ CREATE TABLE IF NOT EXISTS sync_conflicts (
     CreatedTime INTEGER NOT NULL DEFAULT 0,
     Resolved INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS note_history (
+    HistoryId TEXT PRIMARY KEY,
+    NoteId TEXT NOT NULL,
+    UserId TEXT NOT NULL,
+    Title TEXT NOT NULL DEFAULT '',
+    Content TEXT NOT NULL,
+    CreatedTime INTEGER NOT NULL DEFAULT 0
+);
 CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(UpdatedTime DESC);
 CREATE INDEX IF NOT EXISTS idx_notes_notebook ON notes(NotebookId);
 CREATE INDEX IF NOT EXISTS idx_notebooks_user_title ON notebooks(UserId, Title);
+CREATE INDEX IF NOT EXISTS idx_note_history_note ON note_history(NoteId, CreatedTime DESC);
 ";
