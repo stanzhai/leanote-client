@@ -670,6 +670,16 @@ CREATE TABLE IF NOT EXISTS accounts (
     LastSyncUsn INTEGER NOT NULL DEFAULT -1,
     IsActive INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS sync_conflicts (
+    ServerNoteId TEXT PRIMARY KEY,
+    LocalNoteId TEXT NOT NULL,
+    ServerNote TEXT NOT NULL,
+    LocalTitle TEXT NOT NULL,
+    LocalContent TEXT NOT NULL,
+    ServerContent TEXT NOT NULL,
+    CreatedTime INTEGER NOT NULL DEFAULT 0,
+    Resolved INTEGER NOT NULL DEFAULT 0
+);
 CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(UpdatedTime DESC);
 CREATE INDEX IF NOT EXISTS idx_notes_notebook ON notes(NotebookId);
 CREATE INDEX IF NOT EXISTS idx_notebooks_user_title ON notebooks(UserId, Title);

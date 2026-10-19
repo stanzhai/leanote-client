@@ -280,3 +280,235 @@ async fn sync_cli_smoke_prints_progress() {
     assert!(!bad.status.success());
     assert!(String::from_utf8_lossy(&bad.stderr).contains("WrongPassword"));
 }
+
+// ---- incr sync (ticket 04) ----
+
+use leanote_core::sync::incr_sync;
+use leanote_core::{Id, NewNote, NoteUpdate};
+use rusqlite::Connection;
+
+/// seeded server + full_sync'd store, ready for incr tests.
+async fn synced(name: &str) -> (leanote_fakeserver::FakeServer, PathBuf, Store, Api) {
+    let srv = seeded().await;
+    let dir = tmpdir(name);
+    let s = store(&dir);
+    let acct = Api::login(&srv.url(), EMAIL, PWD, &s).unwrap();
+    let api = Api::for_account(&acct);
+    full_sync(&api, &s, &NoProgress).unwrap();
+    assert_eq!(s.last_sync_usn().unwrap(), 1001);
+    (srv, dir, s, api)
+}
+
+fn find_push<'a>(
+    pushes: &'a [leanote_fakeserver::RecordedPush],
+    endpoint: &str,
+) -> &'a leanote_fakeserver::RecordedPush {
+    pushes
+        .iter()
+        .find(|p| p.endpoint == endpoint)
+        .unwrap_or_else(|| panic!("no push {endpoint} in {pushes:?}"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incr_push_offline_new_and_edit() {
+    let (srv, _dir, s, api) = synced("incr_new_edit").await;
+
+    s.add_note(NewNote {
+        title: "Local new".into(),
+        content: "# new".into(),
+        tags: vec![],
+        notebook_title: "Notebook 1".into(),
+        is_markdown: true,
+    })
+    .unwrap();
+    s.update_note(
+        &Id("note0042".into()),
+        NoteUpdate { content: Some("# Note 42\n\nlocal edit".into()), ..Default::default() },
+    )
+    .unwrap();
+
+    incr_sync(&api, &s, &NoProgress).unwrap();
+
+    let pushes = srv.pushes();
+    let up = find_push(&pushes, "note/updateNote");
+    assert_eq!(up.fields["NoteId"].as_str().unwrap(), "note0042");
+    assert_eq!(up.fields["Title"].as_str().unwrap(), "Note 42");
+    let add = find_push(&pushes, "note/addNote");
+    assert_eq!(add.fields["Title"].as_str().unwrap(), "Local new");
+    assert_eq!(add.fields["Content"].as_str().unwrap(), "# new");
+
+    // new note: clean + mapped to a server id
+    assert_eq!(
+        s.raw_query_row(
+            "SELECT COUNT(*) FROM notes WHERE Title='Local new' AND IsDirty=0 AND LocalIsNew=0
+             AND ServerNoteId LIKE 'srvnote%'"
+        )
+        .unwrap(),
+        1
+    );
+    // edited note: clean + usn advanced
+    assert_eq!(
+        s.raw_query_row(
+            "SELECT COUNT(*) FROM notes WHERE NoteId='note0042' AND IsDirty=0 AND Usn=1002
+             AND Content='# Note 42\n\nlocal edit'"
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(counts(&s), (3, 451, 2, 451));
+    assert_eq!(s.last_sync_usn().unwrap(), 1003);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incr_push_hard_delete_sends_delete_trash() {
+    let (srv, dir, s, api) = synced("incr_hard_delete").await;
+
+    let conn = Connection::open(dir.join("leanote.db")).unwrap();
+    conn.execute(
+        "UPDATE notes SET IsTrash=1, LocalIsDelete=1, IsDirty=1 WHERE NoteId='note0042'",
+        [],
+    )
+    .unwrap();
+
+    incr_sync(&api, &s, &NoProgress).unwrap();
+
+    let pushes = srv.pushes();
+    let del = find_push(&pushes, "note/deleteTrash");
+    assert_eq!(del.fields["noteId"].as_str().unwrap(), "note0042");
+    assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM notes WHERE NoteId='note0042'").unwrap(), 0);
+    assert_eq!(counts(&s).1, 449);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incr_usn_advance_re_rounds_to_convergence() {
+    let (srv, _dir, s, api) = synced("incr_re_round").await;
+
+    for i in [42, 43] {
+        s.update_note(
+            &Id(format!("note{i:04}")),
+            NoteUpdate { content: Some(format!("# Note {i}\n\nlocal edit")), ..Default::default() },
+        )
+        .unwrap();
+    }
+    // first push answers with a far-future usn → needAgain → re-round pulls
+    // (nothing new) and skips the second push round
+    srv.inject_response(json!({"Ok": true, "NoteId": "note0042", "Usn": 5000}));
+
+    incr_sync(&api, &s, &NoProgress).unwrap();
+
+    assert_eq!(srv.pushes().len(), 2);
+    assert_eq!(
+        s.raw_query_row(
+            "SELECT COUNT(*) FROM notes WHERE NoteId IN ('note0042','note0043') AND IsDirty=0"
+        )
+        .unwrap(),
+        2
+    );
+    // converged: local cursor == server LastSyncUsn (only the real push bumped it)
+    assert_eq!(s.last_sync_usn().unwrap(), api.get_sync_state().unwrap());
+    assert_eq!(s.last_sync_usn().unwrap(), 1002);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incr_delete_conflict_sets_not_dirty_keeps_row() {
+    let (srv, dir, s, api) = synced("incr_del_conflict").await;
+
+    let conn = Connection::open(dir.join("leanote.db")).unwrap();
+    conn.execute(
+        "UPDATE notes SET IsTrash=1, LocalIsDelete=1, IsDirty=1 WHERE NoteId='note0042'",
+        [],
+    )
+    .unwrap();
+    srv.inject_response(json!({"Ok": false, "Msg": "conflict"}));
+
+    incr_sync(&api, &s, &NoProgress).unwrap();
+
+    let pushes = srv.pushes();
+    let del = find_push(&pushes, "note/deleteTrash");
+    assert_eq!(del.fields["noteId"].as_str().unwrap(), "note0042");
+    // 置非脏不删: row survives, not dirty, not deleted (still trash)
+    let n = s.get_note_any(&Id("note0042".into())).unwrap().unwrap();
+    assert!(!n.is_dirty);
+    assert!(!n.is_deleted);
+    assert!(n.is_trash);
+    assert_eq!(counts(&s).1, 450);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incr_content_conflict_recorded_not_overwritten() {
+    let (srv, _dir, s, api) = synced("incr_content_conflict").await;
+
+    // local edit (dirty)…
+    s.update_note(
+        &Id("note0042".into()),
+        NoteUpdate { content: Some("# Note 42\n\nlocal edit".into()), ..Default::default() },
+    )
+    .unwrap();
+    // …racing a server edit at a higher usn with different content
+    let (mut nb, mut notes, tags, mut contents) = dataset();
+    nb.clear();
+    for n in notes.iter_mut() {
+        if n["NoteId"] == json!("note0042") {
+            n["Usn"] = json!(1500);
+        }
+    }
+    contents.insert("note0042".into(), json!("# Note 42\n\nserver edit"));
+    srv.set_notebooks(nb);
+    srv.set_notes(notes);
+    srv.set_tags(tags);
+    srv.set_contents(contents);
+    srv.set_sync_usn(1002);
+    // the updateNote push also answers conflict → local stays dirty
+    srv.inject_response(json!({"Ok": false, "Msg": "conflict"}));
+
+    incr_sync(&api, &s, &NoProgress).unwrap();
+
+    let conflicts = s.conflicts().unwrap();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0]["server"]["NoteId"].as_str().unwrap(), "note0042");
+    assert_eq!(conflicts[0]["server"]["Usn"].as_i64().unwrap(), 1500);
+    assert_eq!(
+        conflicts[0]["local"]["Content"].as_str().unwrap(),
+        "# Note 42\n\nlocal edit"
+    );
+    // local row untouched by the server version
+    let n = s.get_note_any(&Id("note0042".into())).unwrap().unwrap();
+    assert_eq!(n.content, "# Note 42\n\nlocal edit");
+    assert!(n.is_dirty, "conflict keeps the local row dirty");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incr_pull_delta_only_no_duplicates_on_rerun() {
+    let (srv, _dir, s, api) = synced("incr_delta").await;
+
+    let (nb, mut notes, tags, mut contents) = dataset();
+    notes.push(json!({
+        "NoteId": "note0500", "NotebookId": "nb2", "Title": "Note 500",
+        "IsTrash": false, "IsMarkdown": true, "Tags": [], "Files": [],
+        "IsDeleted": false, "IsDirty": false,
+        "CreatedTime": "2026-01-02T00:00:00Z", "UpdatedTime": "2026-01-02T00:00:00Z",
+        "Usn": 1500,
+    }));
+    contents.insert("note0500".into(), json!("# Note 500\n\nbody 500"));
+    srv.set_notebooks(nb);
+    srv.set_notes(notes);
+    srv.set_tags(tags);
+    srv.set_contents(contents);
+    srv.set_sync_usn(1002);
+
+    incr_sync(&api, &s, &NoProgress).unwrap();
+
+    assert_eq!(counts(&s), (3, 451, 2, 451));
+    let n = s.get_note_any(&Id("note0500".into())).unwrap().unwrap();
+    assert_eq!(n.content, "# Note 500\n\nbody 500");
+    let last = s.last_sync_usn().unwrap();
+    assert_eq!(last, 1002);
+    assert!(srv.pushes().is_empty(), "pull-only round pushes nothing");
+
+    // rerun: nothing new server-side, nothing dirty → no traffic, no dupes
+    srv.clear_pushes();
+    incr_sync(&api, &s, &NoProgress).unwrap();
+    assert_eq!(counts(&s), (3, 451, 2, 451));
+    assert!(srv.pushes().is_empty());
+    assert_eq!(s.last_sync_usn().unwrap(), last);
+}
