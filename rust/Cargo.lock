@@ -546,6 +546,7 @@ version = "0.1.0"
 dependencies = [
  "leanote-core",
  "leanote-fakeserver",
+ "leanote-http",
  "rusqlite",
  "serde_json",
  "tokio",
@@ -569,6 +570,17 @@ dependencies = [
  "form_urlencoded",
  "reqwest",
  "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "leanote-http"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "leanote-core",
+ "reqwest",
  "serde_json",
  "tokio",
 ]

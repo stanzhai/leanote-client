@@ -6,7 +6,9 @@ use std::io::{Read, Write};
 
 pub fn run(argv: Vec<String>) -> i32 {
     // JS: first arg that is a known subcommand wins; default "add".
-    const SUBCOMMANDS: [&str; 7] = ["add", "list", "show", "search", "edit", "sync", "help"];
+    // `serve` is Rust-only (dev helper to run the local HTTP server).
+    const SUBCOMMANDS: [&str; 8] =
+        ["add", "list", "show", "search", "edit", "sync", "help", "serve"];
     let mut cmd = "add";
     let mut cmd_index: Option<usize> = None;
     for (i, a) in argv.iter().enumerate() {
@@ -60,6 +62,11 @@ pub fn run(argv: Vec<String>) -> i32 {
             1
         }
         "sync" => cmd_sync(&cmd_args),
+        "serve" => cmd_serve(&cmd_args),
+        "edit" => {
+            eprintln!("Error: edit is not implemented yet");
+            1
+        }
         _ => {
             eprintln!("Unknown command: {}", cmd);
             print_global_help();
@@ -285,6 +292,46 @@ impl leanote_core::sync::SyncProgress for PrintProgress {
         println!("{msg}");
     }
 }
+
+// --- serve (Rust-only: run the local HTTP /api server; dev/test helper) ---
+
+fn cmd_serve(args: &[String]) -> i32 {
+    let mut port: u16 = leanote_http::DEFAULT_PORT;
+    let mut i = 0;
+    while i < args.len() {
+        if (args[i] == "-p" || args[i] == "--port") && i + 1 < args.len() {
+            i += 1;
+            match args[i].parse() {
+                Ok(p) => port = p,
+                Err(_) => {
+                    eprintln!("Error: invalid port {}", args[i]);
+                    return 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    let store = match open_store() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return 1;
+        }
+    };
+    match leanote_http::serve_blocking(store, port) {
+        Ok(()) => 0,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                eprintln!("[leanote] Port {} in use, CLI will use file I/O", port);
+            } else {
+                eprintln!("[leanote] Local server error: {}", e);
+            }
+            1
+        }
+    }
+}
+
+// --- list ---
 
 struct ListOpts {
     notebook: String,

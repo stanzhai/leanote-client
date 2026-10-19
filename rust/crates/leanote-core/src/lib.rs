@@ -305,10 +305,98 @@ impl Store {
         self.conn.query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
     }
 
-    pub fn journal_mode(&self) -> rusqlite::Result<String> {
-        self.conn
-            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+    /// JS handleUpdateNote + NoteService.updateNoteOrContent semantics:
+    /// - desc/abstract recomputed only when content is provided
+    /// - IsDirty/UpdatedTime only when Title/Content/Tags actually differ
+    /// - no-op update (nothing differed) → Ok(Some(old)), nothing written
+    /// - tags upsert only for a non-empty new tag list
+    /// - `notebook_title` is accepted but intentionally ignored: JS
+    ///   updateNoteOrContent's updateFields never persists NotebookId, so a
+    ///   notebook-only move is a no-op there too.
+    pub fn update_note(&self, id: &Id, upd: NoteUpdate) -> rusqlite::Result<Option<Note>> {
+        let Some(old) = self.get_note_any(id)? else {
+            return Ok(None);
+        };
+        let title = upd.title.clone().unwrap_or_else(|| old.title.clone());
+        let content = upd.content.clone().unwrap_or_else(|| old.content.clone());
+        let tags = upd.tags.clone().unwrap_or_else(|| old.tags.clone());
+        let dirty =
+            title != old.title || content != old.content || tags_csv(&tags) != tags_csv(&old.tags);
+        if !dirty {
+            return Ok(Some(old));
+        }
+        let (desc, abstract_) = if upd.content.is_some() {
+            (plain_desc(&content), content.chars().take(500).collect())
+        } else {
+            (old.desc.clone(), old.abstract_.clone())
+        };
+        let now = now_ms();
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE notes SET Title=?2, Content=?3, \"Desc\"=?4, Abstract=?5, Tags=?6,
+                IsDirty=1, LocalIsDelete=0, UpdatedTime=?7
+             WHERE NoteId=?1",
+            params![
+                id.to_string(),
+                title,
+                content,
+                desc,
+                abstract_,
+                tags_csv(&tags),
+                now
+            ],
+        )?;
+        if let Some(t) = upd.tags.clone().filter(|t| !t.is_empty()) {
+            upsert_tags(&tx, &self.user_id, &t, now)?;
+        }
+        tx.commit()?;
+        self.get_note(id)
     }
+
+    /// Note by exact id regardless of trash/deleted state (JS getNote uses
+    /// findOne({NoteId}) with no status filter).
+    pub fn get_note_any(&self, id: &Id) -> rusqlite::Result<Option<Note>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
+                IsMarkdown, IsTrash, IsDirty, LocalIsNew, LocalIsDelete, IsBlog, Star, CreatedTime, UpdatedTime
+             FROM notes WHERE NoteId=?1",
+        )?;
+        stmt.query_row([id.to_string()], row_to_note).optional()
+    }
+
+    /// JS local_server findNoteByPrefix: exact id first (any state), else
+    /// prefix matches in insertion order, first non-trash/non-deleted wins.
+    pub fn find_note_by_prefix(&self, prefix: &str) -> rusqlite::Result<Option<Note>> {
+        if let Some(n) = self.get_note_any(&Id(prefix.to_string()))? {
+            return Ok(Some(n));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
+                IsMarkdown, IsTrash, IsDirty, LocalIsNew, LocalIsDelete, IsBlog, Star, CreatedTime, UpdatedTime
+             FROM notes WHERE NoteId LIKE ?1 || '%' ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([prefix.replace('%', "\\%").replace('_', "\\_")], row_to_note)?;
+        for n in rows {
+            let n = n?;
+            if !n.is_trash && !n.is_deleted {
+                return Ok(Some(n));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Unified search (spec §30): case-insensitive substring over
+    /// Title+Content+Tags, weights Title 3 / Tags 2 / Content 1, excerpt
+    /// window exactly as `src/leanote_cli.js` cmdSearch.
+    pub fn search(&self, keyword: &str, limit: usize) -> rusqlite::Result<Vec<SearchHit>> {
+        Ok(search_notes(&self.list_notes()?, keyword, limit))
+    }
+
+     pub fn journal_mode(&self) -> rusqlite::Result<String> {
+         self.conn
+             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+     }
 }
 
 #[derive(Debug)]
@@ -330,6 +418,97 @@ pub struct NewNote {
     pub is_markdown: bool,
 }
 
+/// Fields the local HTTP updateNote accepts (None = leave unchanged).
+/// `notebook` moves the note by target notebook *title*, like JS.
+#[derive(Default)]
+pub struct NoteUpdate {
+    pub title: Option<String>,
+    pub content: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub notebook_title: Option<String>,
+}
+
+/// One ranked search result. `excerpt` mirrors the JS CLI's context window.
+#[derive(Clone, Debug)]
+pub struct SearchHit {
+    pub note: Note,
+    pub score: u32,
+    pub excerpt: String,
+}
+
+/// Case-insensitive substring search over Title+Content+Tags.
+/// Weights: Title 3, Tags 2, Content 1. Sort: score desc, then insertion
+/// order (JS `Array.prototype.sort` is stable). Excerpt (verbatim from
+/// `src/leanote_cli.js` cmdSearch): 30 units before the first Content hit,
+/// kw.len+50 after, `...` on both cut sides, newlines → spaces; when
+/// Content misses, Desc[:80] (Content fallback).
+pub fn search_notes(notes: &[Note], keyword: &str, limit: usize) -> Vec<SearchHit> {
+    if keyword.is_empty() {
+        return Vec::new();
+    }
+    let kw_lower = keyword.to_lowercase();
+    let mut out: Vec<SearchHit> = Vec::new();
+    for n in notes {
+        let in_title = n.title.to_lowercase().contains(&kw_lower);
+        let in_content = n.content.to_lowercase().contains(&kw_lower);
+        let in_tags = n.tags.iter().any(|t| t.to_lowercase().contains(&kw_lower));
+        if !(in_title || in_content || in_tags) {
+            continue;
+        }
+        let score = (in_title as u32) * 3 + (in_tags as u32) * 2 + (in_content as u32) * 1;
+        out.push(SearchHit { note: n.clone(), score, excerpt: excerpt(n, keyword) });
+    }
+    out.sort_by(|a, b| b.score.cmp(&a.score));
+    out.truncate(limit);
+    out
+}
+
+/// JS: idx = content.toLowerCase().indexOf(kw); start = max(0, idx-30);
+/// end = min(len, idx+kw.len+50); "..." when start>0 / end<len; \n -> " ".
+/// All indices are JS UTF-16 code units, kw.len included.
+fn excerpt(n: &Note, keyword: &str) -> String {
+    let cu: Vec<u16> = n.content.encode_utf16().collect();
+    let lower_cu: Vec<u16> = n.content.to_lowercase().encode_utf16().collect();
+    let lower_kw: Vec<u16> = keyword.to_lowercase().encode_utf16().collect();
+    match find_sub(&lower_cu, &lower_kw) {
+        Some(i) => {
+            let start = i.saturating_sub(30);
+            let end = (i + keyword.encode_utf16().count() + 50).min(cu.len());
+            let mut s = String::new();
+            if start > 0 {
+                s.push_str("...");
+            }
+            s.push_str(&String::from_utf16_lossy(&cu[start..end]).replace('\n', " "));
+            if end < cu.len() {
+                s.push_str("...");
+            }
+            s
+        }
+        None => {
+            let src = if n.desc.is_empty() && !n.content.is_empty() {
+                &n.content
+            } else {
+                &n.desc
+            };
+            utf16_prefix(src, 80)
+        }
+    }
+}
+
+fn find_sub(hay: &[u16], needle: &[u16]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// JS String.prototype.substring(0, n): UTF-16 code-unit prefix.
+fn utf16_prefix(s: &str, n: usize) -> String {
+    let cu: Vec<u16> = s.encode_utf16().collect();
+    String::from_utf16_lossy(&cu[..n.min(cu.len())])
+}
+
+/// JS: content.replace(/\n/g," ").replace(/#/g,"").substring(0,50).trim()
 pub(crate) fn plain_desc(content: &str) -> String {
     content
         .replace('\n', " ")

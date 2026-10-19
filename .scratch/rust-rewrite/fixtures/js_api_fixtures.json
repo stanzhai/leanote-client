@@ -1,0 +1,73 @@
+[
+  {
+    "name": "GET /api/ping #0",
+    "status": 200,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": "{\"success\":true}"
+  },
+  {
+    "name": "GET /api/nope #1",
+    "status": 404,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": "{\"success\":false,\"error\":\"Unknown endpoint\"}"
+  },
+  {
+    "name": "POST /api/note/addNote #2",
+    "status": 200,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": "{\"success\":true,\"noteId\":\"<24hex>\"}"
+  },
+  {
+    "name": "POST /api/note/addNote #3 (no title)",
+    "status": 400,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": "{\"success\":false,\"error\":\"title is required\"}"
+  },
+  {
+    "name": "POST /api/note/addNote #4 (no content)",
+    "status": 400,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": "{\"success\":false,\"error\":\"content is required\"}"
+  },
+  {
+    "name": "POST /api/note/addNote #5 (invalid JSON)",
+    "status": 400,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "bodyPattern": "\\{\\\\\"success\\\\\":false,\\\\\"error\\\\\":\\\\\".+\\\\\"\\}",
+    "note": "JSON.parse error text differs per engine (V8 vs serde_json); shape is asserted, not wording."
+  },
+  {
+    "name": "POST /api/note/updateNote #6 (no noteId)",
+    "status": 400,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": "{\"success\":false,\"error\":\"noteId is required\"}"
+  },
+  {
+    "name": "POST /api/note/updateNote #7 (unknown id)",
+    "status": 404,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": "{\"success\":false,\"error\":\"Note not found\"}"
+  },
+  {
+    "name": "POST /api/note/updateNote #8 (full id, 200)",
+    "status": 200,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": "{\"success\":true,\"noteId\":\"<24hex>\"}"
+  },
+  {
+    "name": "POST /api/note/updateNote #9 (prefix id, 200)",
+    "status": 200,
+    "contentType": "application/json",
+    "allowOrigin": "*",
+    "body": "{\"success\":true,\"noteId\":\"<24hex>\"}"
+  }
+]

@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 leanote-core = { path = "../leanote-core" }
+leanote-http = { path = "../leanote-http" }
 
 [dev-dependencies]
 leanote-fakeserver = { path = "../../fake-server" }
