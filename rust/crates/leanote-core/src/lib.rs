@@ -131,6 +131,11 @@ pub struct Account {
 
 pub const DB_FILE: &str = "leanote.db";
 
+/// Column list + live-note filter shared by the browse queries (JS _getNotes).
+pub(crate) const NOTES_LIVE_BASE: &str = "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
+    IsMarkdown, IsTrash, IsDirty, LocalIsNew, LocalIsDelete, IsBlog, Star, CreatedTime, UpdatedTime
+ FROM notes WHERE IsTrash=0 AND LocalIsDelete=0 AND IsDeleted=0";
+
 /// Rust app data dir; MUST differ from Electron's
 /// `~/Library/Application Support/leanote/` (which contains NeDB `nedb55/`).
 pub fn app_data_dir() -> PathBuf {
@@ -206,6 +211,106 @@ impl Store {
         upsert_tags(&tx, &self.user_id, &note.tags, now)?;
         tx.commit()?;
         Ok(self.get_note(&id)?.expect("just inserted"))
+    }
+
+    /// JS Note._getNotes(notebookId, isTrash=false, isStar): live notes,
+    /// optionally narrowed to one notebook and/or Star=1. Trash is a
+    /// different query (JS getTrashNotes) → [`Store::list_trash`].
+    pub fn list_notes_filtered(
+        &self,
+        notebook_id: Option<&Id>,
+        starred: bool,
+    ) -> rusqlite::Result<Vec<Note>> {
+        let mut sql = NOTES_LIVE_BASE.to_string();
+        if starred {
+            sql.push_str(" AND Star=1");
+        }
+        if let Some(nb) = notebook_id {
+            // ' is the only char needing escape in a SQLite string literal.
+            sql.push_str(&format!(" AND NotebookId='{}'", nb.replace('\'', "''")));
+        }
+        sql.push_str(" ORDER BY UpdatedTime DESC, rowid ASC");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], row_to_note)?;
+        rows.collect()
+    }
+
+    /// Notes carrying `tag` (JS searchNoteByTag: live notes, whole-tag match
+    /// via `,tag,` inside the CSV-wrapped Tags column).
+    pub fn list_notes_by_tag(&self, tag: &str) -> rusqlite::Result<Vec<Note>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{NOTES_LIVE_BASE} AND (',' || Tags || ',') LIKE ?
+             ORDER BY UpdatedTime DESC, rowid ASC"
+        ))?;
+        let pat = format!("%,{},%", tag);
+        let rows = stmt.query_map([pat], row_to_note)?;
+        rows.collect()
+    }
+
+    /// Trashed notes newest-first (JS getTrashNotes: IsTrash=1, no other filter).
+    pub fn list_trash(&self) -> rusqlite::Result<Vec<Note>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
+                IsMarkdown, IsTrash, IsDirty, LocalIsNew, LocalIsDelete, IsBlog, Star, CreatedTime, UpdatedTime
+             FROM notes WHERE IsTrash=1
+             ORDER BY UpdatedTime DESC, rowid ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_note)?;
+        rows.collect()
+    }
+
+    /// Live-note count per notebook (JS reCountNotebookNumberNotes).
+    pub fn notebook_note_counts(&self) -> rusqlite::Result<Vec<(Id, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT NotebookId, COUNT(*) FROM notes
+             WHERE IsTrash=0 AND LocalIsDelete=0 AND IsDeleted=0
+             GROUP BY NotebookId",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((Id(r.get(0)?), r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Toggle Star. JS Note.star: sets Star + UpdatedTime ONLY — IsDirty
+    /// stays untouched so the change never reaches the server.
+    pub fn toggle_star(&self, id: &Id) -> rusqlite::Result<Option<bool>> {
+        let n = self.conn.execute(
+            "UPDATE notes SET Star = 1-Star, UpdatedTime=?2 WHERE NoteId=?1",
+            params![id.to_string(), now_ms()],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(
+                "SELECT Star FROM notes WHERE NoteId=?1",
+                [id.to_string()],
+                |r| r.get::<_, i64>(0).map(|v| v != 0),
+            )
+            .map(Some)
+    }
+
+    /// Restore from trash into `notebook_id` (JS moveNote on a trashed
+    /// note): clears IsTrash/LocalIsDelete, sets IsDirty so sync pushes it.
+    pub fn restore_note(&self, id: &Id, notebook_id: &Id) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE notes SET IsTrash=0, LocalIsDelete=0, IsDirty=1, NotebookId=?2, UpdatedTime=?3
+             WHERE NoteId=?1",
+            params![id.to_string(), notebook_id.to_string(), now_ms()],
+        )
+    }
+
+    /// Hard delete (JS deleteTrash local-user branch): row removed, nothing
+    /// left to push. History purge lands with ticket 10's history table.
+    pub fn hard_delete_note(&self, id: &Id) -> rusqlite::Result<usize> {
+        self.conn.execute("DELETE FROM notes WHERE NoteId=?1", [id.to_string()])
+    }
+
+    /// Empty trash (JS clearTrash): every trashed row marked deleted+dirty.
+    pub fn empty_trash(&self) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE notes SET LocalIsDelete=1, IsDirty=1 WHERE IsTrash=1",
+            [],
+        )
     }
 
     /// Notes newest-first (matches JS `loadNotes` sort by UpdatedTime desc).
