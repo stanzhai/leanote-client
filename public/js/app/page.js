@@ -1455,6 +1455,10 @@ function initPage(initedCallback) {
     });
     */
     const ipc = electron.ipcRenderer;
+    // 防止页面重新初始化时重复注册监听器（长时间运行后累积导致多次回调）
+    ipc.removeAllListeners('focusWindow');
+    ipc.removeAllListeners('blurWindow');
+    ipc.removeAllListeners('closeWindow');
     ipc.on('focusWindow', function(event, arg) {
         $('body').removeClass('blur');
     });
@@ -2266,6 +2270,16 @@ function userMenu(allUsers) {
         });
 
         this.menu.append(this.more);
+
+        // CLI 与 MCP 使用说明
+        this.menu.append(new gui.MenuItem({ type: 'separator' }));
+        this.menu.append(new gui.MenuItem({
+            label: 'CLI 与 MCP 使用说明',
+            click: function(e) {
+                try { $('#cliMcpHelpDialog').modal('show'); } catch (e) {}
+            }
+        }));
+        height += 40;
 
         this.popup = function(e) {
             var y = $(window).height() - height;

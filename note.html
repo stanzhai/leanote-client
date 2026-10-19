@@ -688,6 +688,58 @@ function log(o) {
         </div><!-- /.modal-dialog -->
       </div><!-- /.modal -->
 
+      <!-- CLI 与 MCP 使用说明 -->
+      <div class="modal fade" id="cliMcpHelpDialog" tabindex="-1" role="dialog" aria-labelledby="cliMcpHelpTitle">
+        <div class="modal-dialog modal-lg" role="document">
+          <div class="modal-content">
+            <div class="modal-header">
+              <button type="button" class="close" data-dismiss="modal" aria-hidden="true">&times;</button>
+              <h4 class="modal-title" id="cliMcpHelpTitle">CLI 与 MCP 使用说明</h4>
+            </div>
+            <div class="modal-body" style="max-height:70vh; overflow-y:auto;">
+              <h5 style="font-weight:bold; margin-top:0;">命令行工具 (leanote)</h5>
+              <p style="color:#666; font-size:13px;">在终端管理笔记。笔记 ID 可用前缀缩写。</p>
+              <pre style="background:#f5f5f5; padding:10px; border-radius:4px; font-size:12px; white-space:pre-wrap; word-wrap:break-word; margin:0;">leanote add -t "标题" -c "# Markdown 内容" -g "标签1,标签2"
+echo "# 内容" | leanote -t "标题"
+
+leanote list                  列出最近笔记
+leanote list -n "笔记本"      按笔记本过滤
+leanote show &lt;noteId&gt;         查看完整内容（支持 ID 前缀）
+leanote search "关键字"       搜索笔记
+leanote edit &lt;noteId&gt; -t "新标题"</pre>
+              <h5 style="font-weight:bold; margin-top:18px;">MCP Server（供 AI 智能体调用）</h5>
+              <p style="color:#666; font-size:13px;">Leanote 启动后在本地开启 MCP 服务（Model Context Protocol，Streamable HTTP，端口 8912，仅绑定 127.0.0.1），智能体配置后即可管理笔记。与 CLI 文件 I/O 模式一致：直接读写本地 NeDB 文件，写入的笔记带同步标记（<code>IsDirty</code>），app 下次加载/同步时生效。</p>
+              <pre style="background:#f5f5f5; padding:10px; border-radius:4px; font-size:12px; white-space:pre-wrap; word-wrap:break-word; margin:0;">端点: http://127.0.0.1:8912/mcp
+
+智能体配置 (Claude Desktop / Cursor):
+{
+  "mcpServers": {
+    "leanote": { "url": "http://127.0.0.1:8912/mcp" }
+  }
+}</pre>
+              <p style="color:#666; font-size:13px; margin-top:10px; margin-bottom:6px;">可用工具：</p>
+              <ul style="font-size:13px;">
+                <li><code>list_notebooks</code> — 列出所有笔记本及笔记数量</li>
+                <li><code>list_tags</code> — 列出所有标签</li>
+                <li><code>add_note</code> — 新建 Markdown 笔记（title / content / tags / notebook，默认笔记本 "AI札"，不存在则自动创建）</li>
+                <li><code>list_notes</code> — 列出最近笔记，可按 notebook / tag 过滤</li>
+                <li><code>get_note</code> — 按 ID（或前缀）查看笔记完整内容</li>
+                <li><code>search_notes</code> — 按关键字搜索（标题 / 正文 / 标签），按相关度排序</li>
+                <li><code>update_note</code> — 更新笔记（title / content / tags / notebook）</li>
+                <li><code>delete_note</code> — 移到回收站</li>
+              </ul>
+              <h5 style="font-weight:bold; margin-top:18px;">调试</h5>
+              <pre style="background:#f5f5f5; padding:10px; border-radius:4px; font-size:12px; white-space:pre-wrap; word-wrap:break-word; margin:0;">npx @modelcontextprotocol/inspector
+# Transport 选 Streamable HTTP，URL 填 http://127.0.0.1:8912/mcp</pre>
+              <p style="color:#666; font-size:13px; margin-top:6px;">仓库内附冒烟测试：<code>node tests/test_mcp_server.js</code>（需本机已有 Leanote 数据）。</p>
+            </div>
+            <div class="modal-footer">
+              <button type="button" class="btn btn-default" data-dismiss="modal">关闭</button>
+            </div>
+          </div>
+        </div>
+      </div><!-- /.modal -->
+
       <!-- loading -->
       <div class="modal fade bs-modal-sm" id="loadingDialog" tabindex="-1" role="dialog" aria-labelledby="mySmallModalLabel">
         <div class="modal-dialog modal-sm modal-large">

@@ -72,6 +72,47 @@ leanote edit a1b2c3d4 -n "其他笔记本"          # 移动笔记
 echo "# 新内容" | leanote edit a1b2c3d4 -c -  # 管道更新内容
 ```
 
+## MCP Server
+
+Leanote 桌面客户端启动后会在本地开启 **MCP Server**（Model Context Protocol，Streamable HTTP），让 AI 智能体（Claude Desktop、Cursor 等）通过标准协议管理笔记。
+
+- 端点：`http://127.0.0.1:8912/mcp`（仅绑定本机回环 127.0.0.1，需 app 在运行）
+- 与 CLI 文件 I/O 模式一致：直接读写本地 NeDB 文件，写入的笔记带同步标记（`IsDirty`），app 下次加载/同步时生效
+
+### 工具
+
+| 工具 | 说明 |
+|---|---|
+| `list_notebooks` | 列出所有笔记本及笔记数量 |
+| `list_tags` | 列出所有标签 |
+| `add_note` | 新建 Markdown 笔记（`title` / `content` / `tags` / `notebook`，默认笔记本 "AI札"，不存在则自动创建） |
+| `list_notes` | 列出最近笔记，可按 `notebook` / `tag` 过滤 |
+| `get_note` | 按 ID（或前缀）查看笔记完整内容 |
+| `search_notes` | 按关键字搜索（标题 / 正文 / 标签），按相关度排序 |
+| `update_note` | 更新笔记（`title` / `content` / `tags` / `notebook`） |
+| `delete_note` | 移到回收站 |
+
+### 智能体配置
+
+在 Claude Desktop / Cursor 等的 MCP 配置中加入（Streamable HTTP）：
+
+```json
+{
+  "mcpServers": {
+    "leanote": { "url": "http://127.0.0.1:8912/mcp" }
+  }
+}
+```
+
+### 调试
+
+```bash
+npx @modelcontextprotocol/inspector
+# Transport 选 Streamable HTTP，URL 填 http://127.0.0.1:8912/mcp
+```
+
+仓库内附冒烟测试：`node tests/test_mcp_server.js`（需本机已有 Leanote 数据）。
+
 ## Docs
 
 Please see https://github.com/leanote/desktop-app/wiki

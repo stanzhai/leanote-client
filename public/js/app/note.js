@@ -49,6 +49,8 @@ Note.getItemTplNoImg = function() {
 
 // 定时保存信息
 Note.intervalTime = 10 * 1000; // 10秒
+Note._isSaving = false; // 防重入：是否有保存正在进行
+Note._lastSaveTime = 0; // 防抖：上次保存时间
 Note.startInterval = function() {
     if (Note.interval) {
         clearInterval(Note.interval);
@@ -73,9 +75,13 @@ Note.stopInterval = function(notStartAuto) {
 };
 
 // note = {NoteId, Desc, UserId,...}
+Note.MAX_CACHE_ENTRIES = 200; // 缓存上限
+Note.CONTENT_RETAIN_COUNT = 5; // 保留完整 Content 的最近笔记数
 Note.addNoteCache = function(note) {
         Note.cache[note.NoteId] = note;
         Note.clearCacheByNotebookId(note.NotebookId);
+        Note._trackRecentNote(note);
+        Note.evictCache();
     }
     // content = {NoteId:, Content:}
     // 还可以设置其它的值
@@ -92,7 +98,73 @@ Note.setNoteCache = function(content, clear) {
     if (clear) {
         Note.clearCacheByNotebookId(content.NotebookId);
     }
+    Note._trackRecentNote(content);
+    Note.evictCache();
 }
+
+// 维护最近笔记 ID 排序列表（用于缓存淘汰和命令面板）
+Note._recentNoteIds = [];
+Note._trackRecentNote = function(note) {
+    if (!note || !note.NoteId) return;
+    var idx = Note._recentNoteIds.indexOf(note.NoteId);
+    if (idx >= 0) {
+        Note._recentNoteIds.splice(idx, 1);
+    }
+    Note._recentNoteIds.unshift(note.NoteId);
+    // 保持列表不超过缓存上限的 2 倍
+    if (Note._recentNoteIds.length > Note.MAX_CACHE_ENTRIES * 2) {
+        Note._recentNoteIds = Note._recentNoteIds.slice(0, Note.MAX_CACHE_ENTRIES * 2);
+    }
+};
+
+// 淘汰缓存：超出上限时，先清空旧条目的 Content（保留元数据）；仍超出则删除最旧的
+Note.evictCache = function() {
+    var keys = Object.keys(Note.cache);
+    if (keys.length <= Note.MAX_CACHE_ENTRIES) return;
+
+    // 保留当前活跃笔记 + 最近 CONTENT_RETAIN_COUNT 个的完整 Content
+    var keepContent = {};
+    if (Note.curNoteId) keepContent[Note.curNoteId] = true;
+    for (var i = 0; i < Math.min(Note.CONTENT_RETAIN_COUNT, Note._recentNoteIds.length); i++) {
+        keepContent[Note._recentNoteIds[i]] = true;
+    }
+
+    // 收集候选条目（不在保留列表中的），按更新时间升序排列（最旧的在前）
+    var candidates = [];
+    for (var k = 0; k < keys.length; k++) {
+        var id = keys[k];
+        if (keepContent[id]) continue;
+        var entry = Note.cache[id];
+        candidates.push({ id: id, time: entry && entry.UpdatedTime ? new Date(entry.UpdatedTime).getTime() : 0 });
+    }
+    candidates.sort(function(a, b) { return a.time - b.time; });
+
+    // 第一步：清空旧条目的 Content（释放内存，但保留元数据供列表显示）
+    for (var j = 0; j < candidates.length; j++) {
+        var entry = Note.cache[candidates[j].id];
+        if (entry && entry.Content) {
+            entry.Content = '';
+        }
+    }
+
+    // 第二步：如果仍然超出上限，删除最旧的条目
+    keys = Object.keys(Note.cache);
+    if (keys.length > Note.MAX_CACHE_ENTRIES) {
+        // 重新收集（含已清空 Content 的条目），按时间升序
+        var allSorted = [];
+        for (var m = 0; m < keys.length; m++) {
+            var eid = keys[m];
+            if (keepContent[eid]) continue;
+            var e = Note.cache[eid];
+            allSorted.push({ id: eid, time: e && e.UpdatedTime ? new Date(e.UpdatedTime).getTime() : 0 });
+        }
+        allSorted.sort(function(a, b) { return a.time - b.time; });
+        var excess = keys.length - Note.MAX_CACHE_ENTRIES;
+        for (var n = 0; n < Math.min(excess, allSorted.length); n++) {
+            delete Note.cache[allSorted[n].id];
+        }
+    }
+};
 
 // 删除缓存
 Note.deleteCache = function(noteId) {
@@ -547,7 +619,18 @@ Note.curChangedSaveIt = function(force, callback) {
     var me = Note;
     // 如果当前没有笔记, 不保存
     if (!me.curNoteId) {
-        // console.trace('无当前笔记!!');
+        callback && callback();
+        return;
+    }
+
+    // 防重入：上次保存仍在进行中，跳过本次
+    if (me._isSaving) {
+        console.log('自动保存跳过: 上次保存仍在进行中');
+        callback && callback();
+        return;
+    }
+    // 防抖：两次保存间隔至少 500ms（强制保存除外）
+    if (!force && me._lastSaveTime && Date.now() - me._lastSaveTime < 500) {
         callback && callback();
         return;
     }
@@ -575,6 +658,8 @@ Note.curChangedSaveIt = function(force, callback) {
         Note.clearCacheByNotebookId(hasChanged.NotebookId);
 
         // 保存之
+        me._isSaving = true;
+        me._lastSaveTime = Date.now();
         me.saveInProcess[hasChanged.NoteId] = true;
 
         if (hasChanged.IsNew) {
@@ -587,6 +672,7 @@ Note.curChangedSaveIt = function(force, callback) {
 
         // console.log(hasChanged);
         NoteService.updateNoteOrContent(hasChanged, function(ret) {
+            me._isSaving = false;
             me.saveInProcess[hasChanged.NoteId] = false;
             if (hasChanged.IsNew) {
                 // 缓存之, 后台得到其它信息
@@ -1069,10 +1155,15 @@ Note.renderNotes = function(notes, forNewNote, hasSorted) {
     }
 
     // 20个一次
+    var MAX_VISIBLE = 200; // 单次渲染上限，防止大量笔记阻塞 UI
     var len = notes.length;
-    var c = Math.ceil(len / 20);
+    var renderLimit = len;
+    if (len > MAX_VISIBLE && !forNewNote) {
+        renderLimit = MAX_VISIBLE;
+    }
+    var c = Math.ceil(renderLimit / 20);
 
-    Note._renderNotes(notes, forNewNote, isShared, 1);
+    Note._renderNotes(notes.slice(0, renderLimit), forNewNote, isShared, 1);
 
     // 先设置缓存
     for (var i = 0; i < len; ++i) {
@@ -1088,10 +1179,38 @@ Note.renderNotes = function(notes, forNewNote, hasSorted) {
                 // 防止还没渲染完就点击另一个notebook了
                 return function() {
                     if (renderNotesC == Note.renderNotesC) {
-                        Note._renderNotes(notes, forNewNote, isShared, i + 1);
+                        Note._renderNotes(notes.slice(0, renderLimit), forNewNote, isShared, i + 1);
                     }
                 }
             })(i), i * 2000);
+    }
+
+    // 如果笔记数量超过渲染上限，显示"加载全部"按钮
+    if (len > MAX_VISIBLE && !forNewNote) {
+        var remaining = len - MAX_VISIBLE;
+        var $footer = $(
+            '<div class="note-list-footer" style="padding:12px;text-align:center;cursor:pointer;color:#666;">' +
+            '<span>' + getMsg('Showing') + ' ' + MAX_VISIBLE + ' / ' + len + ' ' + getMsg('notes') + '</span>' +
+            ' <a href="#" class="load-all-notes" style="margin-left:8px;">' + getMsg('Load all') + ' (' + remaining + ' ' + getMsg('more') + ')</a>' +
+            '</div>'
+        );
+        Note.noteItemListO.append($footer);
+        $footer.find('.load-all-notes').on('click', function(e) {
+            e.preventDefault();
+            $footer.remove();
+            // 渲染剩余笔记
+            var remainingNotes = notes.slice(MAX_VISIBLE);
+            var rc = Math.ceil(remainingNotes.length / 20);
+            for (var ri = 0; ri < rc; ri++) {
+                setTimeout(
+                    (function(ri) {
+                        return function() {
+                            var start = ri * 20;
+                            Note._renderNotes(remainingNotes.slice(start, start + 20), forNewNote, isShared, ri + 1);
+                        }
+                    })(ri), ri * 2000);
+            }
+        });
     }
 };
 

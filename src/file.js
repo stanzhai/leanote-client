@@ -567,6 +567,8 @@ var File = {
 		// filePaths = filePaths.split(';');
 		// 复制每一个文件, 保存到数据库中
 		var targets = [];
+		var pendingWrites = 0;
+		for (var k in filePaths) { pendingWrites++; }
 		for(var i in filePaths) {
 			var filePath = filePaths[i];
 			var fileStat = fs.statSync(filePath);
@@ -580,9 +582,7 @@ var File = {
 			var distPath = User.getCurUserAttachsPath() + '/' + rename;
 			var readable = fs.createReadStream(filePath);
 	        // 创建写入流
-	        var writable = fs.createWriteStream(distPath);   
-	        // 通过管道来传输流
-	        readable.pipe(writable);
+	        var writable = fs.createWriteStream(distPath);
 			var attach = {
 				FileId: Common.objectId(),
 				ServerFileId: '',
@@ -597,11 +597,30 @@ var File = {
 				IsDirty: true, // 本地是新添加的, ServerFileId = 0
 				CreatedTime: new Date()
 			};
-			db.attachs.insert(attach);
+			// 错误处理：任一流出错时销毁两个流防止 fd 泄漏
+			var _cleanupDone = false;
+			function _cleanupCopy() {
+				if (_cleanupDone) return;
+				_cleanupDone = true;
+				try { readable.destroy(); } catch (e) {}
+				try { writable.destroy(); } catch (e) {}
+			}
+			readable.on('error', function () { _cleanupCopy(); });
+			writable.on('error', function () { _cleanupCopy(); });
+	        // 通过管道来传输流
+	        readable.pipe(writable);
+			// 等待写入完成后再记录到数据库（修复同步回调时序问题）
+			writable.on('finish', function () {
+				db.attachs.insert(attach);
+				pendingWrites--;
+				if (pendingWrites <= 0) {
+					callback && callback(targets);
+				}
+			});
 			targets.push(attach);
 		}
 
-		callback && callback(targets);
+		// callback 现在由 writable.on('finish') 在所有文件写入完成后异步调用
 	},
 	// 删除不存在的attachs
 	deleteNotExistsAttach: function(noteId, attachs) {
@@ -678,13 +697,26 @@ var File = {
 			// 复制图片
 			var readStream = fs.createReadStream(src);
 			var writeStream = fs.createWriteStream(imagePathAll);
-			readStream.pipe(writeStream);
-			readStream.on('end', function () {
-				callback(imagePathAll);
-			});
+			var cleaned = false;
+			function cleanup() {
+				if (cleaned) return;
+				cleaned = true;
+				try { readStream.destroy(); } catch (e) {}
+				try { writeStream.destroy(); } catch (e) {}
+			}
 			readStream.on('error', function () {
+				cleanup();
 				callback();
 			});
+			writeStream.on('error', function () {
+				cleanup();
+				callback();
+			});
+			// 在 writeStream finish 时回调，确保数据完全写入磁盘
+			writeStream.on('finish', function () {
+				callback(imagePathAll);
+			});
+			readStream.pipe(writeStream);
 		}
 		else {
 			if (src.indexOf('https://leanote.com') == 0) {

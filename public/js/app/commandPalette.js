@@ -220,23 +220,15 @@ var CommandPalette = {
         var $list = me.$recentList;
         $list.empty();
 
-        // Collect all non-trashed, non-deleted notes and sort by UpdatedTime desc
-        var recentNotes = [];
-        for (var id in Note.cache) {
-            if (!id) continue;
-            var note = Note.cache[id];
+        // 使用 Note._recentNoteIds 预排序索引，O(1) 而非 O(N) 全量扫描
+        var recentIds = Note._recentNoteIds || [];
+        var top6 = [];
+        for (var i = 0; i < recentIds.length && top6.length < 6; i++) {
+            var note = Note.cache[recentIds[i]];
             if (!note || note.IsTrash || note.IsDeleted || note.LocalIsDelete) continue;
             if (!('IsMarkdown' in note)) continue;
-            recentNotes.push(note);
+            top6.push(note);
         }
-
-        recentNotes.sort(function(a, b) {
-            var t1 = a.UpdatedTime ? new Date(a.UpdatedTime).getTime() : 0;
-            var t2 = b.UpdatedTime ? new Date(b.UpdatedTime).getTime() : 0;
-            return t2 - t1;
-        });
-
-        var top6 = recentNotes.slice(0, 6);
 
         for (var i = 0; i < top6.length; i++) {
             var note = top6[i];

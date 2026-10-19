@@ -1,3 +1,7 @@
+// 防止终端关闭后 console.log 向已断开 stdout/stderr 写入时触发 EIO 错误
+process.stdout.on('error', () => {});
+process.stderr.on('error', () => {});
+
 // var app = require('electron').app;  // Module to control application life.
 const {app, BrowserWindow, crashReporter, Tray, Menu, ipcMain: ipc, screen} = require('electron');
 var pdfMain = require('./src/pdf_main');
@@ -37,7 +41,7 @@ function saveWinState(bounds) {
       y: bounds.y,
       width: bounds.width,
       height: bounds.height,
-      isMaximized: mainWindow ? mainWindow.isMaximized() : false
+      isMaximized: (mainWindow && !mainWindow.isDestroyed()) ? mainWindow.isMaximized() : false
     }, null, 2));
   } catch (e) {}
 }
@@ -76,7 +80,7 @@ if (!app.makeSingleInstance) {
     app.quit()
   } else {
     app.on('second-instance', (event, commandLine, workingDirectory) => {
-      if (mainWindow) {
+      if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.show();
         if (mainWindow.isMinimized()) {
           mainWindow.restore();
@@ -90,7 +94,7 @@ else {
   // single instance
   const shouldQuit = app.makeSingleInstance((commandLine, workingDirectory) => {
     // Someone tried to run a second instance, we should focus our window.
-    if (mainWindow) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.show();
       if (mainWindow.isMinimized()) {
         mainWindow.restore();
@@ -114,7 +118,7 @@ app.on('window-all-closed', function() {
 // 避免可以启动多个app
 app.on('open-file', function(e) {
   // console.log('reopen');
-  if(mainWindow) {
+  if(mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.show();
     mainWindow.focus();
   } else {
@@ -126,7 +130,7 @@ app.on('open-file', function(e) {
 // var appIsReady = false;
 app.on('activate', function() {
   console.log('activate');
-  if(mainWindow) {
+  if(mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.show();
   }
   else {
@@ -186,7 +190,16 @@ function removeEvents (win) {
 
 function close (e, force) {
   console.log('close:', force);
-  if (mainWindow) {
+  if (force) {
+    // 强制退出：直接销毁窗口并退出
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.destroy();
+      mainWindow = null;
+    }
+    app.quit();
+    return;
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.hide();
     e && e.preventDefault();
     mainWindow.webContents.send('closeWindow');
@@ -206,12 +219,12 @@ function bindEvents (win) {
 
   win.on('focus', function() {
     console.log('focus');
-    if(win && win.webContents)
+    if(win && !win.isDestroyed() && win.webContents)
       win.webContents.send('focusWindow');
   });
   win.on('blur', function() {
     console.log('blur');
-    if(win && win.webContents)
+    if(win && !win.isDestroyed() && win.webContents)
       win.webContents.send('blurWindow');
   });
 
@@ -306,7 +319,7 @@ function openIt() {
   // 前端发来可以关闭了
   ipc.on('quit-app', function(event, arg) {
     console.log('get quit-app request');
-    if (mainWindow) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.destroy();
       mainWindow = null;
     } else {
@@ -338,9 +351,11 @@ function openIt() {
     win2.loadURL('file://' + __dirname + '/' + html);
     mainWindow = win2;
 
-    // remove all events then close it
-    removeEvents(everWindow);
-    everWindow.close();
+    // remove all events then close old window（确保旧窗口未被销毁再操作）
+    if (everWindow && !everWindow.isDestroyed()) {
+      removeEvents(everWindow);
+      everWindow.close();
+    }
 
     if (html.indexOf('note.html') >= 0) {
       bindEvents(mainWindow)
@@ -350,7 +365,7 @@ function openIt() {
   pdfMain.init();
 
   function show () {
-    if (mainWindow) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.show();
       mainWindow.restore();
       mainWindow.focus();
