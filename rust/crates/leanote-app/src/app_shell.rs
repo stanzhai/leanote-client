@@ -6,22 +6,38 @@ use crate::browse::{self, NavNode};
 use crate::conflict_bar;
 use crate::i18n::{self, Lang};
 use crate::theme::{self, Material};
-use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
-use gpui_kit::component::label::Label;
-use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::text::TextView;
 use gpui_kit::assets::IconName as AssetIcon;
-use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, WindowExt as _};
+use gpui_kit::base::Scrollbar;
+use gpui_kit::component::alert::Alert;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
+use gpui_kit::component::resizable_panel;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::text::TextView;
+use gpui_kit::component::{
+    ActiveTheme, Disableable, Icon, IconName, InteractiveElementExt, Sizable, WindowExt as _,
+};
 use gpui_kit::prelude::*;
-use gpui_kit::{px, AnyElement, KeyDownEvent, SharedString, Task, Window};
+use gpui_kit::{
+    px, AnyElement, KeyDownEvent, MouseButton, SharedString, Task, UniformListScrollHandle, Window,
+    WindowControlArea,
+};
 use leanote_core::sync::{Api, NoProgress, SyncProgress, SyncStats};
 use std::sync::{Arc, Mutex};
 
-/// ADR-0003 fixed widths.
+/// Default pane widths (ADR-0003). Issue 18: user-resizable, persisted;
+/// these are the first-run and reset values.
 const LEFT_W: f32 = 224.;
 const MID_W: f32 = 336.;
+/// Issue 18: drag ranges for the left/middle panes.
+const LEFT_RANGE: (f32, f32) = (180., 400.);
+const MID_RANGE: (f32, f32) = (240., 600.);
+/// Issue 18: uniform note-row height — 2-line title (19px each) + meta line
+/// (16px) + py_2 padding (16px) + gap_1 (4px).
+const NOTE_ROW_H: f32 = 74.;
 const READER_W: f32 = 720.;
 /// macOS transparent titlebar height, same material as the sidebar.
 const TITLEBAR_H: f32 = 44.;
@@ -30,11 +46,15 @@ pub enum Phase {
     Login,
     SigningIn,
     /// Progress lines from full_sync, newest last.
-    Syncing { lines: Vec<SharedString> },
+    Syncing {
+        lines: Vec<SharedString>,
+    },
     /// Sync done → three-pane shell.
     Shell,
     /// Login or sync failed → back to login with an error line.
-    Failed { error: SharedString },
+    Failed {
+        error: SharedString,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -51,16 +71,28 @@ enum ConflictChoice {
     KeepBoth,
 }
 
-/// In-flight nav edit (ticket 11): one at a time.
+#[derive(Clone)]
 enum NavEdit {
     /// Create a notebook under this parent ("" = root).
-    NewNotebook { parent: String, name: gpui_kit::Entity<InputState> },
+    NewNotebook {
+        parent: String,
+        name: gpui_kit::Entity<InputState>,
+    },
     /// Rename this notebook.
-    RenameNotebook { id: leanote_core::Id, name: gpui_kit::Entity<InputState> },
+    RenameNotebook {
+        id: leanote_core::Id,
+        name: gpui_kit::Entity<InputState>,
+    },
     /// Move this notebook: picking the target parent.
     MoveNotebook { id: leanote_core::Id },
+    /// Issue 18: move this note to another notebook — the middle list
+    /// swaps to a target picker.
+    MoveNote { id: leanote_core::Id },
     /// Rename this tag.
-    RenameTag { old: String, name: gpui_kit::Entity<InputState> },
+    RenameTag {
+        old: String,
+        name: gpui_kit::Entity<InputState>,
+    },
 }
 
 /// What the middle list is filtered to (left-nav selection).
@@ -100,6 +132,10 @@ pub struct AppShell {
     /// Ticket 13: ⌘K search overlay (dialog-hosted palette + last rows).
     search: crate::search_overlay::SearchOverlay,
     search_rows: Vec<crate::search_overlay::ResultRow>,
+    /// Latest committed query (debounce re-entry takes the newest).
+    search_query: String,
+    /// Debounced ⌘K search task (issue 17 Q6).
+    search_task: Option<Task<()>>,
     // --- Ticket 12 rich-text state ---
     /// Set after a successful Convert to Markdown; cleared when the
     /// selection changes. Rendered as a one-line feedback next to the badge.
@@ -113,15 +149,36 @@ pub struct AppShell {
     history_open: bool,
     /// Which history row is previewed (None = list view).
     history_preview: Option<leanote_core::Id>,
+    // --- Issue 17 list caches + virtualization ---
+    /// List caches — invalidated by invalidate_lists() on any mutation
+    /// (select/sync/save/nav edit/...). Avoids re-querying the DB every frame.
+    cached_notebook_nodes: Option<Vec<NavNode>>,
+    cached_tag_nodes: Option<Vec<NavNode>>,
+    cached_notebook_names: Option<std::collections::HashMap<String, String>>,
+    cached_visible_notes: Option<Vec<leanote_core::Note>>,
+    /// Scroll handles for the virtualized lists.
+    notes_scroll: UniformListScrollHandle,
+    notebooks_scroll: UniformListScrollHandle,
+    tags_scroll: UniformListScrollHandle,
+    // --- Issue 17 vim mode (ADR-0004) ---
+    /// Pure key-grammar state machine; side effects execute in the shell.
+    vim: crate::vim::VimState,
+    /// Vim enabled (toolbar toggle; persisted as prefs.vim_default).
+    vim_enabled: bool,
 }
 
-/// Right-pane edit mode (ticket 10): title + multiline source editor with
-/// preview toggle. Buffer lives in the kit's TextareaState so IME
-/// composition is handled entirely by the kit.
+/// Right-pane edit mode (issues 10+17): title + source editor with syntax
+/// highlighting. Buffer lives in the kit's EditorState so IME composition is
+/// handled entirely by the kit; `saved_content` is the last persisted text so
+/// an unchanged editor never writes to the store (issue 17 Q2/Q8).
 struct EditState {
     note_id: leanote_core::Id,
     title: gpui_kit::Entity<InputState>,
-    content: gpui_kit::Entity<TextareaState>,
+    content: gpui_kit::Entity<EditorState>,
+    /// Last persisted content — auto-save compares against it.
+    saved_content: String,
+    /// True when the buffer has changed since last persist (drives autosave).
+    dirty: bool,
     /// Show rendered preview instead of source.
     preview: bool,
     /// Set for one frame after a save, to flash "Saved".
@@ -165,7 +222,9 @@ impl AppShell {
             s
         });
         let password = cx.new(|cx| {
-            let mut s = InputState::new(window, cx).placeholder("••••••••").masked(true);
+            let mut s = InputState::new(window, cx)
+                .placeholder("••••••••")
+                .masked(true);
             if let Some((_, _, p)) = fake_prefill {
                 s = s.default_value(p);
             }
@@ -191,6 +250,7 @@ impl AppShell {
             lang,
             user_id: user_id.unwrap_or_else(|| "user1".to_string()),
             sync_status: None,
+            vim_enabled: crate::prefs::Prefs::load(&data_dir).vim_default,
             data_dir,
             host,
             email,
@@ -203,11 +263,21 @@ impl AppShell {
             export_status: None,
             search: crate::search_overlay::SearchOverlay::new(window, cx),
             search_rows: Vec::new(),
+            search_query: String::new(),
+            search_task: None,
             converted_note: None,
             nav_edit: None,
             editing: None,
             history_open: false,
             history_preview: None,
+            cached_notebook_nodes: None,
+            cached_tag_nodes: None,
+            cached_notebook_names: None,
+            cached_visible_notes: None,
+            notes_scroll: UniformListScrollHandle::new(),
+            notebooks_scroll: UniformListScrollHandle::new(),
+            tags_scroll: UniformListScrollHandle::new(),
+            vim: crate::vim::VimState::new(),
         }
     }
 
@@ -247,7 +317,8 @@ impl AppShell {
                 let Ok(store) = leanote_core::Store::open(dir.clone(), "user1".into()) else {
                     return Err("cannot open local store".into());
                 };
-                let account = Api::login(&host, &email, &password, &store).map_err(|e| e.to_string())?;
+                let account =
+                    Api::login(&host, &email, &password, &store).map_err(|e| e.to_string())?;
                 // Re-open the store keyed to the real user so synced rows land
                 // under the account that owns them.
                 let Ok(store) = leanote_core::Store::open(dir, account.user_id.clone()) else {
@@ -255,7 +326,9 @@ impl AppShell {
                 };
                 let api = Api::for_account(&account);
                 let uid = account.user_id.clone();
-                leanote_core::sync::full_sync(&api, &store, &progress).map(|s| (uid, s)).map_err(|e| e.to_string())
+                leanote_core::sync::full_sync(&api, &store, &progress)
+                    .map(|s| (uid, s))
+                    .map_err(|e| e.to_string())
             })();
             result
         });
@@ -292,6 +365,7 @@ impl AppShell {
                     Ok((user_id, _stats)) => {
                         shell.user_id = user_id;
                         shell.phase = Phase::Shell;
+                        shell.invalidate_lists();
                     }
                     Err(e) => {
                         leanote_core::logging::log("sync", &e);
@@ -333,6 +407,7 @@ impl AppShell {
                         shell.sync_status = Some(Err(e.clone().into()));
                     }
                 }
+                shell.invalidate_lists();
                 cx.notify();
             });
         }));
@@ -353,7 +428,9 @@ impl AppShell {
     fn logout(&mut self, cx: &mut gpui_kit::Context<Self>) {
         if let Some(acct) = self.store().and_then(|s| s.active_account().ok().flatten()) {
             Api::for_account(&acct).logout();
-            if let Ok(store) = leanote_core::Store::open(self.data_dir.clone(), acct.user_id.clone()) {
+            if let Ok(store) =
+                leanote_core::Store::open(self.data_dir.clone(), acct.user_id.clone())
+            {
                 let _ = store.deactivate_account();
             }
         }
@@ -361,6 +438,7 @@ impl AppShell {
         self.sync_status = None;
         self.phase = Phase::Login;
         self._task = None;
+        self.invalidate_lists();
         cx.notify();
     }
 
@@ -378,78 +456,144 @@ impl AppShell {
         leanote_core::Store::open(self.data_dir.clone(), self.user_id.clone()).ok()
     }
 
-    /// Notes for the current nav selection, in list order.
-    fn visible_notes(&self) -> Vec<leanote_core::Note> {
-        let Some(store) = self.store() else { return Vec::new() };
-        let res = match &self.nav {
-            NavSelection::AllNotes => store.list_notes_filtered(None, false),
-            NavSelection::Starred => store.list_notes_filtered(None, true),
-            NavSelection::Trash => store.list_trash(),
-            NavSelection::Notebook(id) => {
-                store.list_notes_filtered(Some(&leanote_core::Id(id.clone())), false)
-            }
-            NavSelection::Tag(tag) => store.list_notes_by_tag(tag),
-        };
-        res.unwrap_or_default()
+    /// Issue 17: invalidate list caches — call after ANY mutation that can
+    /// change notes/notebooks/tags (select, sync, save, nav edit, ...).
+    fn invalidate_lists(&mut self) {
+        self.cached_tag_nodes = None;
+        self.cached_notebook_names = None;
+        self.cached_visible_notes = None;
     }
 
-    fn notebook_names(&self) -> std::collections::HashMap<String, String> {
-        self.store()
-            .and_then(|s| s.notebooks().ok())
-            .map(|nbs| {
-                nbs.into_iter()
-                    .map(|nb| (nb.notebook_id.to_string(), nb.title))
-                    .collect::<std::collections::HashMap<_, _>>()
-            })
-            .unwrap_or_default()
+    /// Notes for the current nav selection, in list order (cached).
+    fn visible_notes(&mut self) -> &Vec<leanote_core::Note> {
+        if self.cached_visible_notes.is_none() {
+            let notes =
+                self.store()
+                    .map(|store| {
+                        let res = match &self.nav {
+                            NavSelection::AllNotes => store.list_notes_filtered(None, false),
+                            NavSelection::Starred => store.list_notes_filtered(None, true),
+                            NavSelection::Trash => store.list_trash(),
+                            NavSelection::Notebook(id) => store
+                                .list_notes_filtered(Some(&leanote_core::Id(id.clone())), false),
+                            NavSelection::Tag(tag) => store.list_notes_by_tag(tag),
+                        };
+                        res.unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+            self.cached_visible_notes = Some(notes);
+        }
+        self.cached_visible_notes.as_ref().unwrap()
     }
 
-    /// Nav-tree rows for the Notebooks group (nesting + Seq + counts).
-    fn notebook_nav_nodes(&self) -> Vec<NavNode> {
-        let Some(store) = self.store() else { return Vec::new() };
-        let (Ok(nbs), Ok(count_rows)) = (store.notebooks(), store.notebook_note_counts()) else {
-            return Vec::new();
-        };
-        let counts: std::collections::HashMap<String, i64> =
-            count_rows.into_iter().map(|(id, c)| (id.to_string(), c)).collect();
-        browse::notebook_nodes(
-            &nbs.iter()
-                .map(|nb| (nb.notebook_id.to_string(), nb.title.clone(), nb.parent_notebook_id.clone(), nb.seq))
-                .collect::<Vec<_>>(),
-            &counts,
-        )
+    fn notebook_names(&mut self) -> &std::collections::HashMap<String, String> {
+        if self.cached_notebook_names.is_none() {
+            let names = self
+                .store()
+                .and_then(|s| s.notebooks().ok())
+                .map(|nbs| {
+                    nbs.into_iter()
+                        .map(|nb| (nb.notebook_id.to_string(), nb.title))
+                        .collect::<std::collections::HashMap<_, _>>()
+                })
+                .unwrap_or_default();
+            self.cached_notebook_names = Some(names);
+        }
+        self.cached_notebook_names.as_ref().unwrap()
     }
 
-    /// Nav rows for the Tags group: tag name → live note count via
+    /// Nav-tree rows for the Notebooks group (nesting + Seq + counts, cached).
+    fn notebook_nav_nodes(&mut self) -> &Vec<NavNode> {
+        if self.cached_notebook_nodes.is_none() {
+            let nodes = self
+                .store()
+                .map(|store| {
+                    let (Ok(nbs), Ok(count_rows)) =
+                        (store.notebooks(), store.notebook_note_counts())
+                    else {
+                        return Vec::new();
+                    };
+                    let counts: std::collections::HashMap<String, i64> = count_rows
+                        .into_iter()
+                        .map(|(id, c)| (id.to_string(), c))
+                        .collect();
+                    browse::notebook_nodes(
+                        &nbs.iter()
+                            .map(|nb| {
+                                (
+                                    nb.notebook_id.to_string(),
+                                    nb.title.clone(),
+                                    nb.parent_notebook_id.clone(),
+                                    nb.seq,
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                        &counts,
+                    )
+                })
+                .unwrap_or_default();
+            self.cached_notebook_nodes = Some(nodes);
+        }
+        self.cached_notebook_nodes.as_ref().unwrap()
+    }
+
+    /// Nav rows for the Tags group (cached): tag name → live note count via
     /// list_notes_by_tag (the tags table's Count stays 1 after sync).
-    fn tag_nav_nodes(&self) -> Vec<NavNode> {
-        let Some(store) = self.store() else { return Vec::new() };
-        let Ok(tags) = store.tags() else { return Vec::new() };
-        tags.into_iter()
-            .filter(|t| !t.is_deleted)
-            .map(|t| NavNode {
-                count: store.list_notes_by_tag(&t.tag).map(|n| n.len() as i64).unwrap_or(0),
-                id: t.tag.clone(),
-                title: format!("# {}", t.tag),
-                depth: 0,
-            })
-            .collect()
+    fn tag_nav_nodes(&mut self) -> &Vec<NavNode> {
+        if self.cached_tag_nodes.is_none() {
+            let nodes = self
+                .store()
+                .map(|store| {
+                    let Ok(tags) = store.tags() else {
+                        return Vec::new();
+                    };
+                    tags.into_iter()
+                        .filter(|t| !t.is_deleted)
+                        .map(|t| NavNode {
+                            count: store
+                                .list_notes_by_tag(&t.tag)
+                                .map(|n| n.len() as i64)
+                                .unwrap_or(0),
+                            id: t.tag.clone(),
+                            title: format!("# {}", t.tag),
+                            depth: 0,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.cached_tag_nodes = Some(nodes);
+        }
+        self.cached_tag_nodes.as_ref().unwrap()
     }
 
     fn select_nav(&mut self, nav: NavSelection, cx: &mut gpui_kit::Context<Self>) {
         self.nav = nav;
         self.selected = None; // new filter → no stale reader content
         self.close_editor();
+        self.invalidate_lists();
         cx.notify();
     }
 
-    fn select_note(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
+    fn select_note(
+        &mut self,
+        id: leanote_core::Id,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        // Issue 17 Q6: local recents (prefs).
+        let dir = self.data_dir.clone();
+        let mut p = crate::prefs::Prefs::load(&dir);
+        p.push_recent(&id.to_string());
+        p.save(&dir);
+
         self.selected = Some(id);
         self.converted_note = None;
         self.close_editor();
+        self.invalidate_lists();
+        // Issue 17 Q2/Q8: a live markdown note opens straight in the editor.
+        self.start_editing(window, cx);
         cx.notify();
     }
-
 
     fn close_editor(&mut self) {
         self.editing = None;
@@ -459,54 +603,111 @@ impl AppShell {
 
     /// Enter edit mode for the selected live markdown note. Buffer is seeded
     /// from the store; all editing (incl. IME composition) stays inside the
-    /// kit's input state — this code never mutates the buffer on key events.
-    fn start_editing(
-        &mut self,
-        window: &mut Window,
-        cx: &mut gpui_kit::Context<Self>,
-    ) {
-        let Some(id) = self.selected.clone() else { return };
-        let Some(note) = self.store().and_then(|s| s.get_note_any(&id).ok().flatten()) else {
+    /// kit's editor state — this code never mutates the buffer on key events.
+    /// InputEvent::Change marks the buffer dirty and schedules the debounced
+    /// auto-save (issue 17 Q8).
+    fn start_editing(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        let Some(note) = self
+            .store()
+            .and_then(|s| s.get_note_any(&id).ok().flatten())
+        else {
             return;
         };
         if !note.is_markdown || note.is_trash || note.is_deleted {
             return;
         }
         let title = cx.new(|cx| InputState::new(window, cx).default_value(note.title.clone()));
-        let content =
-            cx.new(|cx| TextareaState::new(window, cx).default_value(note.content.clone()));
+        let content = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("markdown")
+                .line_number(false)
+                .folding(false)
+                .soft_wrap(true)
+                .default_value(note.content.clone())
+        });
+        // Buffer changes → dirty + 800ms debounced write-through.
+        cx.subscribe(&content, |this, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change) {
+                if let Some(ed) = &mut this.editing {
+                    ed.dirty = true;
+                }
+                this.schedule_autosave(cx);
+            }
+        })
+        .detach();
         self.editing = Some(EditState {
             note_id: id,
             title,
             content,
+            saved_content: note.content,
+            dirty: false,
             preview: false,
             saved_flash: false,
         });
+        // Issue 17 Q12: every session starts in normal mode.
+        self.vim = crate::vim::VimState::new();
         self.history_open = false;
         self.history_preview = None;
         cx.notify();
     }
 
-    /// Save button / ⌘S: write through save_note_with_history (snapshot of
-    /// the pre-change content, IsDirty=1 so sync pushes it).
+    /// Issue 17 Q8: 800ms after the last keystroke, flush to the store (if
+    /// the text actually changed). Restarted on every buffer change.
+    fn schedule_autosave(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        self._task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(800))
+                .await;
+            let _ = this.update(cx, |shell, cx| shell.autosave_flush(cx));
+        }));
+    }
+
+    fn autosave_flush(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        let Some(ed) = &self.editing else { return };
+        if !ed.dirty {
+            return;
+        }
+        let content = ed.content.read(cx).value().to_string();
+        if content == ed.saved_content {
+            // Q8: no real change → never write, never dirty the sync row.
+            if let Some(ed) = &mut self.editing {
+                ed.dirty = false;
+            }
+            return;
+        }
+        self.save_editor(cx);
+    }
+
+    /// ⌘S / autosave: write through save_note_with_history (snapshot of the
+    /// pre-change content, IsDirty=1 so sync pushes it). Unchanged text is a
+    /// no-op (issue 17 Q8).
     fn save_editor(&mut self, cx: &mut gpui_kit::Context<Self>) {
         let Some(ed) = &self.editing else { return };
         let title = ed.title.read(cx).value().to_string();
         let content = ed.content.read(cx).value().to_string();
         let id = ed.note_id.clone();
-        if let Some(store) = self.store() {
-            let _ = store.save_note_with_history(
-                &id,
-                leanote_core::NoteUpdate {
-                    title: Some(title),
-                    content: Some(content),
-                    ..Default::default()
-                },
-            );
+        let changed = content != ed.saved_content;
+        if changed {
+            if let Some(store) = self.store() {
+                let _ = store.save_note_with_history(
+                    &id,
+                    leanote_core::NoteUpdate {
+                        title: Some(title),
+                        content: Some(content.clone()),
+                        ..Default::default()
+                    },
+                );
+            }
         }
         if let Some(ed) = &mut self.editing {
+            ed.dirty = false;
+            ed.saved_content = content;
             ed.saved_flash = true;
         }
+        self.invalidate_lists();
         cx.notify();
     }
 
@@ -514,6 +715,231 @@ impl AppShell {
     fn stop_editing(&mut self, cx: &mut gpui_kit::Context<Self>) {
         self.close_editor();
         cx.notify();
+    }
+
+    /// Persist vim_enabled to prefs.json (issue 17 Q12).
+    fn save_vim_pref(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        let dir = self.data_dir.clone();
+        let mut p = crate::prefs::Prefs::load(&dir);
+        p.vim_default = self.vim_enabled;
+        p.save(&dir);
+        let _ = cx;
+    }
+
+    /// Issue 17 Q7: appearance pref → disk + live theme replay.
+    fn set_appearance(&mut self, ix: usize, cx: &mut gpui_kit::Context<Self>) {
+        let dir = self.data_dir.clone();
+        let mut p = crate::prefs::Prefs::load(&dir);
+        p.appearance = match ix {
+            0 => crate::prefs::AppearancePref::Follow,
+            1 => crate::prefs::AppearancePref::Light,
+            _ => crate::prefs::AppearancePref::Dark,
+        };
+        p.save(&dir);
+        match p.appearance {
+            crate::prefs::AppearancePref::Follow => {
+                gpui_kit::component::Theme::sync_system_appearance(None, cx)
+            }
+            crate::prefs::AppearancePref::Light => {
+                gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Light, None, cx);
+            }
+            crate::prefs::AppearancePref::Dark => {
+                gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+            }
+        }
+        let palette = p.editor_palette.clone();
+        gpui_kit::component::Theme::update(cx, move |theme| {
+            crate::apply_wake_theme(theme, &palette)
+        });
+        cx.notify();
+    }
+
+    /// Issue 17 Q7: editor palette pref → disk + live replay.
+    fn set_editor_palette(&mut self, ix: usize, cx: &mut gpui_kit::Context<Self>) {
+        let dir = self.data_dir.clone();
+        let mut p = crate::prefs::Prefs::load(&dir);
+        p.editor_palette = match ix {
+            1 => "warm".into(),
+            2 => "solarized".into(),
+            _ => String::new(),
+        };
+        p.save(&dir);
+        let palette = p.editor_palette.clone();
+        gpui_kit::component::Theme::update(cx, move |theme| {
+            crate::apply_wake_theme(theme, &palette)
+        });
+        cx.notify();
+    }
+
+    /// Issue 17 Q7: language pref → disk + live switch.
+    fn set_lang(&mut self, ix: usize, cx: &mut gpui_kit::Context<Self>) {
+        let dir = self.data_dir.clone();
+        let mut p = crate::prefs::Prefs::load(&dir);
+        p.lang = match ix {
+            1 => crate::prefs::LangPref::Zh,
+            2 => crate::prefs::LangPref::En,
+            _ => crate::prefs::LangPref::Follow,
+        };
+        p.save(&dir);
+        self.lang = match p.lang {
+            crate::prefs::LangPref::Follow => i18n::system_lang(),
+            crate::prefs::LangPref::Zh => Lang::Zh,
+            crate::prefs::LangPref::En => Lang::En,
+        };
+        cx.notify();
+    }
+
+    /// Issue 17 Q11/Q12: one bare keypress in normal/visual mode. Returns
+    /// true when consumed (the caller must stop propagation so the editor
+    /// never sees it as text input). Insert mode returns false — the kit
+    /// editor handles everything; `escape` alone falls back to here.
+    fn handle_vim_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> bool {
+        if !self.vim_enabled {
+            return false;
+        }
+        let Some(ed) = self.editing.as_ref() else {
+            return false;
+        };
+        if !ed.content.read(cx).has_selection_focus(window, cx) {
+            return false;
+        }
+        let m = &ev.keystroke.modifiers;
+        let bare = !m.platform && !m.control && !m.alt && !m.shift;
+        let esc = ev.keystroke.key == "escape";
+        if self.vim.mode == crate::vim::VimMode::Insert {
+            if !esc {
+                return false; // insert mode: everything flows to the editor
+            }
+        } else if !bare {
+            return false; // normal/visual: only bare keys are vim grammar
+        }
+        let key_char = ev
+            .keystroke
+            .key_char
+            .as_deref()
+            .and_then(|s| s.chars().next());
+        let action = self.vim.handle_key(&ev.keystroke.key, key_char);
+        if matches!(action, crate::vim::VimAction::Consumed) {
+            return true;
+        }
+        self.exec_vim_action(action, window, cx);
+        true
+    }
+
+    /// Execute one VimAction against the focused kit editor.
+    fn exec_vim_action(
+        &mut self,
+        action: crate::vim::VimAction,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        use crate::vim::{DeleteOp, Motion, Op, VimAction};
+        use gpui_kit::component::input as in_actions;
+        let Some(ed) = self.editing.as_ref() else {
+            return;
+        };
+        let editor = ed.content.clone();
+        match action {
+            VimAction::Dispatch(motion) => {
+                let act: Box<dyn gpui_kit::Action> = match motion {
+                    Motion::Left => Box::new(in_actions::MoveLeft),
+                    Motion::Right => Box::new(in_actions::MoveRight),
+                    Motion::Up => Box::new(in_actions::MoveUp),
+                    Motion::Down => Box::new(in_actions::MoveDown),
+                    Motion::Home => Box::new(in_actions::MoveHome),
+                    Motion::End => Box::new(in_actions::MoveEnd),
+                    Motion::Start => Box::new(in_actions::MoveToStart),
+                    Motion::Finish => Box::new(in_actions::MoveToEnd),
+                    Motion::NextWord => Box::new(in_actions::MoveToNextWord),
+                    Motion::PrevWord => Box::new(in_actions::MoveToPreviousWord),
+                };
+                window.dispatch_action(act, cx);
+            }
+            VimAction::DispatchDelete(op) => {
+                let act: Box<dyn gpui_kit::Action> = match op {
+                    DeleteOp::Char => Box::new(in_actions::Delete),
+                    DeleteOp::ToNextWordEnd => Box::new(in_actions::DeleteToNextWordEnd),
+                    DeleteOp::ToLineStart => Box::new(in_actions::DeleteToBeginningOfLine),
+                    DeleteOp::ToLineEnd => Box::new(in_actions::DeleteToEndOfLine),
+                };
+                window.dispatch_action(act, cx);
+            }
+            VimAction::Undo => window.dispatch_action(Box::new(in_actions::Undo), cx),
+            VimAction::LineOp(op, row) => {
+                editor.update(cx, |state, cx| {
+                    use gpui_kit::component::input::RopeExt;
+                    let text = state.text().clone();
+                    let start = text.line_start_offset(row);
+                    let end = text.line_end_offset(row);
+                    match op {
+                        Op::Yank => {
+                            self.vim.register = Some(state.text().slice_line(row).to_string());
+                        }
+                        Op::Delete | Op::Change => {
+                            self.vim.register = Some(state.text().slice_line(row).to_string());
+                            state.set_selected_range(start..end, cx);
+                            state.replace("", window, cx);
+                            if op == Op::Change {
+                                self.vim.set_mode(crate::vim::VimMode::Insert);
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+            VimAction::Paste => {
+                let Some(text) = self.vim.register.clone() else {
+                    return;
+                };
+                editor.update(cx, |state, cx| {
+                    state.insert(text, window, cx);
+                    cx.notify();
+                });
+            }
+            VimAction::EnterInsert {
+                append,
+                open_below,
+                open_above,
+            } => {
+                editor.update(cx, |state, cx| {
+                    if append {
+                        window.dispatch_action(Box::new(in_actions::MoveRight), cx);
+                    }
+                    if open_below || open_above {
+                        use gpui_kit::component::input::RopeExt;
+                        let row = state.cursor_position().line as usize;
+                        let text = state.text().clone();
+                        let offset = if open_below {
+                            text.line_end_offset(row)
+                        } else {
+                            text.line_start_offset(row)
+                        };
+                        state.set_selected_range(offset..offset, cx);
+                        state.insert("\n", window, cx);
+                    }
+                    cx.notify();
+                });
+            }
+            VimAction::EnterVisual { .. } | VimAction::LeaveVisual => {
+                // mode already switched by the state machine; the selection
+                // anchor is handled by vim.rs on subsequent motions.
+                cx.notify();
+            }
+            VimAction::ChangeThenInsert(op) => {
+                self.exec_vim_action(crate::vim::VimAction::DispatchDelete(op), window, cx);
+                self.vim.set_mode(crate::vim::VimMode::Insert);
+            }
+            VimAction::Command(cmd) => match cmd {
+                crate::vim::Cmd::Write => self.save_editor(cx),
+                crate::vim::Cmd::Quit => self.stop_editing(cx),
+            },
+            VimAction::Consumed => {}
+        }
     }
 
     /// New note in the current nav context's notebook (IsNew=1, dirty) and
@@ -525,9 +951,9 @@ impl AppShell {
             None => return,
         };
         let notebook_title = match &self.nav {
-            NavSelection::Notebook(id) => store
-                .notebook_title(id)
-                .unwrap_or_else(|_| id.to_string()),
+            NavSelection::Notebook(id) => {
+                store.notebook_title(id).unwrap_or_else(|_| id.to_string())
+            }
             _ => store
                 .notebooks()
                 .unwrap_or_default()
@@ -551,6 +977,7 @@ impl AppShell {
         }
         self.selected = Some(note.note_id.clone());
         self.close_editor();
+        self.invalidate_lists();
         cx.notify();
         self.start_editing(window, cx);
     }
@@ -563,9 +990,15 @@ impl AppShell {
         let Some(ed) = &self.editing else { return };
         let note_id = ed.note_id.clone();
         let Some(store) = self.store() else { return };
-        if store.restore_history(&note_id, &history_id).ok().flatten().is_some() {
+        if store
+            .restore_history(&note_id, &history_id)
+            .ok()
+            .flatten()
+            .is_some()
+        {
             self.close_editor();
             self.selected = Some(note_id);
+            self.invalidate_lists();
             self.start_editing(window, cx); // reopen seeded with restored content
         }
     }
@@ -580,36 +1013,76 @@ impl AppShell {
     pub(crate) fn overlay_rows(&self) -> &[crate::search_overlay::ResultRow] {
         &self.search_rows
     }
+}
 
-    /// Committed query → unified core search → rows. IME-safe: the palette
-    /// only calls this on `InputEvent::Change` (committed text).
+impl AppShell {
+    /// Committed query → unified core search → rows, debounced 150ms
+    /// (issue 17 Q6). IME-safe: the palette only calls this on
+    /// `InputEvent::Change` (committed text).
     pub(crate) fn run_overlay_search(&mut self, query: &str, cx: &mut gpui_kit::Context<Self>) {
-        self.search_rows = if crate::search_overlay::should_search(query, false) {
-            self.search_store(query)
-        } else {
-            Vec::new()
-        };
-        cx.notify();
+        self.search_query = query.to_string();
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(150))
+                .await;
+            let _ = this.update(cx, |shell, cx| {
+                let q = shell.search_query.clone();
+                shell.search_rows = if crate::search_overlay::should_search(&q, false) {
+                    shell.search_store(&q)
+                } else {
+                    Vec::new()
+                };
+                cx.notify();
+            });
+        }));
     }
 
-    /// ↩ on a row: open the note in the reader (`selected` drives it), then
+    /// ↩ on a row: open the note in the editor (`selected` drives it), then
     /// close the overlay. The middle list keeps its filter/nav untouched.
+    /// Issue 17 Q6: with an empty query, section 1 = recents (section 0 is
+    /// quick actions, which carry their own actions).
     pub(crate) fn confirm_overlay(
         &mut self,
         index: gpui_kit::component::IndexPath,
         window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) {
-        if let Some(row) = self.search_rows.get(index.row) {
-            let id = leanote_core::Id(row.note_id.clone());
-            self.select_note(id, cx);
+        if self.search_query.is_empty() && index.section == 1 {
+            let recents = self.recent_rows();
+            if let Some((id, _)) = recents.get(index.row).cloned() {
+                self.select_note(leanote_core::Id(id), window, cx);
+            }
+        } else if !self.search_query.is_empty() {
+            if let Some(row) = self.search_rows.get(index.row) {
+                let id = leanote_core::Id(row.note_id.clone());
+                self.select_note(id, window, cx);
+            }
         }
         window.close_dialog(cx);
     }
 
+    /// Issue 17 Q6: recent note ids (prefs) resolved to titles; dead ids
+    /// (deleted notes) are skipped.
+    pub(crate) fn recent_rows(&self) -> Vec<(String, String)> {
+        let prefs = crate::prefs::Prefs::load(&self.data_dir);
+        prefs
+            .recents
+            .iter()
+            .filter_map(|id| {
+                let note = self
+                    .store()
+                    .and_then(|s| s.get_note_any(&leanote_core::Id(id.clone())).ok().flatten())?;
+                Some((id.clone(), note.title))
+            })
+            .collect()
+    }
     fn search_store(&self, query: &str) -> Vec<crate::search_overlay::ResultRow> {
-        let Some(store) = self.store() else { return Vec::new() };
-        let hits = store.search(query, crate::search_overlay::RESULT_LIMIT).unwrap_or_default();
+        let Some(store) = self.store() else {
+            return Vec::new();
+        };
+        let hits = store
+            .search(query, crate::search_overlay::RESULT_LIMIT)
+            .unwrap_or_default();
         crate::search_overlay::format_rows(&hits, |id| {
             store.notebook_title(id).unwrap_or_else(|_| id.to_string())
         })
@@ -620,6 +1093,35 @@ impl AppShell {
         if let Some(store) = self.store() {
             let _ = store.toggle_star(&id);
         }
+        self.invalidate_lists();
+        cx.notify();
+    }
+
+    /// Issue 18: context-menu delete — trash a live note (soft delete,
+    /// syncs back to the server like the web UI's delete).
+    fn delete_note(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
+        if let Some(store) = self.store() {
+            let _ = store.trash_note(&id);
+        }
+        if self.selected.as_ref() == Some(&id) {
+            self.selected = None;
+        }
+        self.invalidate_lists();
+        cx.notify();
+    }
+
+    /// Issue 18: context-menu move — reassign the note's notebook.
+    fn move_note_to(
+        &mut self,
+        id: leanote_core::Id,
+        notebook: String,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if let Some(store) = self.store() {
+            let _ = store.set_notebook(&id, &leanote_core::Id(notebook));
+        }
+        self.nav_edit = None;
+        self.invalidate_lists();
         cx.notify();
     }
 
@@ -649,6 +1151,7 @@ impl AppShell {
                 }
             }
         }
+        self.invalidate_lists();
         cx.notify();
     }
 
@@ -661,6 +1164,7 @@ impl AppShell {
             }
         }
         self.selected = None;
+        self.invalidate_lists();
         cx.notify();
     }
 
@@ -669,6 +1173,7 @@ impl AppShell {
             let _ = store.hard_delete_note(&id);
         }
         self.selected = None;
+        self.invalidate_lists();
         cx.notify();
     }
 
@@ -677,6 +1182,7 @@ impl AppShell {
             let _ = store.empty_trash();
         }
         self.selected = None;
+        self.invalidate_lists();
         cx.notify();
     }
 
@@ -707,7 +1213,9 @@ impl AppShell {
 
     /// Selected note → HTML (`md=false`) or Markdown (`md=true`) file.
     fn export_selected_file(&mut self, md: bool, cx: &mut gpui_kit::Context<Self>) {
-        let Some(n) = self.selected_note() else { return };
+        let Some(n) = self.selected_note() else {
+            return;
+        };
         let name = format!(
             "{}.{}",
             crate::export::safe_filename(&n.title),
@@ -727,7 +1235,9 @@ impl AppShell {
     /// authority). Any failure — not synced, no account, transport, server
     /// error — falls back to a local HTML export with the reason shown.
     fn export_selected_pdf(&mut self, cx: &mut gpui_kit::Context<Self>) {
-        let Some(n) = self.selected_note() else { return };
+        let Some(n) = self.selected_note() else {
+            return;
+        };
         let (server_id, account) = match self.store() {
             Some(store) => (
                 store.note_server_id(&n.note_id.to_string()).ok().flatten(),
@@ -752,11 +1262,8 @@ impl AppShell {
                     } else {
                         fell_back.clone()
                     };
-                    std::fs::write(
-                        path.with_extension("html"),
-                        crate::export::note_to_html(&n),
-                    )
-                    .map_err(|e| e.to_string())?;
+                    std::fs::write(path.with_extension("html"), crate::export::note_to_html(&n))
+                        .map_err(|e| e.to_string())?;
                     Err(reason)
                 }
             }
@@ -782,7 +1289,6 @@ impl AppShell {
     }
 }
 
-
 /// Save-panel default directory (std only).
 fn home_dir() -> std::path::PathBuf {
     std::env::var_os("HOME")
@@ -805,6 +1311,7 @@ impl AppShell {
                 self.converted_note = Some(id);
             }
         }
+        self.invalidate_lists();
         cx.notify();
     }
 }
@@ -884,20 +1391,27 @@ impl AppShell {
                     }
                 }
             }
-            // MoveNotebook resolves directly in move_notebook_to
-            Some(NavEdit::MoveNotebook { .. }) | None => {}
+            // MoveNotebook / MoveNote resolve directly in their *_to fns.
+            Some(NavEdit::MoveNotebook { .. }) | Some(NavEdit::MoveNote { .. }) | None => {}
         }
+        self.invalidate_lists();
         cx.notify();
     }
 
     /// Context-menu "Move to…" target chosen: reparent as the last child.
     /// (Full drag-reorder is the drag-drop ticket's UI; Seq rewriting and
     /// the sibling-group push semantics are identical either way.)
-    fn move_notebook_to(&mut self, id: leanote_core::Id, parent: String, cx: &mut gpui_kit::Context<Self>) {
+    fn move_notebook_to(
+        &mut self,
+        id: leanote_core::Id,
+        parent: String,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
         if let Some(store) = self.store() {
             let _ = store.move_notebook(&id, &parent, usize::MAX, &[]);
         }
         self.nav_edit = None;
+        self.invalidate_lists();
         cx.notify();
     }
 
@@ -909,6 +1423,7 @@ impl AppShell {
             self.nav = NavSelection::AllNotes;
             self.selected = None;
         }
+        self.invalidate_lists();
         cx.notify();
     }
 
@@ -920,12 +1435,118 @@ impl AppShell {
             self.nav = NavSelection::AllNotes;
             self.selected = None;
         }
+        self.invalidate_lists();
         cx.notify();
     }
 }
 
+/// One note entry for the virtualized middle list. Issue 18: fixed row
+/// height so every row (and thus its selection band) is identical —
+/// uniform_list is an equal-height model. Title wraps up to 2 lines then
+/// ellipsizes; meta is one truncated line.
+/// `shell` (weak) routes the click to select_note — uniform_list closures
+/// only get `&mut App`, not the view context.
+fn note_list_row(
+    shell: &gpui_kit::WeakEntity<AppShell>,
+    n: &leanote_core::Note,
+    meta: SharedString,
+    is_sel: bool,
+    fg: gpui_kit::Hsla,
+    sel_fg: gpui_kit::Hsla,
+    muted: gpui_kit::Hsla,
+) -> impl IntoElement + use<> {
+    let shell = shell.clone();
+    let shell_menu = shell.clone();
+    let id = n.note_id.clone();
+    let id_menu = n.note_id.clone();
+    let row_fg = if is_sel { sel_fg } else { fg };
+    let row_muted = if is_sel { sel_fg } else { muted };
+    gpui_kit::base::v_flex()
+        .id(n.note_id.to_string())
+        .h(px(NOTE_ROW_H))
+        .px_2()
+        .py_2()
+        .gap_1()
+        .justify_between()
+        .rounded(px(theme::RADIUS_SELECTION))
+        .when(is_sel, |el| el.bg(theme::accent()))
+        .on_click(move |_ev, window, cx| {
+            let _ = shell.update(cx, |this: &mut AppShell, cx| {
+                this.select_note(id.clone(), window, cx)
+            });
+        })
+        .context_menu({
+            let shell = shell_menu;
+            let id = id_menu;
+            let lang = crate::i18n::system_lang();
+            move |menu, _window, _cx| note_row_menu(menu, &shell, &id, lang)
+        })
+        .child(
+            // Title block: 2 wrapped lines max, then ellipsis. The star
+            // rides in the corner without stealing title width.
+            gpui_kit::base::h_flex()
+                .gap_1()
+                .child(
+                    gpui_kit::div().flex_1().min_w_0().line_clamp(2).child(
+                        Label::new(n.title.clone())
+                            .text_size(px(14.))
+                            .line_height(px(19.))
+                            .text_color(row_fg),
+                    ),
+                )
+                .when(n.star, |el| {
+                    el.child(
+                        Icon::new(IconName::StarFill)
+                            .xsmall()
+                            .flex_none()
+                            .text_color(row_muted),
+                    )
+                }),
+        )
+        .child(
+            gpui_kit::div()
+                .truncate()
+                .child(small_label(meta, row_muted)),
+        )
+}
+
+/// Issue 18: right-click menu on a note row — trash (live notes) or
+/// restore/delete-forever (trash view), plus move-to-notebook.
+fn note_row_menu(
+    menu: gpui_kit::component::menu::PopupMenu,
+    shell: &gpui_kit::WeakEntity<AppShell>,
+    id: &leanote_core::Id,
+    lang: Lang,
+) -> gpui_kit::component::menu::PopupMenu {
+    let shell_mv = shell.clone();
+    let shell_del = shell.clone();
+    let id_mv = id.clone();
+    let id_del = id.clone();
+    menu.item(
+        PopupMenuItem::new(i18n::t(lang, i18n::Key::MoveNoteTo)).on_click(
+            move |_ev, _window, cx| {
+                let _ = shell_mv.update(cx, |this, cx| {
+                    this.nav_edit = Some(NavEdit::MoveNote { id: id_mv.clone() });
+                    cx.notify();
+                });
+            },
+        ),
+    )
+    .item(
+        PopupMenuItem::new(i18n::t(lang, i18n::Key::DeleteNote)).on_click(
+            move |_ev, _window, cx| {
+                let _ = shell_del.update(cx, |this, cx| this.delete_note(id_del.clone(), cx));
+            },
+        ),
+    )
+}
+
 impl Render for AppShell {
-    fn render(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> impl IntoElement {
         let dark = self.dark(window);
         let lang = self.lang;
         let t = move |k: i18n::Key| i18n::t(lang, k);
@@ -937,17 +1558,60 @@ impl Render for AppShell {
             .size_full()
             .bg(base_bg)
             .text_color(cx.theme().foreground)
-            .on_action(
-                cx.listener(|this, _: &crate::search_overlay::ToggleSearch, window, cx| {
+            .on_action(cx.listener(
+                |this, _: &crate::search_overlay::ToggleSearch, window, cx| {
                     // Any phase: the dialog layer is window-level.
                     this.toggle_search(window, cx);
-                }),
-            );
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::search_overlay::QuickNewNote, window, cx| {
+                    window.close_dialog(cx);
+                    this.new_note(window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::search_overlay::QuickExportBackup, window, cx| {
+                    window.close_dialog(cx);
+                    this.export_backup(cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::search_overlay::QuickToggleVim, window, cx| {
+                    window.close_dialog(cx);
+                    this.vim_enabled = !this.vim_enabled;
+                    this.save_vim_pref(cx);
+                    cx.notify();
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::search_overlay::QuickSyncNow, window, cx| {
+                    window.close_dialog(cx);
+                    this.sync_now(cx);
+                },
+            ));
 
-        // 44px strip shares sidebar material — drawn by the root bg.
-        let titlebar = gpui_kit::base::h_flex().h(px(TITLEBAR_H)).w_full().flex_none();
+        // Issue 17: no separate titlebar strip. The left nav's 44px header
+        // region is the drag area (see render_nav); every pane runs flush
+        // to the window top edge.
 
-        let mut body = gpui_kit::base::h_flex().flex_1().min_h_0().w_full();
+        // Issue 18: panes are user-resizable; widths persist (prefs).
+        // The group wraps every phase's three children in panels so the
+        // saved geometry applies from the login frame onward.
+        let widths = crate::prefs::Prefs::load(&self.data_dir).pane_widths;
+        let mut body = gpui_kit::component::h_resizable("main-panes").on_resize({
+            let dir = self.data_dir.clone();
+            move |state, _window, cx| {
+                let sizes = state.read(cx).sizes();
+                if sizes.len() < 2 {
+                    return;
+                }
+                let mut p = crate::prefs::Prefs::load(&dir);
+                p.pane_widths.left = Some(sizes[0].as_f32().round());
+                p.pane_widths.mid = Some(sizes[1].as_f32().round());
+                p.save(&dir);
+            }
+        });
 
         match &self.phase {
             Phase::Login | Phase::SigningIn | Phase::Failed { .. } => {
@@ -961,7 +1625,10 @@ impl Render for AppShell {
                 let busy = matches!(self.phase, Phase::SigningIn);
                 // Built here: on_click needs cx.listener (Context of Self).
                 let sign_in = if busy {
-                    Button::new("sign-in").label(t(i18n::Key::SigningIn)).primary().disabled(true)
+                    Button::new("sign-in")
+                        .label(t(i18n::Key::SigningIn))
+                        .primary()
+                        .disabled(true)
                 } else {
                     Button::new("sign-in")
                         .label(t(i18n::Key::SignIn))
@@ -969,30 +1636,158 @@ impl Render for AppShell {
                         .on_click(cx.listener(|this, _ev, _window, cx| this.start_login(cx)))
                 };
                 body = body
-                    .child(gpui_kit::base::v_flex().w(px(LEFT_W)).h_full().flex_none().bg(base_bg))
-                    .child(gpui_kit::base::v_flex().w(px(MID_W)).h_full().flex_none().bg(list_bg))
-                    .child(render_login(dark, error, sign_in, &t, &self.host, &self.email, &self.password));
+                    .child(
+                        resizable_panel()
+                            .size(px(widths.left.unwrap_or(LEFT_W)))
+                            .size_range(px(LEFT_RANGE.0)..px(LEFT_RANGE.1))
+                            .child(gpui_kit::base::v_flex().h_full().w_full().bg(base_bg)),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size(px(widths.mid.unwrap_or(MID_W)))
+                            .size_range(px(MID_RANGE.0)..px(MID_RANGE.1))
+                            .child(gpui_kit::base::v_flex().h_full().w_full().bg(list_bg)),
+                    )
+                    .child(resizable_panel().child(render_login(
+                        dark,
+                        error,
+                        sign_in,
+                        &t,
+                        &self.host,
+                        &self.email,
+                        &self.password,
+                    )));
             }
             Phase::Syncing { lines } => {
                 body = body
-                    .child(gpui_kit::base::v_flex().w(px(LEFT_W)).h_full().flex_none().bg(base_bg))
-                    .child(gpui_kit::base::v_flex().w(px(MID_W)).h_full().flex_none().bg(list_bg))
-                    .child(render_syncing(dark, lines, &t));
+                    .child(
+                        resizable_panel()
+                            .size(px(widths.left.unwrap_or(LEFT_W)))
+                            .size_range(px(LEFT_RANGE.0)..px(LEFT_RANGE.1))
+                            .child(gpui_kit::base::v_flex().h_full().w_full().bg(base_bg)),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size(px(widths.mid.unwrap_or(MID_W)))
+                            .size_range(px(MID_RANGE.0)..px(MID_RANGE.1))
+                            .child(gpui_kit::base::v_flex().h_full().w_full().bg(list_bg)),
+                    )
+                    .child(resizable_panel().child(render_syncing(dark, lines, &t)));
             }
             Phase::Shell { .. } => {
                 body = body
-                    .child(self.render_nav(dark, &t, window, cx))
-                    .child(self.render_list(dark, &t, window, cx))
-                    .child(self.render_reader(dark, &t, window, cx));
+                    .child(
+                        resizable_panel()
+                            .size(px(widths.left.unwrap_or(LEFT_W)))
+                            .size_range(px(LEFT_RANGE.0)..px(LEFT_RANGE.1))
+                            .child(self.render_nav(dark, &t, window, cx)),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size(px(widths.mid.unwrap_or(MID_W)))
+                            .size_range(px(MID_RANGE.0)..px(MID_RANGE.1))
+                            .child(self.render_list(dark, &t, window, cx)),
+                    )
+                    .child(resizable_panel().child(self.render_reader(dark, &t, window, cx)));
             }
         }
 
-        root.child(titlebar).child(body)
+        root.child(body)
     }
 }
 
 fn small_label(text: impl Into<SharedString>, color: gpui_kit::Hsla) -> Label {
     Label::new(text).text_size(px(13.)).text_color(color)
+}
+
+/// State for the manual window-drag region (mirrors kit TitleBar's TODO
+/// workaround for GPUI pre-0.2.3).
+struct DragHeaderState {
+    should_move: bool,
+}
+
+impl Render for DragHeaderState {
+    fn render(&mut self, _: &mut Window, _: &mut gpui_kit::Context<Self>) -> impl IntoElement {
+        gpui_kit::div()
+    }
+}
+
+/// Issue 17: the left nav's 44px header — window-drag region with the app
+/// name. macOS traffic lights sit over its left padding (pl 80).
+/// Windows/Linux keep the native titlebar; this strip still renders but the
+/// platform ignores client-side drag there.
+fn drag_header(
+    title: &str,
+    fg: gpui_kit::Hsla,
+    window: &mut Window,
+    cx: &mut gpui_kit::Context<AppShell>,
+) -> impl IntoElement + use<> {
+    let state = window.use_state(cx, |_, _| DragHeaderState { should_move: false });
+    let is_macos = cfg!(target_os = "macos");
+    gpui_kit::div()
+        .id("nav-drag-header")
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(TITLEBAR_H))
+        .w_full()
+        .pl(px(if is_macos { 80. } else { 0. }))
+        .when(is_macos, |this| {
+            this.on_double_click(|_, window, _| window.titlebar_double_click())
+        })
+        .on_mouse_down_out(window.listener_for(&state, |s, _, _, _| s.should_move = false))
+        .on_mouse_down(
+            MouseButton::Left,
+            window.listener_for(&state, |s, _, _, _| s.should_move = true),
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            window.listener_for(&state, |s, _, _, _| s.should_move = false),
+        )
+        .on_mouse_move(window.listener_for(&state, |s, _, window, _| {
+            if s.should_move {
+                s.should_move = false;
+                window.start_window_move();
+            }
+        }))
+        .window_control_area(WindowControlArea::Drag)
+        .child(Label::new(title).text_size(px(16.)).text_color(fg))
+}
+
+/// Issue 17: transparent 28px strip at the top of the right pane — drag
+/// region only, no content.
+fn reader_drag_strip(
+    window: &mut Window,
+    cx: &mut gpui_kit::Context<AppShell>,
+) -> impl IntoElement + use<> {
+    let state = window.use_state(cx, |_, _| DragHeaderState { should_move: false });
+    let is_macos = cfg!(target_os = "macos");
+    gpui_kit::div()
+        .id("reader-drag-strip")
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(28.))
+        .w_full()
+        .when(is_macos, |this| {
+            this.on_double_click(|_, window, _| window.titlebar_double_click())
+        })
+        .on_mouse_down_out(window.listener_for(&state, |s, _, _, _| s.should_move = false))
+        .on_mouse_down(
+            MouseButton::Left,
+            window.listener_for(&state, |s, _, _, _| s.should_move = true),
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            window.listener_for(&state, |s, _, _, _| s.should_move = false),
+        )
+        .on_mouse_move(window.listener_for(&state, |s, _, window, _| {
+            if s.should_move {
+                s.should_move = false;
+                window.start_window_move();
+            }
+        }))
+        .window_control_area(WindowControlArea::Drag)
 }
 
 fn render_login(
@@ -1006,7 +1801,9 @@ fn render_login(
 ) -> impl IntoElement + use<> {
     let fg = theme::foreground(dark);
     let muted = theme::muted_foreground(dark);
-    let title = Label::new(t(i18n::Key::LoginTitle)).text_size(px(22.)).text_color(fg);
+    let title = Label::new(t(i18n::Key::LoginTitle))
+        .text_size(px(22.))
+        .text_color(fg);
     let subtitle = small_label(t(i18n::Key::LoginSubtitle), muted);
 
     let host_field = gpui_kit::base::v_flex()
@@ -1039,9 +1836,14 @@ fn render_login(
         .child(register);
     if let Some(err) = error {
         form = form.child(
-            Label::new(format!("{} / {}: {}", t(i18n::Key::LoginFailed), t(i18n::Key::SyncFailed), err))
-                .text_size(px(13.))
-                .text_color(gpui_kit::hsla(0. / 360., 0.78, 0.46, 1.)),
+            Label::new(format!(
+                "{} / {}: {}",
+                t(i18n::Key::LoginFailed),
+                t(i18n::Key::SyncFailed),
+                err
+            ))
+            .text_size(px(13.))
+            .text_color(gpui_kit::hsla(0. / 360., 0.78, 0.46, 1.)),
         );
     }
 
@@ -1056,7 +1858,11 @@ fn render_login(
         .into_element()
 }
 
-fn render_syncing(dark: bool, lines: &[SharedString], t: &dyn Fn(i18n::Key) -> &'static str) -> impl IntoElement {
+fn render_syncing(
+    dark: bool,
+    lines: &[SharedString],
+    t: &dyn Fn(i18n::Key) -> &'static str,
+) -> impl IntoElement {
     let muted = theme::muted_foreground(dark);
     let rows = lines
         .iter()
@@ -1078,68 +1884,83 @@ fn render_syncing(dark: bool, lines: &[SharedString], t: &dyn Fn(i18n::Key) -> &
                     gpui_kit::base::h_flex()
                         .gap_2()
                         .child(Spinner::new())
-                        .child(Label::new(t(i18n::Key::SyncingTitle)).text_size(px(22.)).text_color(theme::foreground(dark)))
+                        .child(
+                            Label::new(t(i18n::Key::SyncingTitle))
+                                .text_size(px(22.))
+                                .text_color(theme::foreground(dark)),
+                        ),
                 )
-                .child(small_label(if lines.is_empty() { t(i18n::Key::SyncingSubtitle) } else { t(i18n::Key::SyncDone) }, muted))
-                .child(gpui_kit::base::v_flex().gap_1().children(rows))
+                .child(small_label(
+                    if lines.is_empty() {
+                        t(i18n::Key::SyncingSubtitle)
+                    } else {
+                        t(i18n::Key::SyncDone)
+                    },
+                    muted,
+                ))
+                .child(gpui_kit::base::v_flex().gap_1().children(rows)),
         )
         .into_element()
 }
+/// One clickable nav row; `id` doubles as the element id.
+fn nav_row(
+    shell: &gpui_kit::WeakEntity<AppShell>,
+    dark: bool,
+    node: &NavNode,
+    kind: &str,
+    icon: Option<IconName>,
+    selected: bool,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let fg = theme::foreground(dark);
+    let sel_fg = theme::accent_foreground();
+    let indent = px(12. * node.depth as f32);
+    let shell = shell.clone();
+    let sel: NavSelection = match kind {
+        "notebook" => NavSelection::Notebook(node.id.clone()),
+        "tag" => NavSelection::Tag(node.id.clone()),
+        "starred" => NavSelection::Starred,
+        "trash" => NavSelection::Trash,
+        _ => NavSelection::AllNotes,
+    };
+    let mut row = gpui_kit::base::h_flex()
+        .id(node.id.clone())
+        .px_3()
+        .h_8()
+        .ml(indent)
+        .rounded(px(theme::RADIUS_SELECTION))
+        .when(selected, |el| el.bg(theme::accent()))
+        .on_click(move |_ev, _window, cx| {
+            let _ = shell.update(cx, |this: &mut AppShell, cx| {
+                this.select_nav(sel.clone(), cx)
+            });
+        });
+    if let Some(icon) = icon {
+        row = row.child(Icon::new(icon).xsmall().text_color(if selected {
+            sel_fg
+        } else {
+            theme::muted_foreground(dark)
+        }));
+    }
+    row.child(
+        Label::new(node.title.clone())
+            .text_size(px(14.))
+            .text_color(if selected { sel_fg } else { fg }),
+    )
+    .child(gpui_kit::base::h_flex().flex_1())
+    .child(
+        small_label(
+            node.count.to_string(),
+            if selected {
+                sel_fg
+            } else {
+                theme::muted_foreground(dark)
+            },
+        )
+        .into_any_element(),
+    )
+}
 
 impl AppShell {
-    /// One clickable nav row; `id` doubles as the element id.
-    fn nav_row(
-        &self,
-        dark: bool,
-        node: &NavNode,
-        kind: &str,
-        icon: Option<IconName>,
-        selected: bool,
-        cx: &mut gpui_kit::Context<Self>,
-    ) -> gpui_kit::Stateful<gpui_kit::Div> {
-        let fg = theme::foreground(dark);
-        let sel_fg = theme::accent_foreground();
-        let indent = px(12. * node.depth as f32);
-        let mut row = gpui_kit::base::h_flex()
-            .id(node.id.clone())
-            .px_3()
-            .h_8()
-            .ml(indent)
-            .rounded(px(theme::RADIUS_SELECTION))
-            .when(selected, |el| el.bg(theme::accent()))
-            .on_click({
-                let sel: NavSelection = match kind {
-                    "notebook" => NavSelection::Notebook(node.id.clone()),
-                    "tag" => NavSelection::Tag(node.id.clone()),
-                    "starred" => NavSelection::Starred,
-                    "trash" => NavSelection::Trash,
-                    _ => NavSelection::AllNotes,
-                };
-                cx.listener(move |this, _ev, _window, cx| this.select_nav(sel.clone(), cx))
-            });
-        if let Some(icon) = icon {
-            row = row.child(
-                Icon::new(icon)
-                    .xsmall()
-                    .text_color(if selected { sel_fg } else { theme::muted_foreground(dark) }),
-            );
-        }
-        row.child(
-            Label::new(node.title.clone())
-                .text_size(px(14.))
-                .text_color(if selected { sel_fg } else { fg }),
-        )
-        .child(gpui_kit::base::h_flex().flex_1())
-        .child(
-            small_label(
-                node.count.to_string(),
-                if selected { sel_fg } else { theme::muted_foreground(dark) },
-            )
-            .into_any_element(),
-        )
-    }
-
-    /// Collapsible group header (Notebooks / Tags).
     fn group_header(
         &self,
         dark: bool,
@@ -1174,53 +1995,88 @@ impl AppShell {
         cx: &mut gpui_kit::Context<Self>,
     ) -> gpui_kit::Div {
         let fg = theme::foreground(dark);
-        let muted = theme::muted_foreground(dark);
         let (notebooks_open, tags_open) = (self.notebooks_open, self.tags_open);
         let shell = cx.weak_entity();
         let lang = self.lang;
 
-        let all = NavNode { id: "all".into(), title: t(i18n::Key::NavAllNotes).into(), count: 0, depth: 0 };
+        let all = NavNode {
+            id: "all".into(),
+            title: t(i18n::Key::NavAllNotes).into(),
+            count: 0,
+            depth: 0,
+        };
         let mut all_count = 0i64;
         if let Some(store) = self.store() {
-            all_count = store.list_notes_filtered(None, false).map(|n| n.len() as i64).unwrap_or(0);
+            all_count = store
+                .list_notes_filtered(None, false)
+                .map(|n| n.len() as i64)
+                .unwrap_or(0);
         }
-        let all = NavNode { count: all_count, ..all };
+        let all = NavNode {
+            count: all_count,
+            ..all
+        };
 
         let mut starred_count = 0i64;
         if let Some(store) = self.store() {
-            starred_count = store.list_notes_filtered(None, true).map(|n| n.len() as i64).unwrap_or(0);
+            starred_count = store
+                .list_notes_filtered(None, true)
+                .map(|n| n.len() as i64)
+                .unwrap_or(0);
         }
         let mut trash_count = 0i64;
         if let Some(store) = self.store() {
             trash_count = store.list_trash().map(|n| n.len() as i64).unwrap_or(0);
         }
-        let starred = NavNode { id: "starred".into(), title: t(i18n::Key::NavStarred).into(), count: starred_count, depth: 0 };
-        let trash = NavNode { id: "trash".into(), title: t(i18n::Key::NavTrash).into(), count: trash_count, depth: 0 };
+        let starred = NavNode {
+            id: "starred".into(),
+            title: t(i18n::Key::NavStarred).into(),
+            count: starred_count,
+            depth: 0,
+        };
+        let trash = NavNode {
+            id: "trash".into(),
+            title: t(i18n::Key::NavTrash).into(),
+            count: trash_count,
+            depth: 0,
+        };
 
-        let all_row = self.nav_row(dark, &all, "fixed", Some(IconName::BookOpen), self.nav == NavSelection::AllNotes, cx);
-        let starred_row = self.nav_row(dark, &starred, "starred", Some(IconName::Star), self.nav == NavSelection::Starred, cx);
-        let trash_row = self.nav_row(dark, &trash, "trash", Some(IconName::Delete), self.nav == NavSelection::Trash, cx);
+        let all_row = nav_row(
+            &shell,
+            dark,
+            &all,
+            "fixed",
+            Some(IconName::BookOpen),
+            self.nav == NavSelection::AllNotes,
+        );
+        let starred_row = nav_row(
+            &shell,
+            dark,
+            &starred,
+            "starred",
+            Some(IconName::Star),
+            self.nav == NavSelection::Starred,
+        );
+        let trash_row = nav_row(
+            &shell,
+            dark,
+            &trash,
+            "trash",
+            Some(IconName::Delete),
+            self.nav == NavSelection::Trash,
+        );
 
         let mut nav = gpui_kit::base::v_flex()
-            .w(px(LEFT_W))
+            .w_full()
             .h_full()
-            .flex_none()
             .bg(theme::material(Material::Base, dark))
-            .pt(px(TITLEBAR_H)) // below the transparent titlebar
+            // Issue 17: 44px header below is the window-drag region (see
+            // the header child below); no global titlebar strip anymore.
             .px_3()
             .gap_1()
-            .child(Label::new(t(i18n::Key::AppName)).text_size(px(16.)).text_color(fg))
-            // Review item 3: signed-in identity + last sync outcome.
-            .when_some(
-                self.store().and_then(|s| s.active_account().ok().flatten()),
-                |el, acct| {
-                    el.child(small_label(
-                        if acct.username.is_empty() { acct.email.clone() } else { acct.username.clone() },
-                        muted,
-                    ))
-                    .child(small_label(self.sync_status_label(), muted))
-                },
-            )
+            .child(drag_header(t(i18n::Key::AppName), fg, window, cx))
+            // Issue 17 Q7: identity moved to the bottom trio (see the nav
+            // footer below) — no duplicate under the header.
             .child(all_row)
             .child(starred_row)
             .child(trash_row);
@@ -1228,32 +2084,39 @@ impl AppShell {
         // Ticket 11: right-click menu on the Notebooks group header —
         // "New Notebook" at root level.
         nav = nav.child(
-            self.group_header(dark, t(i18n::Key::NavNotebooks), notebooks_open, Group::Notebooks, cx)
-                .context_menu({
+            self.group_header(
+                dark,
+                t(i18n::Key::NavNotebooks),
+                notebooks_open,
+                Group::Notebooks,
+                cx,
+            )
+            .context_menu({
+                let shell = shell.clone();
+                move |menu, _window, _cx| {
                     let shell = shell.clone();
-                    move |menu, _window, _cx| {
-                        let shell = shell.clone();
-                        menu.item(
-                            PopupMenuItem::new(i18n::t(lang, i18n::Key::NewNotebook)).on_click(
-                                move |_ev, window, cx| {
-                                    let _ = shell.update(cx, |this, cx| {
-                                        this.begin_new_notebook(String::new(), window, cx)
-                                    });
-                                },
-                            ),
-                        )
-                    }
-                }),
+                    menu.item(
+                        PopupMenuItem::new(i18n::t(lang, i18n::Key::NewNotebook)).on_click(
+                            move |_ev, window, cx| {
+                                let _ = shell.update(cx, |this, cx| {
+                                    this.begin_new_notebook(String::new(), window, cx)
+                                });
+                            },
+                        ),
+                    )
+                }
+            }),
         );
 
         if notebooks_open {
+            let notebook_nodes = self.notebook_nav_nodes().clone();
             // Ticket 11: inline editor row when creating/renaming.
             if let Some(NavEdit::NewNotebook { parent, .. }) = &self.nav_edit {
                 // render at the parent's nesting depth; root edit on top
                 let depth = if parent.is_empty() {
                     0
                 } else {
-                    self.notebook_nav_nodes()
+                    notebook_nodes
                         .iter()
                         .find(|n| n.id == *parent)
                         .map(|n| n.depth + 1)
@@ -1262,120 +2125,216 @@ impl AppShell {
                 let _ = depth;
                 // row itself is drawn in the loop below via nav_edit_row
             }
-            for node in self.notebook_nav_nodes() {
-                let sel = NavSelection::Notebook(node.id.clone());
-                let is_sel = self.nav == sel;
-                let row = self.nav_row(
-                    dark,
-                    &node,
-                    "notebook",
-                    Some(IconName::FolderClosed),
-                    is_sel,
-                    cx,
-                );
-                // nested-create affordance + management menu per notebook row
-                let id = leanote_core::Id(node.id.clone());
-                let title = node.title.clone();
-                nav = nav.child(
-                    row.context_menu({
-                        let shell = shell.clone();
-                        let id2 = id.clone();
-                        let title2 = title.clone();
-                        move |menu, _window, _cx| {
-                            let shell_new = shell.clone();
-                            let shell_ren = shell.clone();
-                            let shell_mv = shell.clone();
-                            let shell_del = shell.clone();
-                            let id_new = id2.to_string();
-                            let id_ren = id2.clone();
-                            let id_mv = id2.clone();
-                            let id_del = id2.clone();
-                            let _ = title2;
-                            menu
-                                .item(
-                                    PopupMenuItem::new(i18n::t(lang, i18n::Key::NewNotebook))
-                                        .on_click(move |_ev, window, cx| {
-                                            let _ = shell_new.update(cx, |this, cx| {
-                                                this.begin_new_notebook(id_new.clone(), window, cx)
-                                            });
-                                        }),
-                                )
-                                .item(
-                                    PopupMenuItem::new(i18n::t(lang, i18n::Key::RenameNotebook))
-                                        .on_click(move |_ev, window, cx| {
-                                            let _ = shell_ren.update(cx, |this, cx| {
-                                                this.begin_rename_notebook(id_ren.clone(), window, cx)
-                                            });
-                                        }),
-                                )
-                                .item(
-                                    PopupMenuItem::new(i18n::t(lang, i18n::Key::MoveNotebookTo))
-                                        .on_click(move |_ev, _window, cx| {
-                                            let _ = shell_mv.update(cx, |this, cx| {
-                                                this.begin_move_notebook(id_mv.clone(), cx)
-                                            });
-                                        }),
-                                )
-                                .item(
-                                    PopupMenuItem::new(i18n::t(lang, i18n::Key::DeleteNotebook))
-                                        .on_click(move |_ev, _window, cx| {
-                                            let _ = shell_del.update(cx, |this, cx| {
-                                                this.delete_notebook_nav(id_del.clone(), cx)
-                                            });
-                                        }),
-                                )
-                        }
-                    })
-                    .when(node.depth > 0, |el| el),
-                );
-            }
-            // Ticket 11: inline create/rename editor row.
-            if let Some(edit_row) = self.nav_edit_row(dark, t, "notebook", window, cx) {
-                nav = nav.child(edit_row);
-            }
+            let edit_row = self.nav_edit_row(dark, t, "notebook", window, cx);
+            let n = notebook_nodes.len() + usize::from(edit_row.is_some());
+            let edit_row = std::rc::Rc::new(std::cell::RefCell::new(edit_row));
+            let nav_sel = self.nav.clone();
+            let shell_ul = shell.clone();
+            let scroll = self.notebooks_scroll.clone();
+            nav = nav.child(
+                gpui_kit::div()
+                    .id("notebooks-vlist")
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        gpui_kit::uniform_list("notebooks-ul", n, move |range, _window, _cx| {
+                            // Rows are rebuilt per call: measure_item fires
+                            // twice per frame (layout + prepaint), so a
+                            // take-once buffer would leave later renders empty.
+                            range
+                                .map(|ix| {
+                                    let Some(node) = notebook_nodes.get(ix) else {
+                                        return edit_row
+                                            .borrow_mut()
+                                            .take()
+                                            .unwrap_or_else(|| gpui_kit::div().into_any_element());
+                                    };
+                                    let is_sel = nav_sel == NavSelection::Notebook(node.id.clone());
+                                    nav_row(
+                                        &shell_ul,
+                                        dark,
+                                        node,
+                                        "notebook",
+                                        Some(IconName::FolderClosed),
+                                        is_sel,
+                                    )
+                                    .context_menu({
+                                        let shell = shell_ul.clone();
+                                        let id2 = node.id.clone();
+                                        move |menu, _window, _cx| {
+                                            let shell_new = shell.clone();
+                                            let shell_ren = shell.clone();
+                                            let shell_mv = shell.clone();
+                                            let shell_del = shell.clone();
+                                            let id_new = id2.clone();
+                                            let id_ren = leanote_core::Id(id2.clone());
+                                            let id_mv = leanote_core::Id(id2.clone());
+                                            let id_del = leanote_core::Id(id2.clone());
+                                            menu.item(
+                                                PopupMenuItem::new(i18n::t(
+                                                    lang,
+                                                    i18n::Key::NewNotebook,
+                                                ))
+                                                .on_click(move |_ev, window, cx| {
+                                                    let _ = shell_new.update(cx, |this, cx| {
+                                                        this.begin_new_notebook(
+                                                            id_new.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    });
+                                                }),
+                                            )
+                                            .item(
+                                                PopupMenuItem::new(i18n::t(
+                                                    lang,
+                                                    i18n::Key::RenameNotebook,
+                                                ))
+                                                .on_click(move |_ev, window, cx| {
+                                                    let _ = shell_ren.update(cx, |this, cx| {
+                                                        this.begin_rename_notebook(
+                                                            id_ren.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    });
+                                                }),
+                                            )
+                                            .item(
+                                                PopupMenuItem::new(i18n::t(
+                                                    lang,
+                                                    i18n::Key::MoveNotebookTo,
+                                                ))
+                                                .on_click(move |_ev, _window, cx| {
+                                                    let _ = shell_mv.update(cx, |this, cx| {
+                                                        this.begin_move_notebook(id_mv.clone(), cx)
+                                                    });
+                                                }),
+                                            )
+                                            .item(
+                                                PopupMenuItem::new(i18n::t(
+                                                    lang,
+                                                    i18n::Key::DeleteNotebook,
+                                                ))
+                                                .on_click(move |_ev, _window, cx| {
+                                                    let _ = shell_del.update(cx, |this, cx| {
+                                                        this.delete_notebook_nav(id_del.clone(), cx)
+                                                    });
+                                                }),
+                                            )
+                                        }
+                                    })
+                                    .into_any_element()
+                                })
+                                .collect()
+                        })
+                        .h_full()
+                        .w_full()
+                        .track_scroll(&scroll),
+                    )
+                    .child(
+                        gpui_kit::div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom_0()
+                            .w(px(12.))
+                            .child(
+                                Scrollbar::vertical(&scroll)
+                                    .viewport_from_layout()
+                                    .max_fps(60),
+                            ),
+                    ),
+            );
         }
 
         nav = nav.child(self.group_header(dark, t(i18n::Key::NavTags), tags_open, Group::Tags, cx));
 
         if tags_open {
-            for node in self.tag_nav_nodes() {
-                let sel = NavSelection::Tag(node.id.clone());
-                let is_sel = self.nav == sel;
-                let row = self.nav_row(dark, &node, "tag", None, is_sel, cx);
-                let tag = node.id.clone();
-                nav = nav.child(row.context_menu({
-                    let shell = shell.clone();
-                    move |menu, _window, _cx| {
-                        let shell_ren = shell.clone();
-                        let shell_del = shell.clone();
-                        let tag_ren = tag.clone();
-                        let tag_del = tag.clone();
-                        menu
-                            .item(
-                                PopupMenuItem::new(i18n::t(lang, i18n::Key::RenameTag)).on_click(
-                                    move |_ev, window, cx| {
-                                        let _ = shell_ren.update(cx, |this, cx| {
-                                            this.begin_rename_tag(tag_ren.clone(), window, cx)
-                                        });
-                                    },
-                                ),
-                            )
-                            .item(
-                                PopupMenuItem::new(i18n::t(lang, i18n::Key::DeleteTag)).on_click(
-                                    move |_ev, _window, cx| {
-                                        let _ = shell_del.update(cx, |this, cx| {
-                                            this.delete_tag_nav(tag_del.clone(), cx)
-                                        });
-                                    },
-                                ),
-                            )
-                    }
-                }));
-            }
-            // tag rename editor
-            if let Some(edit_row) = self.nav_edit_row(dark, t, "tag", window, cx) {
-                nav = nav.child(edit_row);
-            }
+            let tag_nodes = self.tag_nav_nodes().clone();
+            let edit_row = self.nav_edit_row(dark, t, "tag", window, cx);
+            let edit_row = std::rc::Rc::new(std::cell::RefCell::new(edit_row));
+            let nav_sel = self.nav.clone();
+            let shell_ul = shell.clone();
+            let n = tag_nodes.len() + usize::from(edit_row.borrow().is_some());
+            let scroll = self.tags_scroll.clone();
+            nav = nav.child(
+                gpui_kit::div()
+                    .id("tags-vlist")
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        gpui_kit::uniform_list("tags-ul", n, move |range, _window, _cx| {
+                            range
+                                .map(|ix| {
+                                    let Some(node) = tag_nodes.get(ix) else {
+                                        return edit_row
+                                            .borrow_mut()
+                                            .take()
+                                            .unwrap_or_else(|| gpui_kit::div().into_any_element());
+                                    };
+                                    let is_sel = nav_sel == NavSelection::Tag(node.id.clone());
+                                    nav_row(&shell_ul, dark, node, "tag", None, is_sel)
+                                        .context_menu({
+                                            let shell = shell_ul.clone();
+                                            let tag = node.id.clone();
+                                            move |menu, _window, _cx| {
+                                                let shell_ren = shell.clone();
+                                                let shell_del = shell.clone();
+                                                let tag_ren = tag.clone();
+                                                let tag_del = tag.clone();
+                                                menu.item(
+                                                    PopupMenuItem::new(i18n::t(
+                                                        lang,
+                                                        i18n::Key::RenameTag,
+                                                    ))
+                                                    .on_click(move |_ev, window, cx| {
+                                                        let _ = shell_ren.update(cx, |this, cx| {
+                                                            this.begin_rename_tag(
+                                                                tag_ren.clone(),
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        });
+                                                    }),
+                                                )
+                                                .item(
+                                                    PopupMenuItem::new(i18n::t(
+                                                        lang,
+                                                        i18n::Key::DeleteTag,
+                                                    ))
+                                                    .on_click(move |_ev, _window, cx| {
+                                                        let _ = shell_del.update(cx, |this, cx| {
+                                                            this.delete_tag_nav(tag_del.clone(), cx)
+                                                        });
+                                                    }),
+                                                )
+                                            }
+                                        })
+                                        .into_any_element()
+                                })
+                                .collect()
+                        })
+                        .h_full()
+                        .w_full()
+                        .track_scroll(&scroll),
+                    )
+                    .child(
+                        gpui_kit::div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom_0()
+                            .w(px(12.))
+                            .child(
+                                Scrollbar::vertical(&scroll)
+                                    .viewport_from_layout()
+                                    .max_fps(60),
+                            ),
+                    ),
+            );
         }
 
         // "Move to…" picker replaces the notebook list while choosing
@@ -1398,7 +2357,10 @@ impl AppShell {
                                 this.move_notebook_to(moved2.clone(), pid2.clone(), cx)
                             });
                         })
-                        .child(Label::new(format!("{}{}", "　".repeat(pdepth), ptitle)).text_size(px(14.))),
+                        .child(
+                            Label::new(format!("{}{}", "　".repeat(pdepth), ptitle))
+                                .text_size(px(14.)),
+                        ),
                 );
             }
             // cancel
@@ -1416,39 +2378,324 @@ impl AppShell {
             nav = nav.child(picker);
         }
 
-        // Ticket 15: whole-library .leanote backup, pinned to the nav bottom.
-        nav = nav
-            .child(gpui_kit::base::v_flex().flex_1())
-            .child(
-                Button::new("export-backup")
-                    .label(t(i18n::Key::ExportBackup))
+        // Issue 17 Q7: bottom trio — sync status, settings, account.
+        let acct = self.store().and_then(|s| s.active_account().ok().flatten());
+        let mut footer = gpui_kit::base::h_flex().gap_1().pt_1().pb_2();
+        if let Some(acct) = acct {
+            // Sync: icon carries the last outcome; click = sync now.
+            let (icon, title) = match &self.sync_status {
+                Some(Ok(_)) => (AssetIcon::CircleCheck, self.sync_status_label()),
+                Some(Err(_)) => (AssetIcon::TriangleAlert, self.sync_status_label()),
+                None => (AssetIcon::Cloud, self.sync_status_label()),
+            };
+            footer = footer.child(
+                Button::new("nav-sync")
+                    .icon(icon)
                     .ghost()
-                    .on_click(cx.listener(|this, _ev, _window, cx| this.export_backup(cx))),
-            )
-            // Review item 2: manual incr sync + sign out.
-            .child(
-                Button::new("sync-now")
-                    .label(t(i18n::Key::SyncNow))
-                    .ghost()
+                    .tooltip(title)
                     .on_click(cx.listener(|this, _ev, _window, cx| this.sync_now(cx))),
-            )
-            .child(
-                Button::new("logout")
-                    .label(t(i18n::Key::Logout))
-                    .ghost()
-                    .on_click(cx.listener(|this, _ev, _window, cx| this.logout(cx))),
             );
+            // Account: username + menu (logout → confirm).
+            let name: SharedString = if acct.username.is_empty() {
+                acct.email.clone().into()
+            } else {
+                acct.username.clone().into()
+            };
+            let lang = self.lang;
+            let menu_name = name.clone();
+            footer = footer.child(
+                gpui_kit::base::h_flex()
+                    .flex_1()
+                    .justify_end()
+                    .gap_1()
+                    .when(acct.host.starts_with("http"), |el| {
+                        el.child(
+                            Button::new("nav-user")
+                                .icon(AssetIcon::CircleUser)
+                                .label(menu_name)
+                                .ghost()
+                                .context_menu({
+                                    let shell = shell.clone();
+                                    move |menu, _window, _cx| {
+                                        let shell = shell.clone();
+                                        menu.item(
+                                            PopupMenuItem::new(i18n::t(lang, i18n::Key::Logout))
+                                                .on_click(move |_ev, window, cx| {
+                                                    let shell = shell.clone();
+                                                    window.open_dialog(cx, move |d, _w, _cx| {
+                                                        d.w(px(360.)).child(
+                                                            Alert::warning(
+                                                                "logout-confirm",
+                                                                i18n::t(
+                                                                    lang,
+                                                                    i18n::Key::LogoutConfirmBody,
+                                                                ),
+                                                            )
+                                                            .title(i18n::t(
+                                                                lang,
+                                                                i18n::Key::LogoutConfirmTitle,
+                                                            ))
+                                                            .on_close({
+                                                                let shell = shell.clone();
+                                                                move |_e, window, cx| {
+                                                                    let _ = shell
+                                                                        .update(cx, |this, cx| {
+                                                                            this.logout(cx)
+                                                                        });
+                                                                    window.close_dialog(cx);
+                                                                }
+                                                            }),
+                                                        )
+                                                    });
+                                                }),
+                                        )
+                                    }
+                                }),
+                        )
+                    }),
+            );
+        }
+        // Settings: centered dialog (issue 17 Q7).
+        footer = footer.child(
+            Button::new("nav-settings")
+                .icon(AssetIcon::Cog)
+                .ghost()
+                .on_click(cx.listener(|this, _ev, window, cx| this.open_settings(window, cx))),
+        );
+        nav = nav.child(gpui_kit::base::v_flex().flex_1()).child(footer);
 
         nav
     }
 
+    /// Issue 17 Q7: three-button segmented control (label trio + active index).
+    /// `on_pick` receives the picked index; the dialog rebuild re-reads prefs,
+    /// so the highlight stays in sync.
+    fn segmented(
+        id: &'static str,
+        labels: [SharedString; 3],
+        active: usize,
+        on_pick: impl Fn(usize, &mut Window, &mut gpui_kit::App) + 'static,
+    ) -> AnyElement {
+        let on_pick = std::rc::Rc::new(on_pick);
+        let mut row = gpui_kit::base::h_flex().gap_1();
+        for (ix, label) in labels.into_iter().enumerate() {
+            let on_pick = on_pick.clone();
+            row = row.child(
+                Button::new(SharedString::from(format!("{id}-{ix}")))
+                    .label(label)
+                    .when(ix == active, |b| b.primary())
+                    .when(ix != active, |b| b.ghost())
+                    .xsmall()
+                    .on_click(move |_, window, cx| on_pick(ix, window, cx)),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// Issue 17 Q7: centered settings dialog — appearance, editor palette,
+    /// language, vim default, account + logout.
+    fn open_settings(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        let shell = cx.entity();
+        let lang = self.lang;
+        let t = move |k: i18n::Key| i18n::t(lang, k);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let shell_c = shell.clone();
+            let t = t;
+            let prefs = crate::prefs::Prefs::load(&shell.read(cx).data_dir);
+            let acct = shell
+                .read(cx)
+                .store()
+                .and_then(|s| s.active_account().ok().flatten());
+            let dark = shell.read(cx).dark(window);
+            let muted = theme::muted_foreground(dark);
+
+            // Row builders.
+            let row = |label: gpui_kit::SharedString, control: gpui_kit::AnyElement| {
+                gpui_kit::base::h_flex()
+                    .justify_between()
+                    .gap_3()
+                    .py_1()
+                    .child(Label::new(label).text_size(px(13.)))
+                    .child(control)
+            };
+
+            let content = gpui_kit::base::v_flex()
+                .gap_2()
+                .px_1()
+                .py_1()
+                .w_full()
+                // Appearance
+                .child(row(
+                    t(i18n::Key::Appearance).into(),
+                    Self::segmented(
+                        "set-appearance",
+                        [
+                            t(i18n::Key::AppearanceFollow).into(),
+                            t(i18n::Key::AppearanceLight).into(),
+                            t(i18n::Key::AppearanceDark).into(),
+                        ],
+                        match prefs.appearance {
+                            crate::prefs::AppearancePref::Follow => 0,
+                            crate::prefs::AppearancePref::Light => 1,
+                            crate::prefs::AppearancePref::Dark => 2,
+                        },
+                        {
+                            let shell = shell_c.clone();
+                            move |ix, _window, cx| {
+                                shell.update(cx, |this, cx| {
+                                    this.set_appearance(ix, cx);
+                                });
+                            }
+                        },
+                    ),
+                ))
+                // Editor palette
+                .child(row(
+                    t(i18n::Key::EditorPalette).into(),
+                    Self::segmented(
+                        "set-palette",
+                        [
+                            t(i18n::Key::PaletteDefault).into(),
+                            t(i18n::Key::PaletteWarm).into(),
+                            t(i18n::Key::PaletteSolarized).into(),
+                        ],
+                        match prefs.editor_palette.as_str() {
+                            "" => 0,
+                            "warm" => 1,
+                            _ => 2,
+                        },
+                        {
+                            let shell = shell_c.clone();
+                            move |ix, _window, cx| {
+                                shell.update(cx, |this, cx| {
+                                    this.set_editor_palette(ix, cx);
+                                });
+                            }
+                        },
+                    ),
+                ))
+                // Language
+                .child(row(
+                    t(i18n::Key::LanguageSetting).into(),
+                    Self::segmented(
+                        "set-lang",
+                        [
+                            t(i18n::Key::AppearanceFollow).into(),
+                            "中文".into(),
+                            "English".into(),
+                        ],
+                        match prefs.lang {
+                            crate::prefs::LangPref::Follow => 0,
+                            crate::prefs::LangPref::Zh => 1,
+                            crate::prefs::LangPref::En => 2,
+                        },
+                        {
+                            let shell = shell_c.clone();
+                            move |ix, _window, cx| {
+                                shell.update(cx, |this, cx| {
+                                    this.set_lang(ix, cx);
+                                });
+                            }
+                        },
+                    ),
+                ))
+                // Vim default
+                .child(
+                    gpui_kit::base::h_flex()
+                        .justify_between()
+                        .gap_3()
+                        .py_1()
+                        .child(Label::new(t(i18n::Key::VimDefault)).text_size(px(13.)))
+                        .child(
+                            Switch::new("vim-default")
+                                .checked(prefs.vim_default)
+                                .on_click({
+                                    let shell = shell_c.clone();
+                                    move |_ev, _window, cx| {
+                                        shell.update(cx, |this, cx| {
+                                            this.vim_enabled = !this.vim_enabled;
+                                            this.save_vim_pref(cx);
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        ),
+                )
+                // Account + logout
+                .when_some(acct, |el, acct| {
+                    el.child(
+                        gpui_kit::base::v_flex()
+                            .gap_1()
+                            .pt_2()
+                            .mt_2()
+                            .border_t_1()
+                            .border_color(theme::border(dark))
+                            .child(small_label(
+                                format!("{}: {}", t(i18n::Key::AccountInfo), acct.email),
+                                muted,
+                            ))
+                            .child(small_label(
+                                format!("{}: {}", t(i18n::Key::ServerLabel), acct.host),
+                                muted,
+                            ))
+                            .child(
+                                Button::new("settings-logout")
+                                    .label(t(i18n::Key::Logout).to_owned())
+                                    .outline()
+                                    .on_click({
+                                        let shell = shell_c.clone();
+                                        move |_ev, window, cx| {
+                                            let shell = shell.clone();
+                                            window.open_dialog(cx, move |d, _w, _cx| {
+                                                d.w(px(360.)).child(
+                                                    Alert::warning(
+                                                        "logout-confirm",
+                                                        i18n::t(lang, i18n::Key::LogoutConfirmBody),
+                                                    )
+                                                    .title(i18n::t(
+                                                        lang,
+                                                        i18n::Key::LogoutConfirmTitle,
+                                                    ))
+                                                    .on_close({
+                                                        let shell = shell.clone();
+                                                        move |_e, window, cx| {
+                                                            let _ = shell.update(cx, |this, cx| {
+                                                                this.logout(cx)
+                                                            });
+                                                            // Pop the confirm, then the settings
+                                                            // dialog beneath it.
+                                                            window.close_dialog(cx);
+                                                            window.close_dialog(cx);
+                                                        }
+                                                    }),
+                                                )
+                                            });
+                                        }
+                                    }),
+                            ),
+                    )
+                });
+
+            dialog
+                .w(px(440.))
+                .title(t(i18n::Key::SettingsTitle))
+                .child(content)
+        });
+    }
+
     /// Flat (id, title, depth) of every valid move target: root + all
     /// notebooks except the moved one and its descendants (no cycles).
-    fn notebook_move_targets(&self, moved: &leanote_core::Id) -> Vec<(String, String, usize)> {
-        let Some(store) = self.store() else { return Vec::new() };
-        let Ok(nbs) = store.notebooks() else { return Vec::new() };
-        let by_id: std::collections::HashMap<String, String> =
-            nbs.iter().map(|nb| (nb.notebook_id.to_string(), nb.parent_notebook_id.clone())).collect();
+    fn notebook_move_targets(&mut self, moved: &leanote_core::Id) -> Vec<(String, String, usize)> {
+        let Some(store) = self.store() else {
+            return Vec::new();
+        };
+        let Ok(nbs) = store.notebooks() else {
+            return Vec::new();
+        };
+        let by_id: std::collections::HashMap<String, String> = nbs
+            .iter()
+            .map(|nb| (nb.notebook_id.to_string(), nb.parent_notebook_id.clone()))
+            .collect();
         // descendants of `moved` are invalid targets
         let mut banned = std::collections::HashSet::new();
         banned.insert(moved.to_string());
@@ -1464,8 +2711,13 @@ impl AppShell {
                 break;
             }
         }
-        let mut out = vec![(String::new(), i18n::t(self.lang, i18n::Key::RootLevel).to_string(), 0usize)];
-        for node in self.notebook_nav_nodes() {
+        let mut out = vec![(
+            String::new(),
+            i18n::t(self.lang, i18n::Key::RootLevel).to_string(),
+            0usize,
+        )];
+        let nodes = self.notebook_nav_nodes().clone();
+        for node in nodes {
             if !banned.contains(&node.id) {
                 out.push((node.id.clone(), node.title.clone(), node.depth as usize + 1));
             }
@@ -1485,7 +2737,8 @@ impl AppShell {
         cx: &mut gpui_kit::Context<Self>,
     ) -> Option<AnyElement> {
         // borrow dance: take the input entity handle out temporarily
-        let (input, indent) = match self.nav_edit.as_ref()? {
+        let edit = self.nav_edit.clone()?;
+        let (input, indent) = match &edit {
             NavEdit::NewNotebook { parent, name } if group == "notebook" => {
                 let depth = if parent.is_empty() {
                     0
@@ -1498,13 +2751,7 @@ impl AppShell {
                 };
                 (name.clone(), depth)
             }
-            NavEdit::RenameNotebook { .. } if group == "notebook" => {
-                if let Some(NavEdit::RenameNotebook { name, .. }) = self.nav_edit.as_ref() {
-                    (name.clone(), 1)
-                } else {
-                    unreachable!()
-                }
-            }
+            NavEdit::RenameNotebook { name, .. } if group == "notebook" => (name.clone(), 1),
             NavEdit::RenameTag { name, .. } if group == "tag" => (name.clone(), 1),
             _ => return None,
         };
@@ -1553,18 +2800,19 @@ impl AppShell {
         let fg = theme::foreground(dark);
         let muted = theme::muted_foreground(dark);
         let sel_fg = theme::accent_foreground();
-        let notebook_names = self.notebook_names();
-        let notes = self.visible_notes();
+        let notebook_names = self.notebook_names().clone();
+        let notes = self.visible_notes().clone();
         let count = notes.len();
-        let title = match &self.nav {
-            NavSelection::AllNotes => t(i18n::Key::NavAllNotes),
-            NavSelection::Starred => t(i18n::Key::NavStarred),
-            NavSelection::Trash => t(i18n::Key::NavTrash),
+        let title: std::borrow::Cow<str> = match &self.nav {
+            NavSelection::AllNotes => t(i18n::Key::NavAllNotes).into(),
+            NavSelection::Starred => t(i18n::Key::NavStarred).into(),
+            NavSelection::Trash => t(i18n::Key::NavTrash).into(),
             NavSelection::Notebook(id) => notebook_names
                 .get(id)
-                .map(|s| s.as_str())
-                .unwrap_or(t(i18n::Key::NavNotebooks)),
-            NavSelection::Tag(tag) => tag.as_str(),
+                .map(|s| s.clone())
+                .unwrap_or_else(|| t(i18n::Key::NavNotebooks).to_string())
+                .into(),
+            NavSelection::Tag(tag) => tag.as_str().into(),
         };
 
         // Trash view has no new-note; every other context does (ticket 10).
@@ -1586,11 +2834,11 @@ impl AppShell {
         }
 
         let mut list = gpui_kit::base::v_flex()
-            .w(px(MID_W))
+            .w_full()
             .h_full()
-            .flex_none()
             .bg(theme::material(Material::List, dark))
-            .pt(px(TITLEBAR_H))
+            // Issue 17: list column runs flush to the window top (drag
+            // region is the left nav's 44px header only).
             .px_3()
             .gap_1()
             .child(header);
@@ -1598,44 +2846,107 @@ impl AppShell {
         if notes.is_empty() {
             list = list.child(small_label(t(i18n::Key::EmptyNotes), muted));
         } else {
-            for n in &notes {
-                let meta = browse::note_meta(
-                    notebook_names.get(&n.notebook_id.to_string()).map(|s| s.as_str()).unwrap_or(""),
-                    &n.tags,
-                    n.updated_time,
-                );
-                let is_sel = self.selected.as_ref() == Some(&n.note_id);
-                let star = n.star;
-                let id = n.note_id.clone();
-                let id2 = n.note_id.clone();
-                list = list.child(
-                    gpui_kit::base::v_flex()
-                        .id(n.note_id.to_string())
-                        .px_2()
-                        .py_2()
-                        .rounded(px(theme::RADIUS_SELECTION))
-                        .when(is_sel, |el| el.bg(theme::accent()))
-                        .on_click(cx.listener(move |this, _ev, _window, cx| this.select_note(id2.clone(), cx)))
+            // Issue 17: virtualized — only visible rows render.
+            let sel_id = self.selected.clone();
+            let shell = cx.weak_entity();
+            let notes_for_list = notes.clone();
+            let scroll = self.notes_scroll.clone();
+            let list_view = gpui_kit::div()
+                .id("notes-vlist")
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    gpui_kit::uniform_list(
+                        "notes-ul",
+                        notes_for_list.len(),
+                        move |range, _window, _cx| {
+                            range
+                                .map(|ix| {
+                                    let n = &notes_for_list[ix];
+                                    let meta = browse::note_meta(
+                                        notebook_names
+                                            .get(&n.notebook_id.to_string())
+                                            .map(|s| s.as_str())
+                                            .unwrap_or(""),
+                                        &n.tags,
+                                        n.updated_time,
+                                    );
+                                    let is_sel = sel_id.as_ref() == Some(&n.note_id);
+                                    note_list_row(&shell, n, meta.into(), is_sel, fg, sel_fg, muted)
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    )
+                    .h_full()
+                    .w_full()
+                    .track_scroll(&scroll),
+                )
+                .child(
+                    gpui_kit::div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .w(px(12.))
                         .child(
-                            gpui_kit::base::h_flex()
-                                .child(
-                                    Label::new(n.title.clone())
-                                        .text_size(px(14.))
-                                        .text_color(if is_sel { sel_fg } else { fg }),
-                                )
-                                .child(gpui_kit::base::h_flex().flex_1())
-                                .when(star, |el| {
-                                    el.child(
-                                        Icon::new(IconName::StarFill)
-                                            .xsmall()
-                                            .text_color(if is_sel { sel_fg } else { muted }),
-                                    )
-                                }),
-                        )
-                        .child(small_label(meta, if is_sel { sel_fg } else { muted })),
+                            Scrollbar::vertical(&scroll)
+                                .viewport_from_layout()
+                                .max_fps(60),
+                        ),
                 );
-                let _ = (id, star);
+            list = list.child(list_view);
+        }
+
+        // Issue 18: "move note" picker replaces the note rows while
+        // choosing (mirrors the nav's notebook-move picker).
+        if let Some(NavEdit::MoveNote { id }) = &self.nav_edit {
+            let moved = id.clone();
+            let shell = cx.weak_entity();
+            let mut picker = gpui_kit::base::v_flex().flex_1().min_h_0().gap_1().py_2();
+            picker = picker.child(
+                Label::new(format!("{} · {}", t(i18n::Key::MoveNoteTo), title))
+                    .text_size(px(16.))
+                    .text_color(fg),
+            );
+            let nodes = self.notebook_nav_nodes().clone();
+            for node in &nodes {
+                let shell2 = shell.clone();
+                let pid = node.id.clone();
+                let moved2 = moved.clone();
+                picker = picker.child(
+                    gpui_kit::base::h_flex()
+                        .id(format!("note-mv-{pid}"))
+                        .h_8()
+                        .px_3()
+                        .ml(px(12. * node.depth as f32))
+                        .rounded(px(theme::RADIUS_SELECTION))
+                        .on_click(move |_, _, cx| {
+                            let _ = shell2.update(cx, |this, cx| {
+                                this.move_note_to(moved2.clone(), pid.clone(), cx)
+                            });
+                        })
+                        .child(Label::new(node.title.clone()).text_size(px(14.))),
+                );
             }
+            let shell3 = shell.clone();
+            picker = picker.child(
+                Button::new("note-mv-cancel")
+                    .label(t(i18n::Key::Cancel).to_string())
+                    .on_click(move |_, _, cx| {
+                        let _ = shell3.update(cx, |this, cx| {
+                            this.nav_edit = None;
+                            cx.notify();
+                        });
+                    }),
+            );
+            return gpui_kit::base::v_flex()
+                .w_full()
+                .h_full()
+                .bg(theme::material(Material::List, dark))
+                .px_3()
+                .gap_1()
+                .child(picker);
         }
         list
     }
@@ -1654,14 +2965,15 @@ impl AppShell {
     ) -> gpui_kit::Div {
         let fg = theme::foreground(dark);
         let muted = theme::muted_foreground(dark);
-        let notebook_names = self.notebook_names();
+        let notebook_names = self.notebook_names().clone();
 
         let pane = gpui_kit::base::v_flex()
             .flex_1()
             .h_full()
             .min_w_0()
             .bg(theme::material(Material::Background, dark))
-            .pt(px(TITLEBAR_H));
+            // Issue 17: top strip is the right-pane drag region.
+            .child(reader_drag_strip(window, cx));
 
         // Ticket 14: adjudication bar when this note (or any note) has an
         // unresolved conflict. Built before the selection check so it also
@@ -1716,8 +3028,15 @@ impl AppShell {
             }
             return pane.child(
                 empty
-                    .child(small_label(i18n::t(self.lang, i18n::Key::NoSelection), muted))
-                    .child(Label::new(t(i18n::Key::NoSelection)).text_size(px(16.)).text_color(fg)),
+                    .child(small_label(
+                        i18n::t(self.lang, i18n::Key::NoSelection),
+                        muted,
+                    ))
+                    .child(
+                        Label::new(t(i18n::Key::NoSelection))
+                            .text_size(px(16.))
+                            .text_color(fg),
+                    ),
             );
         };
 
@@ -1733,12 +3052,16 @@ impl AppShell {
             Button::new("star-toggle")
                 .icon(IconName::StarFill)
                 .ghost()
-                .on_click(cx.listener(move |this, _ev, _window, cx| this.toggle_star(id.clone(), cx)))
+                .on_click(
+                    cx.listener(move |this, _ev, _window, cx| this.toggle_star(id.clone(), cx)),
+                )
         } else {
             Button::new("star-toggle")
                 .icon(IconName::Star)
                 .ghost()
-                .on_click(cx.listener(move |this, _ev, _window, cx| this.toggle_star(id.clone(), cx)))
+                .on_click(
+                    cx.listener(move |this, _ev, _window, cx| this.toggle_star(id.clone(), cx)),
+                )
         };
 
         let mut toolbar = gpui_kit::base::h_flex().gap_2().child(star_btn);
@@ -1759,8 +3082,7 @@ impl AppShell {
                 );
         }
         if self.converted_note.as_ref() == Some(&n.note_id) {
-            toolbar =
-                toolbar.child(small_label(t(i18n::Key::ConvertedToMarkdown), muted));
+            toolbar = toolbar.child(small_label(t(i18n::Key::ConvertedToMarkdown), muted));
         }
         if is_trash_view {
             let rid = n.note_id.clone();
@@ -1768,27 +3090,24 @@ impl AppShell {
                 Button::new("restore")
                     .label(t(i18n::Key::Restore))
                     .outline()
-                    .on_click(cx.listener(move |this, _ev, _window, cx| this.restore_selected(rid.clone(), cx))),
+                    .on_click(cx.listener(move |this, _ev, _window, cx| {
+                        this.restore_selected(rid.clone(), cx)
+                    })),
             );
             let did = n.note_id.clone();
             toolbar = toolbar.child(
                 Button::new("hard-delete")
                     .label(t(i18n::Key::HardDelete))
                     .outline()
-                    .on_click(cx.listener(move |this, _ev, _window, cx| this.hard_delete_selected(did.clone(), cx))),
+                    .on_click(cx.listener(move |this, _ev, _window, cx| {
+                        this.hard_delete_selected(did.clone(), cx)
+                    })),
             );
             toolbar = toolbar.child(
                 Button::new("empty-trash")
                     .label(t(i18n::Key::EmptyTrash))
                     .outline()
                     .on_click(cx.listener(|this, _ev, _window, cx| this.empty_trash(cx))),
-            );
-        } else if n.is_markdown {
-            toolbar = toolbar.child(
-                Button::new("edit-note")
-                    .label(t(i18n::Key::Edit))
-                    .outline()
-                    .on_click(cx.listener(|this, _ev, window, cx| this.start_editing(window, cx))),
             );
         }
 
@@ -1799,19 +3118,25 @@ impl AppShell {
                     Button::new("export-html")
                         .label(t(i18n::Key::ExportHtml))
                         .outline()
-                        .on_click(cx.listener(|this, _ev, _window, cx| this.export_selected_file(false, cx))),
+                        .on_click(cx.listener(|this, _ev, _window, cx| {
+                            this.export_selected_file(false, cx)
+                        })),
                 )
                 .child(
                     Button::new("export-markdown")
                         .label(t(i18n::Key::ExportMarkdown))
                         .outline()
-                        .on_click(cx.listener(|this, _ev, _window, cx| this.export_selected_file(true, cx))),
+                        .on_click(cx.listener(|this, _ev, _window, cx| {
+                            this.export_selected_file(true, cx)
+                        })),
                 )
                 .child(
                     Button::new("export-pdf")
                         .label(t(i18n::Key::ExportPdf))
                         .outline()
-                        .on_click(cx.listener(|this, _ev, _window, cx| this.export_selected_pdf(cx))),
+                        .on_click(
+                            cx.listener(|this, _ev, _window, cx| this.export_selected_pdf(cx)),
+                        ),
                 );
         }
         if let Some(status) = self.export_status.clone() {
@@ -1823,7 +3148,6 @@ impl AppShell {
         }
 
         let src = browse::reader_markdown_src(&n.title, &n.content, n.is_markdown);
-
 
         let mut col = gpui_kit::base::v_flex()
             .w(px(READER_W))
@@ -1863,7 +3187,7 @@ impl AppShell {
         &mut self,
         dark: bool,
         t: &dyn Fn(i18n::Key) -> &'static str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) -> gpui_kit::Div {
         let fg = theme::foreground(dark);
@@ -1879,16 +3203,33 @@ impl AppShell {
             .h_full()
             .min_w_0()
             .bg(theme::material(Material::Background, dark))
-            .pt(px(TITLEBAR_H));
+            // Issue 17: editor runs flush to the top; the reader's 28px
+            // drag strip is above the toolbar when editing (the caller
+            // nests this pane inside the reader).
+            .child(reader_drag_strip(window, cx));
 
-        let Some(ed) = &self.editing else { unreachable!("caller checked") };
+        let Some(ed) = &self.editing else {
+            unreachable!("caller checked")
+        };
         let title_entity = ed.title.clone();
         let content_entity = ed.content.clone();
         let preview = ed.preview;
         let saved_flash = ed.saved_flash;
 
-        // Toolbar: Source/Preview toggle · Save · History · Done.
+        // Toolbar: Vim toggle · Source/Preview · Save · History · Done.
         let mut toolbar = gpui_kit::base::h_flex().gap_2();
+        if self.vim_enabled {
+            toolbar = toolbar.child(
+                Button::new("vim-toggle")
+                    .label(t(i18n::Key::VimOn))
+                    .ghost()
+                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                        this.vim_enabled = false;
+                        this.save_vim_pref(cx);
+                        cx.notify();
+                    })),
+            );
+        }
         let (toggle_key, toggle_icon) = if preview {
             (i18n::Key::EditorSource, AssetIcon::Code)
         } else {
@@ -1908,7 +3249,11 @@ impl AppShell {
         );
         toolbar = toolbar.child(
             Button::new("save-note")
-                .label(t(if saved_flash { i18n::Key::Saved } else { i18n::Key::Save }))
+                .label(t(if saved_flash {
+                    i18n::Key::Saved
+                } else {
+                    i18n::Key::Save
+                }))
                 .icon(AssetIcon::Save)
                 .primary()
                 .on_click(cx.listener(|this, _ev, _window, cx| this.save_editor(cx))),
@@ -1933,9 +3278,11 @@ impl AppShell {
                 .on_click(cx.listener(|this, _ev, _window, cx| this.stop_editing(cx))),
         );
 
-        // Body: preview via TextView, source via kit Textarea. The whole
-        // column gets the ⌘S key listener; it only acts on the exact combo
-        // so IME composition keystrokes flow to the input untouched.
+        // Body: preview via TextView, source via kit Editor (syntax
+        // highlighting, soft wrap). Title stays pinned above the scrolling
+        // editor (issue 17 Q2). The whole column gets the ⌘S key listener;
+        // it only acts on the exact combo so IME composition keystrokes flow
+        // to the input untouched.
         let body = if preview {
             let src = content_entity.read(cx).value().to_string();
             let title_txt = title_entity.read(cx).value().to_string();
@@ -1943,11 +3290,10 @@ impl AppShell {
                 .min_h_0()
                 .flex_1()
                 .child(
-                    TextView::markdown("editor-preview", browse::reader_markdown_src(
-                        &title_txt,
-                        &src,
-                        true,
-                    ))
+                    TextView::markdown(
+                        "editor-preview",
+                        browse::reader_markdown_src(&title_txt, &src, true),
+                    )
                     .scrollable(true)
                     .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
                 )
@@ -1963,7 +3309,7 @@ impl AppShell {
                         .bordered(false)
                         .h(px(32.)),
                 )
-                .child(Textarea::new(&content_entity).flex_1().min_h_0().h_full())
+                .child(Editor::new(&content_entity).flex_1().min_h_0().h_full())
                 .into_any_element()
         };
 
@@ -1974,12 +3320,30 @@ impl AppShell {
             .min_h_0()
             .h_full()
             .child(toolbar)
+            .when(self.vim_enabled, |el| {
+                // Issue 17 Q11: mode indicator under the toolbar.
+                let key = match self.vim.mode {
+                    crate::vim::VimMode::Normal => i18n::Key::VimNormal,
+                    crate::vim::VimMode::Insert => i18n::Key::VimInsert,
+                    crate::vim::VimMode::Visual => i18n::Key::VimVisual,
+                };
+                let txt = t(key);
+                el.child(small_label(txt, muted))
+            })
             .child(body)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                // Issue 17 Q11/Q12: vim grammar runs first in normal/visual
+                // mode; a consumed key never reaches the editor.
+                if this.handle_vim_key(ev, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 // IME-safe: only exact cmd/ctrl+S (key_char is None for
                 // cmd combos), never intercepts composition keystrokes.
                 let m = &ev.keystroke.modifiers;
-                let exact = (m.platform || m.control) && !m.alt && !m.shift
+                let exact = (m.platform || m.control)
+                    && !m.alt
+                    && !m.shift
                     && ev.keystroke.key.eq_ignore_ascii_case("s");
                 if exact {
                     this.save_editor(cx);
@@ -1992,9 +3356,11 @@ impl AppShell {
             if let Some(pid) = &self.history_preview {
                 if let Some(h) = history.iter().find(|h| &h.history_id == pid) {
                     let src = browse::reader_markdown_src(&h.title, &h.content, true);
-                    let back_id = pid.clone();
                     rows = rows
-                        .child(small_label(format!("{} · {}", h.title, fmt_time(h.created_time)), muted))
+                        .child(small_label(
+                            format!("{} · {}", h.title, fmt_time(h.created_time)),
+                            muted,
+                        ))
                         .child(
                             TextView::markdown("history-preview", src)
                                 .scrollable(true)
@@ -2069,9 +3435,18 @@ mod tests {
 
     #[test]
     fn nav_selection_compares_by_identity() {
-        assert_eq!(NavSelection::Notebook("nb1".into()), NavSelection::Notebook("nb1".into()));
-        assert_ne!(NavSelection::Notebook("nb1".into()), NavSelection::Tag("nb1".into()));
-        assert_eq!(NavSelection::Tag("rust".into()), NavSelection::Tag("rust".into()));
+        assert_eq!(
+            NavSelection::Notebook("nb1".into()),
+            NavSelection::Notebook("nb1".into())
+        );
+        assert_ne!(
+            NavSelection::Notebook("nb1".into()),
+            NavSelection::Tag("nb1".into())
+        );
+        assert_eq!(
+            NavSelection::Tag("rust".into()),
+            NavSelection::Tag("rust".into())
+        );
     }
 }
 

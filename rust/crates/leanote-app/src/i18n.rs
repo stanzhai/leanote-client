@@ -8,7 +8,11 @@ pub enum Lang {
 
 /// `zh*` → Zh, everything else (incl. unknown) → En.
 pub fn lang_from_locale(locale: &str) -> Lang {
-    if locale.trim_start_matches(['_', '-']).to_ascii_lowercase().starts_with("zh") {
+    if locale
+        .trim_start_matches(['_', '-'])
+        .to_ascii_lowercase()
+        .starts_with("zh")
+    {
         Lang::Zh
     } else {
         Lang::En
@@ -16,7 +20,10 @@ pub fn lang_from_locale(locale: &str) -> Lang {
 }
 
 pub fn system_lang() -> Lang {
-    sys_locale::get_locale().as_deref().map(lang_from_locale).unwrap_or(Lang::En)
+    sys_locale::get_locale()
+        .as_deref()
+        .map(lang_from_locale)
+        .unwrap_or(Lang::En)
 }
 
 macro_rules! keys {
@@ -67,7 +74,6 @@ keys! {
     SearchFootnote => ("↑↓ 选择   ↩ 打开   esc 关闭", "↑↓ navigate   ↩ open   esc close"),
     // Ticket 10: editor toolbar + history.
     NewNote => ("新建笔记", "New note"),
-    Edit => ("编辑", "Edit"),
     Done => ("完成", "Done"),
     EditorPreview => ("预览", "Preview"),
     EditorSource => ("源码", "Source"),
@@ -95,13 +101,15 @@ keys! {
     RootLevel => ("顶层", "Top level"),
     RenameTag => ("重命名标签", "Rename Tag"),
     DeleteTag => ("删除标签", "Delete Tag"),
+    // Issue 18: note-row context menu.
+    MoveNoteTo => ("移动笔记到…", "Move note to…"),
+    DeleteNote => ("删除笔记", "Delete note"),
     Confirm => ("确定", "OK"),
     Cancel => ("取消", "Cancel"),
     // Ticket 15: export actions + PDF-fallback reason.
     ExportHtml => ("导出 HTML", "Export HTML"),
     ExportMarkdown => ("导出 Markdown", "Export Markdown"),
     ExportPdf => ("导出 PDF", "Export PDF"),
-    ExportBackup => ("导出备份 (.leanote)", "Export backup (.leanote)"),
     PdfFellBack => ("服务器导出 PDF 失败，已导出 HTML", "Server PDF export failed, exported HTML instead"),
     NotSynced => ("笔记尚未同步到服务器", "Note is not synced to the server"),
     // Ticket 16 tray menu.
@@ -110,6 +118,35 @@ keys! {
     // Review item 2: sync-now/logout controls.
     SyncNow => ("立即同步", "Sync now"),
     Logout => ("登出", "Log out"),
+    // Issue 17: ⌘K quick actions + recents.
+    QuickActions => ("快捷操作", "Quick actions"),
+    Recents => ("最近打开", "Recents"),
+    ActionExportBackup => ("导出备份", "Export backup"),
+    // Issue 17: settings dialog.
+    SettingsTitle => ("设置", "Settings"),
+    Appearance => ("外观", "Appearance"),
+    AppearanceFollow => ("跟随系统", "Follow system"),
+    AppearanceLight => ("浅色", "Light"),
+    AppearanceDark => ("深色", "Dark"),
+    LanguageSetting => ("语言", "Language"),
+    EditorPalette => ("编辑器配色", "Editor palette"),
+    PaletteDefault => ("默认", "Default"),
+    PaletteWarm => ("暖色", "Warm"),
+    PaletteSolarized => ("Solarized", "Solarized"),
+    VimOn => ("Vim", "Vim"),
+    VimDefault => ("默认启用 Vim", "Enable Vim by default"),
+    AccountInfo => ("账户", "Account"),
+    ServerLabel => ("服务器", "Server"),
+    // Issue 17: Vim status line.
+    VimNormal => ("-- NORMAL --", "-- NORMAL --"),
+    VimInsert => ("-- INSERT --", "-- INSERT --"),
+    VimVisual => ("-- VISUAL --", "-- VISUAL --"),
+    // Issue 17: logout confirmation.
+    LogoutConfirmTitle => ("退出登录？", "Log out?"),
+    LogoutConfirmBody => (
+        "退出后将清除本地数据，需要重新登录。",
+        "Local data is cleared; you will need to sign in again."
+    ),
 }
 
 #[cfg(test)]
@@ -144,21 +181,92 @@ mod tests {
 
     // Exhaustive key list, kept next to the tables so a new key must be added here too.
     const ALL_KEYS: &[Key] = &[
-        Key::AppName, Key::LoginTitle, Key::LoginSubtitle, Key::Host, Key::Email, Key::Password,
-        Key::SignIn, Key::SigningIn, Key::Register, Key::LoginFailed, Key::SyncingTitle,
-        Key::SyncingSubtitle, Key::SyncDone, Key::SyncFailed, Key::NavAllNotes, Key::NavStarred,
-        Key::NavTrash, Key::NavNotebooks, Key::NavTags, Key::NoSelection,
-        Key::EmptyNotes, Key::Restore, Key::HardDelete, Key::EmptyTrash, Key::NewNote,
-        Key::Edit, Key::Done, Key::EditorPreview, Key::EditorSource, Key::Save,
-        Key::History, Key::RestoreVersion, Key::HistoryEmpty, Key::Saved,
-        Key::RichTextReadonly, Key::ConvertToMarkdown, Key::ConvertedToMarkdown,
-        Key::ExportHtml, Key::ExportMarkdown, Key::ExportPdf, Key::ExportBackup,
-        Key::PdfFellBack, Key::NotSynced,
-        Key::ConflictTitle, Key::ConflictLocal, Key::ConflictServer,
-        Key::UseLocal, Key::UseServer, Key::KeepBoth,
-        Key::NewNotebook, Key::RenameNotebook, Key::DeleteNotebook, Key::MoveNotebookTo,
-        Key::RootLevel, Key::RenameTag, Key::DeleteTag, Key::Confirm, Key::Cancel,
-        Key::SearchPlaceholder, Key::SearchNoResults, Key::SearchEmptyHint, Key::SearchFootnote,
-        Key::TrayShow, Key::TrayQuit, Key::SyncNow, Key::Logout,
+        Key::AppName,
+        Key::LoginTitle,
+        Key::LoginSubtitle,
+        Key::Host,
+        Key::Email,
+        Key::Password,
+        Key::SignIn,
+        Key::SigningIn,
+        Key::Register,
+        Key::LoginFailed,
+        Key::SyncingTitle,
+        Key::SyncingSubtitle,
+        Key::SyncDone,
+        Key::SyncFailed,
+        Key::NavAllNotes,
+        Key::NavStarred,
+        Key::NavTrash,
+        Key::NavNotebooks,
+        Key::NavTags,
+        Key::NoSelection,
+        Key::EmptyNotes,
+        Key::Restore,
+        Key::HardDelete,
+        Key::EmptyTrash,
+        Key::NewNote,
+        Key::Done,
+        Key::EditorPreview,
+        Key::EditorSource,
+        Key::Save,
+        Key::History,
+        Key::RestoreVersion,
+        Key::HistoryEmpty,
+        Key::Saved,
+        Key::RichTextReadonly,
+        Key::ConvertToMarkdown,
+        Key::ConvertedToMarkdown,
+        Key::ExportHtml,
+        Key::ExportMarkdown,
+        Key::ExportPdf,
+        Key::PdfFellBack,
+        Key::NotSynced,
+        Key::ConflictTitle,
+        Key::ConflictLocal,
+        Key::ConflictServer,
+        Key::UseLocal,
+        Key::UseServer,
+        Key::KeepBoth,
+        Key::NewNotebook,
+        Key::RenameNotebook,
+        Key::DeleteNotebook,
+        Key::MoveNotebookTo,
+        Key::RootLevel,
+        Key::RenameTag,
+        Key::DeleteTag,
+        Key::MoveNoteTo,
+        Key::DeleteNote,
+        Key::Confirm,
+        Key::Cancel,
+        Key::SearchPlaceholder,
+        Key::SearchNoResults,
+        Key::SearchEmptyHint,
+        Key::SearchFootnote,
+        Key::TrayShow,
+        Key::TrayQuit,
+        Key::SyncNow,
+        Key::Logout,
+        Key::QuickActions,
+        Key::Recents,
+        Key::ActionExportBackup,
+        Key::SettingsTitle,
+        Key::Appearance,
+        Key::AppearanceFollow,
+        Key::AppearanceLight,
+        Key::AppearanceDark,
+        Key::LanguageSetting,
+        Key::EditorPalette,
+        Key::PaletteDefault,
+        Key::PaletteWarm,
+        Key::VimOn,
+        Key::VimDefault,
+        Key::AccountInfo,
+        Key::ServerLabel,
+        Key::VimNormal,
+        Key::VimInsert,
+        Key::VimVisual,
+        Key::LogoutConfirmTitle,
+        Key::LogoutConfirmBody,
     ];
 }

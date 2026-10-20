@@ -26,6 +26,16 @@ use gpui_kit::{px, App, Context, Entity, Window};
 use leanote_core::SearchHit;
 
 gpui_kit::actions!(leanote, [ToggleSearch]);
+// Issue 17 Q6 quick actions: new note / sync / export backup / vim.
+gpui_kit::actions!(
+    leanote,
+    [
+        QuickNewNote,
+        QuickSyncNow,
+        QuickToggleVim,
+        QuickExportBackup
+    ]
+);
 
 /// ADR-0003 fixed overlay width.
 pub const OVERLAY_W: f32 = 680.;
@@ -57,7 +67,11 @@ pub fn format_rows(hits: &[SearchHit], notebook_of: impl Fn(&str) -> String) -> 
             let n = &h.note;
             ResultRow {
                 note_id: n.note_id.to_string(),
-                title: if n.title.is_empty() { "(untitled)".into() } else { n.title.clone() },
+                title: if n.title.is_empty() {
+                    "(untitled)".into()
+                } else {
+                    n.title.clone()
+                },
                 excerpt: h.excerpt.clone(),
                 meta: format!(
                     "{}{}",
@@ -98,7 +112,9 @@ pub struct SearchOverlay {
 
 impl SearchOverlay {
     pub fn new(window: &mut Window, cx: &mut Context<AppShell>) -> Self {
-        Self { state: cx.new(|cx| CommandState::new(window, cx)) }
+        Self {
+            state: cx.new(|cx| CommandState::new(window, cx)),
+        }
     }
 
     /// ⌘K: open when no dialog is up, close otherwise. Works in any phase —
@@ -124,6 +140,8 @@ impl SearchOverlay {
 }
 
 /// The dialog frame + palette with AppShell-owned callbacks wired in.
+/// Issue 17 Q6: three phases — empty query shows quick actions + local
+/// recents; a typed query shows core search results.
 fn render_dialog(
     dialog: Dialog,
     window: &mut Window,
@@ -132,53 +150,21 @@ fn render_dialog(
     shell: &Entity<AppShell>,
 ) -> Dialog {
     let lang = shell.read(cx).lang();
-    let rows = shell.read(cx).overlay_rows().to_vec();
     let dark = shell.read(cx).dark(window);
-
-    let shell_q = shell.clone();
-    let shell_c = shell.clone();
     let muted = theme::muted_foreground(dark);
     let t_footnote = i18n::t(lang, i18n::Key::SearchFootnote);
 
-    let group = CommandGroup::new().items(rows.iter().map(|r| {
-        CommandItem::new()
-            .label(r.title.clone())
-            .child({
-                // Row: title left, date right; excerpt + meta below — the
-                // CLI's three lines as one compact row.
-                let r = r.clone();
-                let muted = muted;
-                move |_: &mut Window, _: &mut App| {
-                    v_flex()
-                        .gap_0p5()
-                        .py_1()
-                        .child(
-                            h_flex()
-                                .justify_between()
-                                .gap_2()
-                                .child(Label::new(r.title.clone()).text_size(px(14.)))
-                                .child(
-                                    Label::new(r.date.clone())
-                                        .text_size(px(11.))
-                                        .text_color(muted),
-                                ),
-                        )
-                        .child(
-                            Label::new(r.excerpt.clone()).text_size(px(12.)).text_color(muted),
-                        )
-                        .child(Label::new(r.meta.clone()).text_size(px(11.)).text_color(muted))
-                        .into_any_element()
-                }
-            })
-    }));
+    let shell_q = shell.clone();
+    let shell_c = shell.clone();
+    let query = state.read(cx).query(cx);
+    let searching = crate::search_overlay::should_search(&query, false);
 
-    let palette = Command::new(state)
+    let mut palette = Command::new(state)
         .searchable(true)
         .filterable(false) // ranking comes from the core, order is fixed
         .bordered(false) // the dialog draws the frame
         .max_h(px(420.))
         .placeholder(i18n::t(lang, i18n::Key::SearchPlaceholder))
-        .group(group)
         .empty(move |state, _, cx| {
             // Empty input → how-to hint; typed query with no hits → no-results.
             let key = if state.query(cx).is_empty() {
@@ -190,7 +176,11 @@ fn render_dialog(
                 .py_6()
                 .w_full()
                 .items_center()
-                .child(Label::new(i18n::t(lang, key)).text_size(px(13.)).text_color(muted))
+                .child(
+                    Label::new(i18n::t(lang, key))
+                        .text_size(px(13.))
+                        .text_color(muted),
+                )
                 .into_any_element()
         })
         .footer(move |_, _, _| {
@@ -209,6 +199,86 @@ fn render_dialog(
         .on_confirm(move |index: IndexPath, window, cx| {
             shell_c.update(cx, |shell, cx| shell.confirm_overlay(index, window, cx));
         });
+
+    if searching {
+        let rows = shell.read(cx).overlay_rows().to_vec();
+        let group = CommandGroup::new().items(rows.iter().map(|r| {
+            CommandItem::new().label(r.title.clone()).child({
+                let r = r.clone();
+                let muted = muted;
+                move |_: &mut Window, _: &mut App| {
+                    v_flex()
+                        .gap_0p5()
+                        .py_1()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .gap_2()
+                                .child(Label::new(r.title.clone()).text_size(px(14.)))
+                                .child(
+                                    Label::new(r.date.clone())
+                                        .text_size(px(11.))
+                                        .text_color(muted),
+                                ),
+                        )
+                        .child(
+                            Label::new(r.excerpt.clone())
+                                .text_size(px(12.))
+                                .text_color(muted),
+                        )
+                        .child(
+                            Label::new(r.meta.clone())
+                                .text_size(px(11.))
+                                .text_color(muted),
+                        )
+                        .into_any_element()
+                }
+            })
+        }));
+        palette = palette.group(group);
+    } else {
+        // Quick actions (issue 17 Q6) — each dispatches an action the root
+        // div handles (root on_action handlers, app_shell.rs).
+        let actions_group = CommandGroup::new()
+            .label(i18n::t(lang, i18n::Key::QuickActions))
+            .items(
+                [
+                    (
+                        Box::new(QuickNewNote) as Box<dyn gpui_kit::Action>,
+                        i18n::t(lang, i18n::Key::NewNote),
+                    ),
+                    (
+                        Box::new(QuickExportBackup) as Box<dyn gpui_kit::Action>,
+                        i18n::t(lang, i18n::Key::ActionExportBackup),
+                    ),
+                    (
+                        Box::new(QuickToggleVim) as Box<dyn gpui_kit::Action>,
+                        i18n::t(lang, i18n::Key::VimOn),
+                    ),
+                    (
+                        Box::new(QuickSyncNow) as Box<dyn gpui_kit::Action>,
+                        i18n::t(lang, i18n::Key::SyncNow),
+                    ),
+                ]
+                .into_iter()
+                .map(|(act, label)| CommandItem::new().label(label).action(act)),
+            );
+        palette = palette.group(actions_group);
+
+        // Recents — local, from prefs (issue 17 Q6). Confirmed via
+        // on_confirm: empty-query section 1 is this group.
+        let recents = shell.read(cx).recent_rows();
+        if !recents.is_empty() {
+            let recents_group = CommandGroup::new()
+                .label(i18n::t(lang, i18n::Key::Recents))
+                .items(
+                    recents
+                        .iter()
+                        .map(|(_, title)| CommandItem::new().label(title.clone())),
+                );
+            palette = palette.group(recents_group);
+        }
+    }
 
     dialog
         .w(px(OVERLAY_W))
@@ -278,7 +348,14 @@ mod tests {
     #[test]
     fn format_rows_untitled_and_no_tags() {
         let hits = leanote_core::search_notes(
-            &[note("000000000000000000000002", "", "body mentions zebra", &[], "nb2", 0)],
+            &[note(
+                "000000000000000000000002",
+                "",
+                "body mentions zebra",
+                &[],
+                "nb2",
+                0,
+            )],
             "zebra",
             20,
         );
@@ -290,7 +367,10 @@ mod tests {
     #[test]
     fn should_search_gates_composition_and_empty() {
         assert!(should_search("leanote", false));
-        assert!(!should_search("", false), "empty query → hint state, no search");
+        assert!(
+            !should_search("", false),
+            "empty query → hint state, no search"
+        );
         assert!(!should_search("ле", true), "preedit in flight → no search");
         assert!(should_search("ле", false), "committed → search");
     }

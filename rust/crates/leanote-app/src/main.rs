@@ -5,10 +5,12 @@ mod browse;
 mod conflict_bar;
 mod export;
 mod i18n;
+mod prefs;
 mod search_overlay;
 mod single_instance;
 mod theme;
 mod tray;
+mod vim;
 mod window_state;
 
 use app_shell::AppShell;
@@ -48,38 +50,38 @@ impl gpui_kit::http_client::HttpClient for UreqHttpClient {
         // Blocking ureq runs on smol's thread pool, off the UI thread.
         async move {
             smol::unblock(move || {
-            let (parts, body) = req.into_parts();
-            // AsyncBody is an in-memory cursor or async reader; image GETs
-            // carry empty bodies — drain on this worker thread's executor.
-            let mut send_body: Vec<u8> = Vec::new();
-            smol::block_on(async {
-                use smol::io::AsyncReadExt as _;
-                let mut body = body;
-                body.read_to_end(&mut send_body).await
-            })?;
-            let agent = match follow {
-                RedirectPolicy::FollowAll => agent,
-                RedirectPolicy::FollowLimit(n) => ureq::Agent::config_builder()
-                    .max_redirects(n)
-                    .build()
-                    .new_agent(),
-                RedirectPolicy::NoFollow => ureq::Agent::config_builder()
-                    .max_redirects(0)
-                    .build()
-                    .new_agent(),
-            };
-            let mut request = http::Request::builder()
-                .method(parts.method.as_str())
-                .uri(parts.uri.to_string());
-            for (name, value) in parts.headers.iter() {
-                request = request.header(name.as_str(), value.to_str().unwrap_or(""));
-            }
-            let (parts, mut body) = agent.run(request.body(send_body)?)?.into_parts();
-            let mut bytes = Vec::new();
-            body.as_reader().read_to_end(&mut bytes)?;
-            Ok(http::Response::builder()
-                .status(parts.status)
-                .body(AsyncBody::from(bytes))?)
+                let (parts, body) = req.into_parts();
+                // AsyncBody is an in-memory cursor or async reader; image GETs
+                // carry empty bodies — drain on this worker thread's executor.
+                let mut send_body: Vec<u8> = Vec::new();
+                smol::block_on(async {
+                    use smol::io::AsyncReadExt as _;
+                    let mut body = body;
+                    body.read_to_end(&mut send_body).await
+                })?;
+                let agent = match follow {
+                    RedirectPolicy::FollowAll => agent,
+                    RedirectPolicy::FollowLimit(n) => ureq::Agent::config_builder()
+                        .max_redirects(n)
+                        .build()
+                        .new_agent(),
+                    RedirectPolicy::NoFollow => ureq::Agent::config_builder()
+                        .max_redirects(0)
+                        .build()
+                        .new_agent(),
+                };
+                let mut request = http::Request::builder()
+                    .method(parts.method.as_str())
+                    .uri(parts.uri.to_string());
+                for (name, value) in parts.headers.iter() {
+                    request = request.header(name.as_str(), value.to_str().unwrap_or(""));
+                }
+                let (parts, mut body) = agent.run(request.body(send_body)?)?.into_parts();
+                let mut bytes = Vec::new();
+                body.as_reader().read_to_end(&mut bytes)?;
+                Ok(http::Response::builder()
+                    .status(parts.status)
+                    .body(AsyncBody::from(bytes))?)
             })
             .await
         }
@@ -106,7 +108,11 @@ fn fake_prefill() -> Option<(String, String, String)> {
         Some((v, String::new(), String::new()))
     } else if !v.is_empty() {
         boot_fake_server();
-        Some((FAKE_URL.get().cloned().unwrap_or_default(), "user@example.com".into(), "right-password".into()))
+        Some((
+            FAKE_URL.get().cloned().unwrap_or_default(),
+            "user@example.com".into(),
+            "right-password".into(),
+        ))
     } else {
         None
     }
@@ -207,118 +213,151 @@ fn main() {
                 .build()
                 .new_agent(),
         )))
+        // Icons: without an AssetSource every svg().path("icons/…") load
+        // fails and Icon/IconName render empty — register the kit's
+        // embedded Lucide catalog.
+        .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
-        gpui_kit::init(cx);
+            gpui_kit::init(cx);
 
-        // Ticket 13: ⌘K / Ctrl+K toggle the global search overlay.
-        cx.bind_keys([
-            gpui_kit::KeyBinding::new("cmd-k", search_overlay::ToggleSearch, None),
-            gpui_kit::KeyBinding::new("ctrl-k", search_overlay::ToggleSearch, None),
-        ]);
+            // Ticket 13: ⌘K / Ctrl+K toggle the global search overlay.
+            // Issue 17: ⌘⇧P / Ctrl+Shift+P open the same palette.
+            cx.bind_keys([
+                gpui_kit::KeyBinding::new("cmd-k", search_overlay::ToggleSearch, None),
+                gpui_kit::KeyBinding::new("ctrl-k", search_overlay::ToggleSearch, None),
+                gpui_kit::KeyBinding::new("cmd-shift-p", search_overlay::ToggleSearch, None),
+                gpui_kit::KeyBinding::new("ctrl-shift-p", search_overlay::ToggleSearch, None),
+            ]);
 
-        // Theme: follow system first (loads registered theme), then overlay
-        // Wake tokens. Re-applied on every appearance change.
-        Theme::sync_system_appearance(None, cx);
-        Theme::update(cx, apply_wake_theme);
+            let prefs = prefs::Prefs::load(&dir);
+            let pref_palette: std::sync::Arc<String> =
+                std::sync::Arc::new(prefs.editor_palette.clone());
+            let palette_boot = pref_palette.clone();
 
-        let lang = i18n::system_lang();
-
-        // Already signed in? → straight to shell (startup incr-sync is 04's).
-        let signed_in_account = leanote_core::Store::open(dir.clone(), "user1".into())
-            .ok()
-            .and_then(|s| s.active_account().ok().flatten());
-        let signed_in = signed_in_account.is_some();
-
-        let displays: Vec<gpui_kit::Bounds<gpui_kit::Pixels>> =
-            cx.displays().iter().map(|d| d.visible_bounds()).collect();
-        let state = window_state::WindowState::load(&dir)
-            .map(|s| s.clamped(&displays))
-            .unwrap_or_else(|| {
-                let b = gpui_kit::Bounds::centered(
-                    None,
-                    gpui_kit::size(px(window_state::DEFAULT_W), px(window_state::DEFAULT_H)),
-                    cx,
-                );
-                window_state::WindowState::from_bounds(&b)
-            });
-
-        let bounds = state.bounds();
-        let options = WindowOptions {
-            window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: Some("Leanote".into()),
-                appears_transparent: true,
-                traffic_light_position: None,
-            }),
-            window_min_size: Some(gpui_kit::size(px(960.), px(600.))),
-            ..Default::default()
-        };
-
-        let dir_for_window = dir.clone();
-        let fake_for_window = fake.clone();
-        let dir_close = dir.clone();
-        let (handle, shell) = gpui_kit::open_window(options, cx, move |window, cx| {
-            // Per-window appearance → keep tokens in sync with the OS.
-            let _ = window.observe_window_appearance(|_window, cx| {
-                Theme::sync_system_appearance(None, cx);
-                Theme::update(cx, apply_wake_theme);
-            });
-            // Persist size/position at close.
-            window.on_window_should_close(cx, move |window, _cx| {
-                if let gpui_kit::WindowBounds::Windowed(b) = window.window_bounds() {
-                    window_state::WindowState::from_bounds(&b).save(&dir_close);
+            // Theme: follow system first (loads registered theme), then overlay
+            // Wake tokens + editor palette. Re-applied on every appearance
+            // change. `apply_config` overwrites highlight_theme on every mode
+            // reload, so the palette assignment lives here too.
+            match prefs.appearance {
+                prefs::AppearancePref::Follow => Theme::sync_system_appearance(None, cx),
+                prefs::AppearancePref::Light => {
+                    Theme::change(gpui_kit::component::ThemeMode::Light, None, cx)
                 }
-                true
-            });
-            cx.new(|cx| {
-                AppShell::new(
-                    window,
-                    cx,
-                    dir_for_window.clone(),
-                    lang,
-                    signed_in,
-                    signed_in_account.map(|a| a.user_id),
-                    fake_for_window
-                        .as_ref()
-                        .map(|(h, e, p)| (h.as_str(), e.as_str(), p.as_str())),
-                )
-            })
-        })
-        .expect("open window");
-        single_instance::remember_window(handle);
-        single_instance::listen(listener, cx);
-        // Ticket 16: tray icon + 显示/退出 menu (left-click → show).
-        tray::init(cx);
+                prefs::AppearancePref::Dark => {
+                    Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx)
+                }
+            }
+            Theme::update(cx, move |theme| apply_wake_theme(theme, &palette_boot));
 
-        // Review item 2: returning user → background incr sync (non-blocking).
-        if signed_in {
-            let shell_boot = shell.clone();
-            cx.spawn(async move |cx| {
-                let _ = shell_boot.update(cx, |s, cx| s.sync_now(cx));
-            })
-            .detach();
-        }
+            let lang = match prefs.lang {
+                prefs::LangPref::Follow => i18n::system_lang(),
+                prefs::LangPref::Zh => i18n::Lang::Zh,
+                prefs::LangPref::En => i18n::Lang::En,
+            };
 
-        // Demo helper: auto-submit the fake login for screenshots.
-        if std::env::var("LEANOTE_FAKE_AUTOSUBMIT").ok().as_deref() == Some("1") {
-            cx.spawn(async move |cx| {
-                smol::Timer::after(std::time::Duration::from_secs(1)).await;
-                let _ = shell.update(cx, |s, cx| s.start_login(cx));
-            })
-            .detach();
-        }
+            // Already signed in? → straight to shell (startup incr-sync is 04's).
+            let signed_in_account = leanote_core::Store::open(dir.clone(), "user1".into())
+                .ok()
+                .and_then(|s| s.active_account().ok().flatten());
+            let signed_in = signed_in_account.is_some();
 
-    });
+            let displays: Vec<gpui_kit::Bounds<gpui_kit::Pixels>> =
+                cx.displays().iter().map(|d| d.visible_bounds()).collect();
+            let state = window_state::WindowState::load(&dir)
+                .map(|s| s.clamped(&displays))
+                .unwrap_or_else(|| {
+                    let b = gpui_kit::Bounds::centered(
+                        None,
+                        gpui_kit::size(px(window_state::DEFAULT_W), px(window_state::DEFAULT_H)),
+                        cx,
+                    );
+                    window_state::WindowState::from_bounds(&b)
+                });
+
+            let bounds = state.bounds();
+            let options = WindowOptions {
+                window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Leanote".into()),
+                    appears_transparent: true,
+                    traffic_light_position: None,
+                }),
+                window_min_size: Some(gpui_kit::size(px(960.), px(600.))),
+                ..Default::default()
+            };
+
+            let dir_for_window = dir.clone();
+            let fake_for_window = fake.clone();
+            let dir_close = dir.clone();
+            let (handle, shell) = gpui_kit::open_window(options, cx, move |window, cx| {
+                // Per-window appearance → keep tokens in sync with the OS.
+                // Mode reloads overwrite highlight_theme, so the palette is
+                // re-applied here too.
+                let palette_for_observer = pref_palette.clone();
+                let _ = window.observe_window_appearance(move |_window, cx| {
+                    Theme::sync_system_appearance(None, cx);
+                    let p = palette_for_observer.clone();
+                    Theme::update(cx, move |theme| apply_wake_theme(theme, &p));
+                });
+                // Persist size/position at close.
+                window.on_window_should_close(cx, move |window, _cx| {
+                    if let gpui_kit::WindowBounds::Windowed(b) = window.window_bounds() {
+                        window_state::WindowState::from_bounds(&b).save(&dir_close);
+                    }
+                    true
+                });
+                cx.new(|cx| {
+                    AppShell::new(
+                        window,
+                        cx,
+                        dir_for_window.clone(),
+                        lang,
+                        signed_in,
+                        signed_in_account.map(|a| a.user_id),
+                        fake_for_window
+                            .as_ref()
+                            .map(|(h, e, p)| (h.as_str(), e.as_str(), p.as_str())),
+                    )
+                })
+            })
+            .expect("open window");
+            single_instance::remember_window(handle);
+            single_instance::listen(listener, cx);
+            // Ticket 16: tray icon + 显示/退出 menu (left-click → show).
+            tray::init(cx);
+
+            // Review item 2: returning user → background incr sync (non-blocking).
+            if signed_in {
+                let shell_boot = shell.clone();
+                cx.spawn(async move |cx| {
+                    let _ = shell_boot.update(cx, |s, cx| s.sync_now(cx));
+                })
+                .detach();
+            }
+
+            // Demo helper: auto-submit the fake login for screenshots.
+            if std::env::var("LEANOTE_FAKE_AUTOSUBMIT").ok().as_deref() == Some("1") {
+                cx.spawn(async move |cx| {
+                    smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                    let _ = shell.update(cx, |s, cx| s.start_login(cx));
+                })
+                .detach();
+            }
+        });
 }
 
 /// Wake tokens on top of the kit theme (materials, radii, fonts).
 /// Call AFTER sync_system_appearance, never inside the same update that
 /// changes mode (mode swap reloads and wipes color edits).
-fn apply_wake_theme(theme: &mut Theme) {
+pub(crate) fn apply_wake_theme(theme: &mut Theme, palette_id: &str) {
     use gpui_kit::component::theme::{ThemeColor, ThemeMode};
     let dark = theme.mode == ThemeMode::Dark;
     // ThemeColor is Copy; light()/dark() hand back an Arc of the base table.
-    let mut colors = *if dark { ThemeColor::dark() } else { ThemeColor::light() };
+    let mut colors = *if dark {
+        ThemeColor::dark()
+    } else {
+        ThemeColor::light()
+    };
     colors.title_bar = theme::material(theme::Material::Base, dark);
     colors.sidebar = theme::material(theme::Material::Base, dark);
     colors.list = theme::material(theme::Material::List, dark);
@@ -336,4 +375,8 @@ fn apply_wake_theme(theme: &mut Theme) {
     theme.mono_font_family = theme::MONO.into();
     theme.font_size = px(14.);
     theme.shadow = false; // ADR-0003: zero shadow on persistent UI
+                          // Issue 17: editor palette ("" = keep the kit default highlight theme).
+    if !palette_id.is_empty() {
+        theme.highlight_theme = theme::editor_palette(palette_id, dark);
+    }
 }

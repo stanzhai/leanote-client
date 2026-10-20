@@ -56,3 +56,23 @@ macOS-first, via `tray-icon` (gpui-kit ships no tray API): icon + menu
 the last window quits on Win/Linux (gpui `QuitMode::Default`); on macOS the
 app stays resident with its dock icon (platform default) — use the tray
 退出 to quit.
+
+## Keyboard & UI (issue 17)
+
+- **⌘K / ⌘⇧P (Ctrl+Shift+P)** — three-section quick panel: quick actions
+  (new note / sync now / export backup / toggle Vim), recents (top 6, empty
+  query), and debounced search. Bare keys always go to the focused element;
+  only modifier combos open the panel. IME composition never triggers it.
+- **Default editing state** — selecting a Markdown note opens it in source
+  edit mode (preview is a toggle, not the default). The title row is pinned
+  at the top of the pane (editable in source, read-only in preview). Edits
+  mark dirty after a debounce; unchanged notes never write or sync. ⌘S saves
+  immediately.
+- **Vim mode** — normal/insert/visual layers (motions `h j k l w b 0 $ gg G`,
+  operators `d c y`, `x dd yy p u`, `i a o O`, `v V`, `:w :q`, esc), a
+  toolbar toggle, and a `-- NORMAL --` status line. The preference persists
+  locally. ⌘K also exposes a quick toggle.
+- **Bottom-left cluster** — sync (cloud icon with state), settings (gear →
+  centered dialog: appearance follow/light/dark, editor palette, language,
+  Vim default, account info + logout), username (menu with logout →
+  confirmation dialog). Settings persist as local JSON.
