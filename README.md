@@ -33,6 +33,43 @@ $> npm run less:watch
 $> npm run dev
 ```
 
+## Rust 重写版（GPUI）
+
+本仓库含一套完整的 Rust 重写（`rust/`）：SQLite 存储、leanote 同步引擎、本地 HTTP/MCP（127.0.0.1:8912）、三栏 GPUI 桌面端与命令行工具，与 Electron 版线协议、CLI 字节输出、MCP 行为对拍一致。详见 `rust/README.md`。
+
+### 开发与运行
+
+```sh
+cd rust
+cargo build --release            # 产出 target/release/leanote-app（GUI）与 leanote（CLI）
+cargo test                       # 全工作区测试（145 个）
+./target/release/leanote-app     # 直接运行桌面端
+
+# 冒烟（假服务器 + 自动登录，无需真实账号）：
+LEANOTE_RUST_DATA=/tmp/smoke LEANOTE_FAKE_SERVER=1 LEANOTE_FAKE_AUTOSUBMIT=1 ./target/release/leanote-app
+```
+
+数据目录：`~/Library/Application Support/leanote-rust/`（可用 `LEANOTE_RUST_DATA` 覆盖），与 Electron 版的 NeDB 数据完全隔离。日志：`<数据目录>/logs/app.log`；`LEANOTE_MCP_DEBUG=1` 时追加 `~/leanote_mcp.log`（与 JS 版一致）。
+
+### 打包（macOS）
+
+```sh
+sh rust/scripts/package-macos.sh        # 默认输出 ../dist（相对 rust/）
+```
+
+产出 `dist/Leanote.app`（GUI + CLI 双二进制、`icon.icns`、ad-hoc 签名）、`dist/Leanote.dmg`（hdiutil），并把 `~/bin/leanote` 指向包内 CLI。Linux/Windows 暂无打包脚本，见 `rust/README.md` 平台说明。
+
+验收脚本：`sh rust/scripts/acceptance-macos.sh`（CLI/HTTP/MCP/日志/打包产物，15 项）。
+
+### CLI 与 MCP 对拍
+
+```sh
+LEANOTE_PORT=8913 bash rust/crates/leanote-cli/compare-with-js.sh . rust/target/debug/leanote   # JS/Rust CLI 逐字节对比（56/56）
+LEANOTE_RUST_MCP=1 node tests/test_mcp_server.js                    # 未修改的 JS 测试跑 Rust MCP
+LEANOTE_RUST_MCP=1 node tests/test_mcp_sse.js
+LEANOTE_RUST_MCP=1 node tests/test_mcp_stateless.js
+```
+
 ## Package
 
 ```shell
