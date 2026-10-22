@@ -14,10 +14,11 @@
 //!   `InputBaseState::undo` is `pub(super)` in gpui-base, so it stays a
 //!   dispatched kit action (deferred by gpui, harmless).
 //!
-//! Caret model (ADR-0005): normal mode rests with a collapsed caret;
-//! entering normal from insert block-selects the char under the cursor
-//! (`off..off+1`); visual selection is `anchor..caret+1` (rgpui's
-//! `extend_to` plus one char, because the block caret covers a char).
+//! Caret model (ADR-0005): normal mode rests on a collapsed caret and the
+//! kit's native block cursor (vendored `set_block_cursor`); nothing is
+//! selected — not even a trailing `\n`. Insert mode clears the flag and
+//! uses the thin caret. Visual selection is `anchor..caret+1` (rgpui's
+//! `extend_to` plus one char, because the block covers a char).
 //! `consume` tracks the visual caret itself — the kit reports the
 //! selection end as its cursor, which is not the moving end.
 //!
@@ -66,6 +67,8 @@ pub enum Motion {
     LineStart,
     /// `$`
     LineEnd,
+    /// `^`
+    FirstNonBlank,
     /// `gg` — first line, preferred column
     DocStart,
     /// `G` — last line, preferred column
@@ -74,6 +77,10 @@ pub enum Motion {
     NextWord,
     /// `b`
     PrevWord,
+    /// `{` — previous blank line (paragraph boundary)
+    ParaBackward,
+    /// `}` — next blank line (paragraph boundary)
+    ParaForward,
 }
 
 impl Motion {
@@ -97,6 +104,12 @@ pub enum DeleteOp {
     ToLineStart,
     /// `d$`
     ToLineEnd,
+    /// `d^`
+    ToFirstNonBlank,
+    /// `d}`/`y}`/`c}` — to the next paragraph boundary
+    ToParaForward,
+    /// `d{`/`y{`/`c{` — to the previous paragraph boundary
+    ToParaBackward,
 }
 
 /// `dd`/`yy`/`cc` — the current line.
@@ -282,6 +295,9 @@ impl VimState {
             "k" => VimAction::Move(Motion::Up),
             "0" => VimAction::Move(Motion::LineStart),
             "$" => VimAction::Move(Motion::LineEnd),
+            "{" => VimAction::Move(Motion::ParaBackward),
+            "}" => VimAction::Move(Motion::ParaForward),
+            "^" => VimAction::Move(Motion::FirstNonBlank),
             "G" => VimAction::Move(Motion::DocEnd),
             "w" => VimAction::Move(Motion::NextWord),
             "b" => VimAction::Move(Motion::PrevWord),
@@ -290,6 +306,7 @@ impl VimState {
                 VimAction::Consumed
             }
             "x" | "delete" => VimAction::Delete(DeleteOp::Char),
+            "D" => VimAction::Delete(DeleteOp::ToLineEnd),
             "backspace" => VimAction::Move(Motion::Left),
             "i" => VimAction::EnterInsert {
                 append: false,
@@ -338,6 +355,9 @@ impl VimState {
             "k" => VimAction::Move(Motion::Up),
             "0" => VimAction::Move(Motion::LineStart),
             "$" => VimAction::Move(Motion::LineEnd),
+            "{" => VimAction::Move(Motion::ParaBackward),
+            "}" => VimAction::Move(Motion::ParaForward),
+            "^" => VimAction::Move(Motion::FirstNonBlank),
             "G" => VimAction::Move(Motion::DocEnd),
             "g" => VimAction::Move(Motion::DocStart),
             "w" => VimAction::Move(Motion::NextWord),
@@ -362,6 +382,9 @@ fn motion_of(key: &str) -> Option<Motion> {
         "k" => Motion::Up,
         "0" => Motion::LineStart,
         "$" => Motion::LineEnd,
+        "^" => Motion::FirstNonBlank,
+        "{" => Motion::ParaBackward,
+        "}" => Motion::ParaForward,
         "w" => Motion::NextWord,
         "b" => Motion::PrevWord,
         _ => return None,
@@ -373,6 +396,9 @@ fn operator_motion(op: char, m: Motion) -> VimAction {
         Motion::NextWord => DeleteOp::ToNextWord,
         Motion::LineStart => DeleteOp::ToLineStart,
         Motion::LineEnd => DeleteOp::ToLineEnd,
+        Motion::FirstNonBlank => DeleteOp::ToFirstNonBlank,
+        Motion::ParaForward => DeleteOp::ToParaForward,
+        Motion::ParaBackward => DeleteOp::ToParaBackward,
         Motion::Left | Motion::Right => DeleteOp::Char,
         _ => return VimAction::Consumed,
     };
@@ -398,6 +424,36 @@ fn line_range(text: &Rope, row: usize) -> (usize, usize) {
 
 fn row_of(text: &Rope, offset: usize) -> usize {
     text.offset_to_point(offset).row
+}
+
+/// Whether `row` is empty or all whitespace — a paragraph boundary.
+fn is_blank_row(text: &Rope, row: usize) -> bool {
+    let (start, end) = line_range(text, row);
+    text.slice(start..end).chars().all(|c| c.is_whitespace())
+}
+
+/// `}`: jump to the next blank line (paragraph boundary) strictly below
+/// `row`; the buffer end when there is none (the kit's trailing virtual
+/// row after a final `\n` is itself blank and matches vim's end stop).
+/// `d}` deletes `caret..boundary` (exclusive).
+fn para_forward(text: &Rope, row: usize) -> usize {
+    for r in (row + 1)..text.lines_len() {
+        if is_blank_row(text, r) {
+            return text.line_start_offset(r);
+        }
+    }
+    text.len()
+}
+
+/// `{`: start of the previous blank line strictly above `row`; row 0
+/// start when there is none. `d{` deletes `boundary..caret`.
+fn para_backward(text: &Rope, row: usize) -> usize {
+    for r in (0..row).rev() {
+        if is_blank_row(text, r) {
+            return text.line_start_offset(r);
+        }
+    }
+    text.line_start_offset(0)
 }
 
 /// Byte offset of the `col`-th char of `row`, clamped to the line end.
@@ -486,23 +542,22 @@ fn goto(state: &mut EditorState, offset: usize, cx: &mut Context<EditorState>) {
     let offset = offset.min(state.text().len());
     state.set_selected_range(offset..offset, cx);
 }
-/// Normal-mode rest position (ADR-0005): a block caret on the char at
-/// `offset`. Insert mode keeps the thin caret, so callers routing
-/// mode-dependent rests go through this instead of `goto`.
+
+/// Normal-mode rest position (ADR-0005): the kit's native block caret at
+/// `offset` (vendored `set_block_cursor`); the selection stays collapsed.
+/// Insert mode keeps the thin caret, so callers routing mode-dependent
+/// rests go through this instead of `goto`.
 fn rest(state: &mut EditorState, mode: VimMode, offset: usize, cx: &mut Context<EditorState>) {
-    if mode == VimMode::Insert {
-        goto(state, offset, cx);
-    } else {
-        block_caret(state, offset, cx);
-    }
+    state.set_block_cursor(mode != VimMode::Insert, cx);
+    goto(state, offset, cx);
 }
 
-/// ADR-0005 block caret: select the char at `offset`.
+/// ADR-0005 block caret, now native to the vendored kit: paint collapses
+/// the selection (nothing selected — not even a trailing `\n`) and the
+/// editor draws a blinking block over the char at the offset.
 fn block_caret(state: &mut EditorState, offset: usize, cx: &mut Context<EditorState>) {
-    let text = state.text().clone();
-    let (line_start, line_end) = line_range(&text, row_of(&text, offset));
-    let end = next_char(&text, offset).min(line_end).max(line_start);
-    state.set_selected_range(offset..end, cx);
+    state.set_block_cursor(true, cx);
+    goto(state, offset, cx);
 }
 
 fn delete_range(
@@ -560,7 +615,19 @@ pub fn exec(
                     char_offset_in_line(&text, row, vim.preferred_col)
                 }
                 Motion::LineStart => line_start,
-                // On the last char (empty line: line_start).
+                // `^`: first non-blank char; blank-only line falls back to
+                // the line start.
+                Motion::FirstNonBlank => {
+                    let (start, end) = (line_start, line_end);
+                    let mut target = start;
+                    for ch in text.slice(start..end).chars() {
+                        if !ch.is_whitespace() {
+                            break;
+                        }
+                        target += ch.len_utf8();
+                    }
+                    target
+                }
                 Motion::LineEnd => prev_char(&text, line_end).max(line_start),
                 Motion::DocStart | Motion::DocEnd => {
                     let row = if *m == Motion::DocStart {
@@ -572,6 +639,8 @@ pub fn exec(
                 }
                 Motion::NextWord => word_forward(&text, caret),
                 Motion::PrevWord => word_backward(&text, caret),
+                Motion::ParaForward => para_forward(&text, row_of(&text, caret)),
+                Motion::ParaBackward => para_backward(&text, row_of(&text, caret)),
             };
             if vim.mode == VimMode::Visual {
                 extend_selection(vim, state, target, cx);
@@ -585,9 +654,11 @@ pub fn exec(
                 Motion::Left
                     | Motion::Right
                     | Motion::LineStart
-                    | Motion::LineEnd
+                    | Motion::FirstNonBlank
                     | Motion::NextWord
                     | Motion::PrevWord
+                    | Motion::ParaForward
+                    | Motion::ParaBackward
             ) {
                 vim.preferred_col = char_col(&text, target);
             }
@@ -702,6 +773,7 @@ pub fn exec(
             } else {
                 goto(state, at, cx);
             }
+            state.set_block_cursor(false, cx); // insert mode: thin caret only
             vim.mode = VimMode::Insert;
             cx.notify();
         }
@@ -753,7 +825,19 @@ fn delete_range_for(op: DeleteOp, text: &Rope, caret: usize) -> Option<std::ops:
         }
         DeleteOp::ToNextWord => caret..word_forward(text, caret),
         DeleteOp::ToLineStart => line_start..caret,
+        DeleteOp::ToFirstNonBlank => {
+            let mut first = line_start;
+            for ch in text.slice(line_start..caret).chars() {
+                if !ch.is_whitespace() {
+                    break;
+                }
+                first += ch.len_utf8();
+            }
+            first..caret
+        }
         DeleteOp::ToLineEnd => caret..line_end,
+        DeleteOp::ToParaForward => caret..para_forward(text, row_of(text, caret)),
+        DeleteOp::ToParaBackward => para_backward(text, row_of(text, caret))..caret,
     })
 }
 

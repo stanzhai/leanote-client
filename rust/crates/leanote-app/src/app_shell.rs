@@ -722,11 +722,13 @@ impl AppShell {
         // Issue 17 Q12: every session starts in normal mode.
         self.vim = crate::vim::VimState::new();
         // ADR-0005: normal mode rests on a block caret, so the very
-        // first frame already shows one.
+        // first frame already shows one. Native block (vendored kit):
+        // collapsed selection + blinking block, nothing selected.
         if self.vim_enabled {
             let editor = self.editing.as_ref().unwrap().content.clone();
             editor.update(cx, |state, cx| {
-                state.set_selected_range(0..1, cx);
+                state.set_block_cursor(true, cx);
+                state.set_selected_range(0..0, cx);
             });
         }
         self.history_open = false;
@@ -1661,6 +1663,12 @@ impl Render for AppShell {
                     // next enable starts clean (issue 17 Q12).
                     if !this.vim_enabled {
                         this.vim.reset();
+                    }
+                    // Sync the caret shape with the new mode (ADR-0005).
+                    if let Some(ed) = &this.editing {
+                        let content = ed.content.clone();
+                        content
+                            .update(cx, |state, cx| state.set_block_cursor(this.vim_enabled, cx));
                     }
                     this.save_vim_pref(cx);
                     cx.notify();
@@ -3967,14 +3975,17 @@ mod tests {
             );
             assert_eq!(content.read(cx).value(), "hello world");
         });
-        // ADR-0005: a fresh editor session starts in normal mode with a
-        // block caret (the char under the cursor selected) — not a thin
-        // insert caret.
+        // ADR-0005: a fresh editor session starts in normal mode with the
+        // native block caret — collapsed selection + block flag set.
         cx.update(|_, cx| {
             assert_eq!(
                 content.read(cx).selected_range(),
-                0..1,
-                "editor entry must show the normal-mode block caret"
+                0..0,
+                "normal mode must not select anything (native block caret)"
+            );
+            assert!(
+                content.read(cx).block_cursor(),
+                "normal mode must paint the block caret"
             );
         });
         // Normal-mode "l" moves right without typing — driven through
@@ -3985,18 +3996,39 @@ mod tests {
         cx.simulate_keystrokes("l");
         cx.update(|_, cx| {
             let range = content.read(cx).selected_range();
-            assert_eq!(range, 1..2, "vim l must block-select the next char");
+            assert_eq!(range, 1..1, "vim l moves the collapsed caret");
+        });
+        // "^" jumps to the first non-blank char ("hello world": col 0),
+        // driven through the real dispatch chain (shifted symbol).
+        cx.simulate_keystrokes("^");
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).selected_range(),
+                0..0,
+                "^ must land on the first non-blank char"
+            );
+        });
+        cx.simulate_keystrokes("l"); // restore caret at col 1
+        cx.update(|_, cx| {
+            assert_eq!(content.read(cx).selected_range(), 1..1);
         });
         // "i" + typing inserts at cursor; escape returns to normal.
         cx.simulate_keystrokes("i");
+        cx.update(|_, cx| {
+            assert!(
+                !content.read(cx).block_cursor(),
+                "insert mode must use the thin caret"
+            );
+        });
         cx.simulate_input("X");
         cx.simulate_keystrokes("escape");
         cx.update(|_, cx| {
             assert_eq!(
                 content.read(cx).selected_range(),
-                2..3,
-                "esc from insert must block-select the char at the caret"
+                2..2,
+                "esc from insert must return the collapsed normal caret"
             );
+            assert!(content.read(cx).block_cursor());
         });
         cx.simulate_keystrokes("x");
         cx.update(|_, cx| {
@@ -4115,8 +4147,8 @@ mod tests {
         cx.update(|_, cx| {
             assert_eq!(
                 content.read(cx).selected_range(),
-                2..3,
-                "$ must block-select the line's last char"
+                2..2,
+                "$ must rest collapsed on the line's last char"
             );
         });
 
@@ -4142,6 +4174,139 @@ mod tests {
                 shell.vim.register.as_deref(),
                 Some("e\no"),
                 "visual yank captures the extended selection"
+            );
+        });
+
+        // Empty-line block caret (ADR-0005): the selection covers the
+        // `\n` itself — the kit paints a selected newline as a
+        // one-space cell, which is the block caret there. Replacing the
+        // buffer with a leading indented line + empty line.
+        cx.update(|window, cx| {
+            content.update(cx, |state, cx| state.replace_all("  ab\n\ncd", window, cx))
+        });
+        cx.update(|window, cx| {
+            shell_entity.update(cx, |shell, cx| {
+                // 0 → line start ("0"), then ^: col 2.
+                shell.vim_key_down(&key("0"), window, cx);
+                shell.vim_key_down(&key("^"), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).selected_range(),
+                2..2,
+                "^ must land on the first non-blank char of an indented line"
+            );
+            assert!(content.read(cx).block_cursor());
+        });
+        cx.update(|window, cx| {
+            shell_entity.update(cx, |shell, cx| {
+                shell.vim_key_down(&key("j"), window, cx); // to the empty line
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).selected_range(),
+                5..5,
+                "empty-line caret is collapsed; the block is painted by the kit"
+            );
+            assert!(content.read(cx).block_cursor());
+        });
+        cx.update(|window, cx| {
+            shell_entity.update(cx, |shell, cx| {
+                shell.vim_key_down(&key("x"), window, cx); // no-op on an empty line
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).value(),
+                "  ab\n\ncd",
+                "x on an empty line must not join lines"
+            );
+            assert_eq!(
+                content.read(cx).selected_range(),
+                5..5,
+                "x on an empty line keeps the collapsed caret"
+            );
+            assert!(content.read(cx).block_cursor());
+        });
+
+        // D: delete to line end (caret col 2 → rest "").
+        cx.update(|window, cx| {
+            content.update(cx, |state, cx| {
+                state.replace_all("para1\n\npara2 line\n", window, cx)
+            })
+        });
+        cx.update(|window, cx| {
+            shell_entity.update(cx, |shell, cx| {
+                shell.vim_key_down(&key("l"), window, cx); // caret on 'a' (offset 1)
+                shell.vim_key_down(&key("l"), window, cx); // caret on 'r' (offset 2)
+                shell.vim_key_down(&key("D"), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).value(),
+                "pa\n\npara2 line\n",
+                "D deletes from the caret to the line end"
+            );
+            assert_eq!(content.read(cx).selected_range(), 2..2);
+        });
+
+        // { / }: paragraph jumps between blank-line boundaries.
+        cx.update(|window, cx| {
+            content.update(cx, |state, cx| {
+                state.replace_all("aa\nbb\n\ncc\ndd\n\nee", window, cx)
+            });
+        });
+        cx.update(|window, cx| {
+            shell_entity.update(cx, |shell, cx| {
+                shell.vim_key_down(&key("g"), window, cx); // g then g: doc start
+                shell.vim_key_down(&key("g"), window, cx);
+                shell.vim_key_down(&key("}"), window, cx); // → blank line (row 2)
+                shell.vim_key_down(&key("}"), window, cx); // → blank line (row 5)
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            // "aa\nbb\n\ncc\ndd\n\nee": blank rows are 2 and 5.
+            assert_eq!(
+                content.read(cx).selected_range(),
+                13..13,
+                "}} lands on the second blank line's start"
+            );
+        });
+        cx.update(|window, cx| {
+            shell_entity.update(cx, |shell, cx| {
+                shell.vim_key_down(&key("{"), window, cx); // → blank row 2
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).selected_range(),
+                6..6,
+                "{{ returns to the previous blank line's start"
+            );
+        });
+
+        // d}: operator + paragraph motion deletes to the boundary.
+        cx.update(|window, cx| {
+            shell_entity.update(cx, |shell, cx| {
+                shell.vim_key_down(&key("d"), window, cx);
+                shell.vim_key_down(&key("}"), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).value(),
+                "aa\nbb\n\nee",
+                "d}} deletes caret..next blank line start"
             );
         });
         let _ = std::fs::remove_dir_all(&dir);

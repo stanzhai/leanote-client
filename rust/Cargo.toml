@@ -14,3 +14,6 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # forced to false so a CJK IME cannot swallow printable keys before GPUI dispatch
 # (breaks vim normal mode). Re-vendor on gpui-pre upgrade. See ADR-0005.
 gpui-pre = { path = "vendor/gpui-pre" }
+# leanote: vendored with one addition — block caret painting for vim normal
+# mode (set_block_cursor). Re-vendor on gpui-base upgrade. See ADR-0005.
+gpui-base = { path = "vendor/gpui-base" }
