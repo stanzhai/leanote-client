@@ -16,7 +16,7 @@
 
 - **笔记本 (Notebook)** — 服务器上的笔记容器，可嵌套（子笔记本），有 `Seq` 排序。见“运行形态”节：GUI 中笔记本与标签共同构成左栏导航分组。
 - **笔记 (Note)** — 一条笔记，含 `Title`、`Content`（HTML 或 Markdown）、`IsMarkdown` 标志、`Usn`、所属 NotebookId、Tags。
-- **标签 (Tag)** — 跨笔记本的笔记横向组织；一篇笔记可有多个标签。
+- **标签 (Tag)** — 跨笔记本的笔记横向组织；一篇笔记可有多个标签。本地 `notes.Tags` 列为 **CSV 格式**（`rust,gpui`）；个别服务端会把标签数组序列化成 JSON 字符串（`["rust"]`）下发，同步层在写入前解析为 CSV，`user_version` 迁移也会把存量 JSON 行归一化。标签导航列表**纯从 notes.Tags 聚合**（去重+计数），不读 tags 表（其 Count 经同步后失真）。
 - **收藏 (Starred)** — 笔记的收藏标志，字段名 `Star`，**纯本地字段，从不上服务器**（服务端无对应 API；现版置 Star 不置 IsDirty）。是笔记列表平级的入口（Starred 视图）。
 - **回收站 (Trash)** — 已删除笔记的停留区；从 Trash 恢复或彻底删除（`deleteTrash`）。
 - **IsMarkdown** — 笔记内容格式标志。`true` = Markdown 文本；`false` = TinyMCE 富文本 HTML。见 ADR-0001 关于富文本在 Rust 版中的降级。

@@ -38,7 +38,6 @@ macro_rules! keys {
 }
 
 keys! {
-    AppName => ("Leanote", "Leanote"),
     // Login form (right pane, spec §1/§4).
     LoginTitle => ("登录到 Leanote", "Sign in to Leanote"),
     LoginSubtitle => ("使用您的服务器账户", "Use your leanote server account"),
@@ -111,9 +110,6 @@ keys! {
     ExportPdf => ("导出 PDF", "Export PDF"),
     PdfFellBack => ("服务器导出 PDF 失败，已导出 HTML", "Server PDF export failed, exported HTML instead"),
     NotSynced => ("笔记尚未同步到服务器", "Note is not synced to the server"),
-    // Ticket 16 tray menu.
-    TrayShow => ("显示", "Show"),
-    TrayQuit => ("退出", "Quit"),
     // Review item 2: sync-now/logout controls.
     SyncNow => ("立即同步", "Sync now"),
     Logout => ("登出", "Log out"),
@@ -209,7 +205,6 @@ mod tests {
 
     // Exhaustive key list, kept next to the tables so a new key must be added here too.
     const ALL_KEYS: &[Key] = &[
-        Key::AppName,
         Key::LoginTitle,
         Key::LoginSubtitle,
         Key::Host,
@@ -270,8 +265,6 @@ mod tests {
         Key::SearchNoResults,
         Key::SearchEmptyHint,
         Key::SearchFootnote,
-        Key::TrayShow,
-        Key::TrayQuit,
         Key::SyncNow,
         Key::Logout,
         Key::QuickActions,

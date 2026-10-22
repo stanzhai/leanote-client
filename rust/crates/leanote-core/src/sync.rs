@@ -1181,7 +1181,12 @@ impl Store {
                     .filter_map(|t| t.as_str().map(str::to_string))
                     .collect::<Vec<_>>()
                     .join(","),
-                Some(Value::String(s)) => s.clone(),
+                // Issue 20: some servers serialize Tags as a JSON string
+                // ("[\"rust\",\"gpui\"]") — parse it, never store it raw
+                // (CSV is the local column format).
+                Some(Value::String(s)) => serde_json::from_str::<Vec<String>>(s)
+                    .map(|v| v.join(","))
+                    .unwrap_or_else(|_| s.clone()),
                 _ => String::new(),
             };
             tx.execute(

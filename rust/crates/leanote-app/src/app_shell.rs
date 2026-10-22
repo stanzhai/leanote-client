@@ -320,6 +320,14 @@ impl AppShell {
             tags_scroll: UniformListScrollHandle::new(),
             vim: crate::vim::VimState::new(),
         };
+        // Issue 20: accordions are exclusive; both default true on a fresh
+        // prefs file — notebooks win, tags collapse (persisted so it sticks).
+        if shell.notebooks_open && shell.tags_open {
+            shell.tags_open = false;
+            let mut p = crate::prefs::Prefs::load(&shell.data_dir);
+            p.nav.tags_open = false;
+            p.save(&shell.data_dir);
+        }
         // Issue 19 #10: restore the last selected note when it still exists.
         if let Some(id) = prefs.nav.last_note.clone().map(leanote_core::Id) {
             let exists = shell
@@ -519,6 +527,7 @@ impl AppShell {
     fn invalidate_lists(&mut self) {
         self.cached_tag_nodes = None;
         self.cached_notebook_names = None;
+        self.cached_notebook_nodes = None;
         self.cached_visible_notes = None;
     }
 
@@ -596,28 +605,22 @@ impl AppShell {
         self.cached_notebook_nodes.as_ref().unwrap()
     }
 
-    /// Nav rows for the Tags group (cached): tag name → live note count via
-    /// list_notes_by_tag (the tags table's Count stays 1 after sync).
+    /// Nav rows for the Tags group (cached): aggregated purely from
+    /// notes.Tags — the tags table can lag notes entirely after sync
+    /// (issue 20: list was empty while notes carried tags).
     fn tag_nav_nodes(&mut self) -> &Vec<NavNode> {
         if self.cached_tag_nodes.is_none() {
             let nodes = self
                 .store()
                 .map(|store| {
-                    let Ok(tags) = store.tags() else {
-                        return Vec::new();
-                    };
-                    // Issue 19: one aggregate query instead of N+1.
-                    let counts: std::collections::HashMap<String, i64> = store
+                    store
                         .tag_note_counts()
                         .unwrap_or_default()
                         .into_iter()
-                        .collect();
-                    tags.into_iter()
-                        .filter(|t| !t.is_deleted)
-                        .map(|t| NavNode {
-                            count: counts.get(&t.tag).copied().unwrap_or(0),
-                            id: t.tag.clone(),
-                            title: format!("# {}", t.tag),
+                        .map(|(tag, count)| NavNode {
+                            count,
+                            id: tag.clone(),
+                            title: format!("# {tag}"),
                             depth: 0,
                         })
                         .collect()
@@ -1644,6 +1647,13 @@ impl Render for AppShell {
                 },
             ))
             .on_action(cx.listener(
+                |this, _: &crate::search_overlay::OpenSettings, window, cx| {
+                    // Issue 20: ⌘, / Ctrl+, (see bind_keys in main.rs).
+                    window.close_dialog(cx);
+                    this.open_settings(window, cx);
+                },
+            ))
+            .on_action(cx.listener(
                 |this, _: &crate::search_overlay::QuickNewNote, window, cx| {
                     window.close_dialog(cx);
                     this.new_note(window, cx);
@@ -1825,8 +1835,6 @@ impl Render for DragHeaderState {
 }
 
 fn drag_header(
-    title: &str,
-    fg: gpui_kit::Hsla,
     window: &mut Window,
     cx: &mut gpui_kit::Context<AppShell>,
 ) -> impl IntoElement + use<> {
@@ -1859,7 +1867,8 @@ fn drag_header(
             }
         }))
         .window_control_area(WindowControlArea::Drag)
-        .child(Label::new(title).text_size(px(16.)).text_color(fg))
+        // Issue 20: no app-name label — the strip stays a 44px drag region
+        // with the search button (user ruling Q7).
         // Issue 19: search entry point in the header (opens the ⌘K overlay).
         .child(
             gpui_kit::base::h_flex()
@@ -2039,7 +2048,9 @@ fn nav_row(
     let sel_fg = theme::accent_foreground();
     // Issue 19: indent via padding so the pill spans the full row width and
     // the count sits flush right.
-    let indent = px(12. * node.depth as f32);
+    // Issue 20: symmetric highlight margins — 8px both sides, plus 12px
+    // per nesting level (user ruling Q2).
+    let indent = px(8. + 12. * node.depth as f32);
     let shell = shell.clone();
     let sel: NavSelection = match kind {
         "notebook" => NavSelection::Notebook(node.id.clone()),
@@ -2054,7 +2065,7 @@ fn nav_row(
         .w_full()
         .gap_2()
         .pl(indent)
-        .pr_3()
+        .pr_2()
         .h_8()
         .rounded(px(theme::RADIUS_SELECTION))
         .when(selected, |el| el.bg(theme::accent()))
@@ -2107,16 +2118,24 @@ impl AppShell {
             .on_click(cx.listener(move |this, _ev, _window, cx| {
                 let dir = this.data_dir.clone();
                 let mut p = crate::prefs::Prefs::load(&dir);
+                // Issue 20: accordions are mutually exclusive — opening
+                // one closes the other (both fields persist).
                 match group {
                     Group::Notebooks => {
                         this.notebooks_open = !this.notebooks_open;
-                        p.nav.notebooks_open = this.notebooks_open;
+                        if this.notebooks_open {
+                            this.tags_open = false;
+                        }
                     }
                     Group::Tags => {
                         this.tags_open = !this.tags_open;
-                        p.nav.tags_open = this.tags_open;
+                        if this.tags_open {
+                            this.notebooks_open = false;
+                        }
                     }
                 }
+                p.nav.notebooks_open = this.notebooks_open;
+                p.nav.tags_open = this.tags_open;
                 p.save(&dir);
                 cx.notify();
             }))
@@ -2132,7 +2151,6 @@ impl AppShell {
         window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) -> gpui_kit::Div {
-        let fg = theme::foreground(dark);
         let (notebooks_open, tags_open) = (self.notebooks_open, self.tags_open);
         let shell = cx.weak_entity();
         let lang = self.lang;
@@ -2212,7 +2230,7 @@ impl AppShell {
             // the header child below); no global titlebar strip anymore.
             .px_3()
             .gap_1()
-            .child(drag_header(t(i18n::Key::AppName), fg, window, cx))
+            .child(drag_header(window, cx))
             // Issue 17 Q7: identity moved to the bottom trio (see the nav
             // footer below) — no duplicate under the header.
             .child(all_row)
@@ -2400,9 +2418,9 @@ impl AppShell {
                 gpui_kit::div()
                     .id("tags-vlist")
                     .relative()
-                    // Notebooks own the leftover height; tags take natural
-                    // height up to a cap and scroll inside.
-                    .max_h(px(300.))
+                    // Issue 20: the open group owns the leftover height
+                    // (exclusive accordion → only one of the two renders).
+                    .flex_1()
                     .min_h_0()
                     .overflow_hidden()
                     .child(
@@ -2478,9 +2496,9 @@ impl AppShell {
         }
 
         // Issue 19: trash lives after the tags group, before the footer.
+        // Issue 20: no spacer — exactly one group is open, and its vlist
+        // (flex_1) pushes trash + footer to natural height at the bottom.
         nav = nav.child(trash_row);
-        // Push the footer to the bottom when both groups are collapsed.
-        nav = nav.child(gpui_kit::div().flex_1().min_h_0());
 
         // "Move to…" picker replaces the notebook list while choosing
         if let Some(NavEdit::MoveNotebook { id }) = &self.nav_edit {
@@ -2607,7 +2625,7 @@ impl AppShell {
                 .ghost()
                 .on_click(cx.listener(|this, _ev, window, cx| this.open_settings(window, cx))),
         );
-        nav = nav.child(gpui_kit::base::v_flex().flex_1()).child(footer);
+        nav = nav.child(footer);
 
         nav
     }

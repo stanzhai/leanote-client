@@ -9,7 +9,6 @@ mod prefs;
 mod search_overlay;
 mod single_instance;
 mod theme;
-mod tray;
 mod vim;
 mod window_state;
 
@@ -232,7 +231,9 @@ fn main() {
                 gpui_kit::KeyBinding::new("cmd-shift-f", search_overlay::ToggleFocusMode, None),
                 gpui_kit::KeyBinding::new("cmd-shift-F", search_overlay::ToggleFocusMode, None),
                 gpui_kit::KeyBinding::new("ctrl-shift-f", search_overlay::ToggleFocusMode, None),
-                gpui_kit::KeyBinding::new("ctrl-shift-F", search_overlay::ToggleFocusMode, None),
+                // Issue 20: ⌘, / Ctrl+, open settings (user ruling Q8).
+                gpui_kit::KeyBinding::new("cmd-,", search_overlay::OpenSettings, None),
+                gpui_kit::KeyBinding::new("ctrl-,", search_overlay::OpenSettings, None),
             ]);
 
             let prefs = prefs::Prefs::load(&dir);
@@ -340,8 +341,6 @@ fn main() {
             .expect("open window");
             single_instance::remember_window(handle);
             single_instance::listen(listener, cx);
-            // Ticket 16: tray icon + 显示/退出 menu (left-click → show).
-            tray::init(cx);
 
             // Review item 2: returning user → background incr sync (non-blocking).
             if signed_in {

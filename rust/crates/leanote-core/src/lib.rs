@@ -218,7 +218,34 @@ impl Store {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        Self::migrate(&conn)?;
         Ok(Store { conn, user_id })
+    }
+
+    /// Issue 20: `PRAGMA user_version` migrations. v1: legacy sync wrote
+    /// server JSON strings ("[\"rust\"]") into notes.Tags; CSV is the
+    /// column's format — convert any row still shaped like a JSON array.
+    fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if v < 1 {
+            let rows: Vec<(String, String)> = {
+                let mut stmt =
+                    conn.prepare("SELECT NoteId, Tags FROM notes WHERE Tags LIKE '[%'")?;
+                let v = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                v
+            };
+            for (id, tags) in rows {
+                let csv = serde_json::from_str::<Vec<String>>(&tags)
+                    .ok()
+                    .map(|v| v.join(","))
+                    .unwrap_or(tags.clone());
+                conn.execute("UPDATE notes SET Tags=?2 WHERE NoteId=?1", params![id, csv])?;
+            }
+            conn.pragma_update(None, "user_version", 1)?;
+        }
+        Ok(())
     }
 
     pub fn user_id(&self) -> &str {
@@ -349,15 +376,19 @@ impl Store {
         rows.collect()
     }
 
-    /// Issue 19: live-note count per distinct tag, from the notes table
-    /// (the tags table's Count column stays stale after sync).
+    /// Issue 19/20: live-note count per distinct tag, aggregated purely
+    /// from notes.Tags CSV (the tags table's Count stays stale after sync
+    /// and its rows can lag notes entirely).
+    /// ponytail: CSV split via json_each — tags cannot contain quotes or
+    /// commas (the CSV format itself forbids it), so the JSON built here
+    /// is always well-formed and exact.
     pub fn tag_note_counts(&self) -> rusqlite::Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT t.Tag, COUNT(n.NoteId) FROM tags t
-             LEFT JOIN notes n ON n.IsTrash=0 AND n.LocalIsDelete=0 AND n.IsDeleted=0
-                  AND (',' || n.Tags || ',') LIKE '%,' || t.Tag || ',%'
-             WHERE t.LocalIsDelete=0
-             GROUP BY t.Tag ORDER BY t.Tag",
+            "SELECT tag, COUNT(*) FROM (
+                 SELECT DISTINCT NoteId, trim(value) AS tag
+                 FROM notes, json_each('[\"' || replace(Tags, ',', '\",\"') || '\"]')
+                 WHERE IsTrash=0 AND LocalIsDelete=0 AND IsDeleted=0 AND Tags != ''
+             ) GROUP BY tag ORDER BY tag",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect()
