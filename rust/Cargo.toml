@@ -8,3 +8,9 @@ version = "0.1.0"
 
 [workspace.dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
+
+[patch.crates-io]
+# leanote: vendored with one change — ElementInputHandler::prefers_ime_for_printable_keys
+# forced to false so a CJK IME cannot swallow printable keys before GPUI dispatch
+# (breaks vim normal mode). Re-vendor on gpui-pre upgrade. See ADR-0005.
+gpui-pre = { path = "vendor/gpui-pre" }
