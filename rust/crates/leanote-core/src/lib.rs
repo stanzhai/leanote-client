@@ -130,6 +130,21 @@ pub struct NoteHistory {
     pub created_time: i64,
 }
 
+/// Issue 21 需求9: an image attachment. Stored locally on insert; the
+/// sync layer fills `server_id` once the upload succeeds, and the note
+/// markdown references it as `leanote://file/getImage?fileId=<server_id>`
+/// (falls back to LocalId for never-uploaded images).
+#[derive(Clone, Debug)]
+pub struct ImageAttachment {
+    pub local_id: Id,
+    pub server_id: String,
+    pub file_name: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+    pub size: i64,
+    pub created_time: i64,
+}
+
 /// Issue 19: list-row metadata without the Content column — the middle
 /// pane's lazy-load shape. Full `Note` (with content) loads only when a
 /// row is opened.
@@ -244,6 +259,11 @@ impl Store {
                 conn.execute("UPDATE notes SET Tags=?2 WHERE NoteId=?1", params![id, csv])?;
             }
             conn.pragma_update(None, "user_version", 1)?;
+        }
+        if v < 2 {
+            // Issue 21 需求9: image attachments live locally until the
+            // server upload succeeds (schema DDL is in SCHEMA above).
+            conn.pragma_update(None, "user_version", 2)?;
         }
         Ok(())
     }
@@ -773,6 +793,73 @@ impl Store {
             "DELETE FROM note_history WHERE NoteId=?1",
             [note_id.to_string()],
         )
+    }
+
+    /// Issue 21 需求9: store an uploaded image locally. `local_id` is
+    /// caller-generated (24-hex, same shape as every other Id).
+    pub fn insert_image(&self, img: &ImageAttachment) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO images (LocalId, UserId, ServerId, FileName, Mime, Bytes, Size, CreatedTime)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                img.local_id.0,
+                self.user_id,
+                img.server_id,
+                img.file_name,
+                img.mime,
+                img.bytes,
+                img.size,
+                img.created_time,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Lookup by the id that appears in `leanote://file/getImage?fileId=`
+    /// — ServerId once uploaded, else the LocalId the note was written
+    /// with.
+    pub fn get_image(&self, file_id: &str) -> rusqlite::Result<Option<ImageAttachment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT LocalId, ServerId, FileName, Mime, Bytes, Size, CreatedTime
+             FROM images WHERE ServerId=?1 OR (ServerId='' AND LocalId=?1)",
+        )?;
+        stmt.query_row([file_id], |r| {
+            Ok(ImageAttachment {
+                local_id: Id(r.get(0)?),
+                server_id: r.get(1)?,
+                file_name: r.get(2)?,
+                mime: r.get(3)?,
+                bytes: r.get(4)?,
+                size: r.get(5)?,
+                created_time: r.get(6)?,
+            })
+        })
+        .optional()
+    }
+
+    /// Record the server's FileId after a successful upload.
+    pub fn set_image_server_id(&self, local_id: &Id, server_id: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE images SET ServerId=?2 WHERE LocalId=?1",
+            params![local_id.0, server_id],
+        )?;
+        Ok(())
+    }
+
+    /// File ids referenced by this content as `leanote://file/getImage`
+    /// links (local ids until upload, server ids after) — used by the sync
+    /// push to find images that still need uploading.
+    pub fn image_ids_in_content(content: &str) -> Vec<String> {
+        content
+            .split("leanote://file/getImage?fileId=")
+            .skip(1)
+            .map(|rest| {
+                rest.chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect::<String>()
+            })
+            .filter(|s: &String| !s.is_empty())
+            .collect()
     }
 
     /// Note by exact id regardless of trash/deleted state (JS getNote uses
@@ -1418,6 +1505,17 @@ CREATE TABLE IF NOT EXISTS note_history (
     Content TEXT NOT NULL,
     CreatedTime INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS images (
+    LocalId TEXT PRIMARY KEY,
+    UserId TEXT NOT NULL,
+    ServerId TEXT NOT NULL DEFAULT '',
+    FileName TEXT NOT NULL DEFAULT '',
+    Mime TEXT NOT NULL DEFAULT '',
+    Bytes BLOB NOT NULL,
+    Size INTEGER NOT NULL DEFAULT 0,
+    CreatedTime INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_images_server ON images(ServerId);
 CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(UpdatedTime DESC);
 CREATE INDEX IF NOT EXISTS idx_notes_notebook ON notes(NotebookId);
 CREATE INDEX IF NOT EXISTS idx_notebooks_user_title ON notebooks(UserId, Title);

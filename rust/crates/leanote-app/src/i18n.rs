@@ -73,7 +73,6 @@ keys! {
     SearchFootnote => ("↑↓ 选择   ↩ 打开   esc 关闭", "↑↓ navigate   ↩ open   esc close"),
     // Ticket 10: editor toolbar + history.
     NewNote => ("新建笔记", "New note"),
-    Done => ("完成", "Done"),
     EditorPreview => ("预览", "Preview"),
     EditorSource => ("源码", "Source"),
     History => ("历史版本", "History"),
@@ -108,6 +107,8 @@ keys! {
     ExportHtml => ("导出 HTML", "Export HTML"),
     ExportMarkdown => ("导出 Markdown", "Export Markdown"),
     ExportPdf => ("导出 PDF", "Export PDF"),
+    // Issue 21: row context-menu items.
+    ToggleStar => ("星标/取消星标", "Star/Unstar"),
     PdfFellBack => ("服务器导出 PDF 失败，已导出 HTML", "Server PDF export failed, exported HTML instead"),
     NotSynced => ("笔记尚未同步到服务器", "Note is not synced to the server"),
     // Review item 2: sync-now/logout controls.
@@ -137,7 +138,6 @@ keys! {
     Download => ("下载", "Download"),
     DownloadFailed => ("下载失败", "Download failed"),
     MarkdownHelpTitle => ("Markdown 语法", "Markdown syntax"),
-    Fullscreen => ("全屏", "Fullscreen"),
     AccentColor => ("强调色", "Accent color"),
     // MarkdownHelpBody: see `markdown_help_body` (multi-line raw strings).
     // Issue 17: logout confirmation.
@@ -229,7 +229,6 @@ mod tests {
         Key::HardDelete,
         Key::EmptyTrash,
         Key::NewNote,
-        Key::Done,
         Key::EditorPreview,
         Key::EditorSource,
         Key::History,
@@ -242,6 +241,7 @@ mod tests {
         Key::ExportHtml,
         Key::ExportMarkdown,
         Key::ExportPdf,
+        Key::ToggleStar,
         Key::PdfFellBack,
         Key::NotSynced,
         Key::ConflictTitle,
@@ -288,7 +288,6 @@ mod tests {
         Key::Download,
         Key::DownloadFailed,
         Key::MarkdownHelpTitle,
-        Key::Fullscreen,
         Key::AccentColor,
         Key::LogoutConfirmTitle,
         Key::LogoutConfirmBody,

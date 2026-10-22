@@ -98,6 +98,26 @@ pub fn reader_markdown_src(title: &str, content: &str, is_markdown: bool) -> Str
     }
 }
 
+/// Issue 21 需求9: swap every `leanote://file/getImage?fileId=X` link for a
+/// `data:` URL from the local images table so TextView renders it; unknown
+/// ids keep the link (renders as alt text until the bytes arrive).
+pub fn resolve_note_images(content: &str, store: &leanote_core::Store) -> String {
+    let mut out = content.to_string();
+    for id in leanote_core::Store::image_ids_in_content(content) {
+        if let Some(img) = store.get_image(&id).ok().flatten() {
+            out = out.replace(
+                &format!("leanote://file/getImage?fileId={id}"),
+                &format!(
+                    "data:{};base64,{}",
+                    img.mime,
+                    crate::export::base64_encode(&img.bytes)
+                ),
+            );
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +196,28 @@ mod tests {
         );
         // Empty rich body falls back to the title so the pane isn't blank.
         assert_eq!(reader_markdown_src("T", "   ", false), "# T\n");
+    }
+
+    #[test]
+    fn resolve_note_images_swaps_known_ids_only() {
+        let dir = std::env::temp_dir().join(format!("lt-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = leanote_core::Store::open(dir.clone(), "u1".into()).unwrap();
+        store
+            .insert_image(&leanote_core::ImageAttachment {
+                local_id: leanote_core::Id("imgaaaaaaaaaaaaaaaaaaaa1".into()),
+                server_id: String::new(),
+                file_name: "a.png".into(),
+                mime: "image/png".into(),
+                bytes: vec![1, 2, 3],
+                size: 3,
+                created_time: 0,
+            })
+            .unwrap();
+        let md = "![a](leanote://file/getImage?fileId=imgaaaaaaaaaaaaaaaaaaaa1)\n![miss](leanote://file/getImage?fileId=zzz)";
+        let out = resolve_note_images(md, &store);
+        assert!(out.starts_with("![a](data:image/png;base64,"), "{out}");
+        assert!(out.contains("leanote://file/getImage?fileId=zzz"), "{out}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

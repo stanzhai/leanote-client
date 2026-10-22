@@ -9,21 +9,12 @@ path = "src/main.rs"
 
 [dependencies]
 leanote-core = { path = "../leanote-core" }
+gpui-base = { version = "0.7.3" }
 leanote-fakeserver = { path = "../../fake-server" }
 gpui-kit = { version = "0.7.3", features = [
-  "tree-sitter-markdown",
-  "tree-sitter-markdown-inline",
-  "tree-sitter-rust",
-  "tree-sitter-javascript",
-  "tree-sitter-typescript",
-  "tree-sitter-tsx",
-  "tree-sitter-html",
-  "tree-sitter-css",
-  "tree-sitter-bash",
-  "tree-sitter-python",
-  "tree-sitter-go",
-  "tree-sitter-yaml",
-  "tree-sitter-toml",
+  # Issue 21: kit's full language aggregate (34 grammars) instead of a
+  # hand-picked subset.
+  "tree-sitter-languages",
 ] }
 
 anyhow = "1"

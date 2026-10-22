@@ -5,6 +5,7 @@ mod browse;
 mod conflict_bar;
 mod export;
 mod i18n;
+mod markdown_input;
 mod prefs;
 mod search_overlay;
 mod single_instance;
@@ -13,6 +14,8 @@ mod vim;
 mod window_state;
 
 use app_shell::AppShell;
+use gpui_base::input::set_language_config;
+use gpui_kit::component::input::language_config::LanguageConfig;
 use gpui_kit::component::Theme;
 use gpui_kit::{px, AppContext as _, TitlebarOptions, WindowOptions};
 use std::path::PathBuf;
@@ -147,6 +150,8 @@ fn boot_fake_server() {
                 json!({"NoteId":"n7","Title":"Plain text note","NotebookId":"nb1","Usn":14,"IsDeleted":false,"IsTrash":false,"IsMarkdown":false,"Tags":"[]","CreatedTime":"2026-01-11T10:00:00","UpdatedTime":"2026-01-11T10:00:00"}),
                 // Trash (⑤).
                 json!({"NoteId":"n8","Title":"Old draft (trash)","NotebookId":"nb2","Usn":15,"IsDeleted":false,"IsTrash":true,"IsMarkdown":true,"Tags":"[]","CreatedTime":"2026-01-12T10:00:00","UpdatedTime":"2026-01-12T10:00:00"}),
+                // Issue 21 需求9: image note (④) — getImage serves the png.
+                json!({"NoteId":"n12","Title":"图片笔记","NotebookId":"nb1","Usn":20,"IsDeleted":false,"IsTrash":false,"IsMarkdown":true,"Tags":"[]","CreatedTime":"2026-01-16T10:00:00","UpdatedTime":"2026-01-16T10:00:00"}),
                 json!({"NoteId":"n9","Title":"Scratch (trash)","NotebookId":"nb3","Usn":16,"IsDeleted":false,"IsTrash":true,"IsMarkdown":true,"Tags":"[]","CreatedTime":"2026-01-13T10:00:00","UpdatedTime":"2026-01-13T10:00:00"}),
                 // Rich text (TinyMCE) notes → read-only Markdown render + explicit convert (ticket 12).
                 json!({"NoteId":"n10","Title":"2018 归档（富文本）","NotebookId":"nb3","Usn":18,"IsDeleted":false,"IsTrash":false,"IsMarkdown":false,"Tags":"[]","CreatedTime":"2026-01-14T10:00:00","UpdatedTime":"2026-01-14T10:00:00"}),
@@ -165,10 +170,20 @@ fn boot_fake_server() {
                 ("n9", "# Scratch\n\nHard-delete me."),
                 ("n10", "<h2>2018 归档</h2><p>TinyMCE 时代的富文本笔记，<span style=\"color: #e03e3d;\">彩色文字</span>与<strong>加粗</strong>共存。</p><ul><li>第一季度<ul><li>一月</li><li>二月</li></ul></li><li>第二季度</li></ul><table><thead><tr><th>事件</th><th>月份</th></tr></thead><tbody><tr><td>启动</td><td>3 月</td></tr></tbody></table><blockquote><p>存档目的</p></blockquote>"),
                 ("n11", "<h3>旅行清单</h3><p><em>北海道</em>，<u>冬季</u>出发。</p><ol><li>机票<ol><li>看价格</li></ol></li><li>酒店</li></ol><p><a href=\"https://leanote.com\">参考</a> <img src=\"https://via.placeholder.com/150\" alt=\"地图\"></p>"),
+                ("n12", "# 图片笔记\n\n![dot](leanote://file/getImage?fileId=srvimg_demo)"),
             ] {
                 contents.insert(id.to_string(), json!(body));
             }
             server.set_contents(contents);
+            // Issue 21 需求9: the png bytes file/getImage serves. ponytail:
+            // header-only png (8 bytes) proves the pipe; real photos come
+            // from the local insert path, not this demo seed.
+            server.set_images([(
+                "srvimg_demo".to_string(),
+                ("dot.png".to_string(), "image/png".to_string(), vec![
+                    0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a,
+                ]),
+            )]);
             server.set_tags(vec![
                 json!({"TagId":"t1","Tag":"rust","Usn":9,"IsDeleted":false}),
                 json!({"TagId":"t2","Tag":"gpui","Usn":10,"IsDeleted":false}),
@@ -219,6 +234,18 @@ fn main() {
         .run(move |cx| {
             gpui_kit::init(cx);
 
+            // Issue 21 需求5: markdown pair closing/fences are handled by
+            // the shell's key capture (app_layer `markdown_input`) — turn
+            // the kit's default auto-closing pairs off for markdown so
+            // `(`/`[`/quotes aren't doubled.
+            set_language_config(
+                "markdown",
+                LanguageConfig::default()
+                    .brackets([])
+                    .auto_closing_pairs([]),
+                cx,
+            );
+
             // Ticket 13: ⌘K / Ctrl+K toggle the global search overlay.
             // Issue 17: ⌘⇧P / Ctrl+Shift+P open the same palette.
             cx.bind_keys([
@@ -231,8 +258,9 @@ fn main() {
                 gpui_kit::KeyBinding::new("cmd-shift-f", search_overlay::ToggleFocusMode, None),
                 gpui_kit::KeyBinding::new("cmd-shift-F", search_overlay::ToggleFocusMode, None),
                 gpui_kit::KeyBinding::new("ctrl-shift-f", search_overlay::ToggleFocusMode, None),
-                // Issue 20: ⌘, / Ctrl+, open settings (user ruling Q8).
-                gpui_kit::KeyBinding::new("cmd-,", search_overlay::OpenSettings, None),
+                // Issue 21 需求10: ⌘T / Ctrl+T full-window markdown preview.
+                gpui_kit::KeyBinding::new("cmd-t", search_overlay::ToggleFullPreview, None),
+                gpui_kit::KeyBinding::new("ctrl-t", search_overlay::ToggleFullPreview, None),
                 gpui_kit::KeyBinding::new("ctrl-,", search_overlay::OpenSettings, None),
             ]);
 

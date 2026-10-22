@@ -39,8 +39,10 @@
 - **最近 (Recent)** — 左栏固定导航首项：最近编辑的 20 条笔记（UpdatedTime 倒序）。第五轮起取代「全部笔记」入口；浏览全部走笔记本/标签分组（ADR-0003 第 6 条）。
 - **视觉语言 (Visual language)** — 取自 Wake 的“现代 macOS”风格：材质分层（titlebar/sidebar/list/background/popover 四层色）、无窗格边框线、持久 UI 零阴影、SF Pro 系统字、8 级字号、4px 间距栅格、分级圆角。与现 Electron 版的多主题体系是替代关系（ADR-0003）。**编辑器配色**是独立概念：仅作用于源码着色的 2–3 套配色（默认跟随系统明暗），不等于全局多主题。**主题色 (accent)** 是视觉语言的参数：6 色板本地偏好，用于选中态与动作色（ADR-0005）。
 - **⌘K 面板 (⌘K palette)** — 顶部悬浮式全局面板（宽 680px），三段式：快捷动作（新建笔记/立即同步/导出备份…）+ 最近打开（本地记录 top6）+ 即输即搜（统一搜索核心），⌘K / ⌘⇧P 触发，空输入显示最近打开（Wake 同款交互；语义 = Electron 版 command palette 的复刻超集，旧词条「⌘K 搜索」已并入）。中栏另有**列表搜索框**：作用于当前列表的即输即搜，与 ⌘K 面板共用搜索核心。
-- **编辑器 (Editor)** — 右栏源码编辑面：kit `Editor` 组件 + tree-sitter 语法着色 + 编辑器配色；第一行 = 标题 + 工具按钮（预览/附件/历史/全屏，仅 icon），第二行 = markdown 格式工具栏 + 帮助。选中 Markdown 笔记**默认即编辑态**，源码为默认模式、预览为开关；改动防抖自动保存（内容有变才置脏），⌘S 保留（ADR-0004）。
+- **编辑器 (Editor)** — 右栏源码编辑面：kit `Editor` 组件 + tree-sitter 语法着色（全部 kit 语言 feature，含 markdown 内嵌代码块注入着色）+ 编辑器配色；第一行 = 标题 + 工具按钮（预览/附件/历史，仅 icon），第二行 = markdown 格式工具栏（含插入图片）+ 帮助。选中 Markdown 笔记**默认即编辑态**，源码为默认模式、预览为开关；改动防抖自动保存，⌘S 保留；标题行兼作窗口拖拽区（ADR-0004）。
 - **Vim 模式 (Vim mode)** — 编辑器的键位层：normal/insert/visual 状态机 + 常用子集（motion、operator、yank/paste、`:w`/`:q`），默认开启、可关闭、持久化。模式反馈仅靠光标形状（normal=block、insert=竖线、visual=block+选区），无状态行。刻意不承诺完整 vi 兼容（无寄存器语法、无宏、无插件），不兼容行为是决策不是缺陷（ADR-0004/0005）。
-- **全屏 (Focus mode)** — 应用内无干扰模式：隐藏左/中栏，右栏占满整窗，再点或 ESC 退出。非 macOS 系统原生全屏。
+- **专注模式 (Focus mode)** — 应用内无干扰模式：⇧⌘F 隐藏左/中栏，右栏占满整窗，再点或 ESC 退出。非 macOS 系统原生全屏。原名"全屏"，第六轮更名以区分全窗口预览。
+- **全窗口预览 (Full-window preview)** — ⌘T 在应用内将当前笔记的**渲染预览**铺满整窗（不触发 OS fullscreen），右上角关闭 icon，ESC/再按 ⌘T 退出；编辑态/阅读态均可用。与专注模式（隐藏栏但保留编辑面）正交。
+- **笔记图片 (Note image)** — 拖放/选择/工具栏插入图片 → 字节存本地 images 表（`LocalId`/`ServerId`/`Bytes`），笔记内容引用 `leanote://file/getImage?fileId=<24hex>`（保持 local id，不改写内容）；渲染前替换为 data URL。脏图片（无 ServerId）随笔记以 multipart 推送（`note/addNote`/`updateNote`），服务器 `Files` 回写 ServerId；同步拉取时 `pull_missing_images` 下载缺失字节（复刻 Electron `src/file.js` 语义，ADR-0006）。
 - **历史版本 (History)** — 笔记的服务端历史快照（每账户最近 20 条）；在居中大弹窗中列出+预览+恢复（ADR-0005）。区别于本地撤销。
 - **设置 (Settings)** — 左栏底部工具栏唤起的居中弹窗：外观（跟随系统/强制浅/深 + 编辑器配色 + 主题色）、语言（中/英）、Vim 开关、账户信息与登出。仅本地 UI 偏好，不涉及服务器概念。

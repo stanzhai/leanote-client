@@ -41,15 +41,6 @@ pub enum VimMode {
     Visual,
 }
 
-/// Status label (shell may hide it; ADR-0005 relies on cursor shape).
-pub fn mode_label(mode: VimMode) -> &'static str {
-    match mode {
-        VimMode::Normal => "-- NORMAL --",
-        VimMode::Insert => "-- INSERT --",
-        VimMode::Visual => "-- VISUAL --",
-    }
-}
-
 /// `:` command parsed from the cmdline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
@@ -181,7 +172,8 @@ impl VimState {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
-
+    /// Issue 21: status line removed; cmdline stays test-visible.
+    #[cfg(test)]
     pub fn cmdline(&self) -> &str {
         &self.cmdline
     }

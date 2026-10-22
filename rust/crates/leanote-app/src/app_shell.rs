@@ -11,7 +11,8 @@ use gpui_kit::base::Scrollbar;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{
-    Backspace, Delete, Editor, EditorState, Enter, Escape, Input, InputEvent, InputState,
+    Backspace, Delete, Editor, EditorState, Enter, Escape, IndentInline, Input, InputEvent,
+    InputState, OutdentInline,
 };
 use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
@@ -151,6 +152,13 @@ pub struct AppShell {
     selected: Option<leanote_core::Id>,
     /// Issue 19: focus mode — hide left + middle panes (⇧⌘F toggles).
     focus_mode: bool,
+    /// Issue 21 需求10: ⌘T full-window markdown preview (reader or
+    /// editor source rendered edge-to-edge; ESC/⌘T leaves).
+    full_preview: bool,
+    /// Focus target while the full-window preview is open: without a
+    /// focused element the key dispatch path skips this shell's nodes
+    /// entirely, and ESC would stop working.
+    preview_focus: gpui_kit::FocusHandle,
     /// Ticket 15: export outcome shown inline in the reader toolbar
     /// (e.g. PDF-fell-back-to-HTML reason). Cleared on selection change.
     export_status: Option<SharedString>,
@@ -298,6 +306,8 @@ impl AppShell {
             tags_open: prefs.nav.tags_open,
             selected: None,
             focus_mode: false,
+            full_preview: false,
+            preview_focus: cx.focus_handle(),
             export_status: None,
             search: crate::search_overlay::SearchOverlay::new(window, cx),
             search_rows: Vec::new(),
@@ -1278,9 +1288,19 @@ impl AppShell {
         }));
     }
 
-    /// Selected note → HTML (`md=false`) or Markdown (`md=true`) file.
-    fn export_selected_file(&mut self, md: bool, cx: &mut gpui_kit::Context<Self>) {
-        let Some(n) = self.selected_note() else {
+    /// One note (`id`) → HTML (`md=false`) or Markdown (`md=true`) file.
+    /// Issue 21: id-parameterized so the row context menu exports its own
+    /// row, not the selection.
+    fn export_note_file(
+        &mut self,
+        id: leanote_core::Id,
+        md: bool,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        let Some(n) = self
+            .store()
+            .and_then(|s| s.get_note_any(&id).ok().flatten())
+        else {
             return;
         };
         let name = format!(
@@ -1298,11 +1318,14 @@ impl AppShell {
         });
     }
 
-    /// Selected note → PDF via the server's exportPdf endpoint (src/api.js
+    /// One note (`id`) → PDF via the server's exportPdf endpoint (src/api.js
     /// authority). Any failure — not synced, no account, transport, server
     /// error — falls back to a local HTML export with the reason shown.
-    fn export_selected_pdf(&mut self, cx: &mut gpui_kit::Context<Self>) {
-        let Some(n) = self.selected_note() else {
+    fn export_note_pdf(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
+        let Some(n) = self
+            .store()
+            .and_then(|s| s.get_note_any(&id).ok().flatten())
+        else {
             return;
         };
         let (server_id, account) = match self.store() {
@@ -1348,11 +1371,6 @@ impl AppShell {
             std::fs::write(&path, crate::export::backup_to_leanote_json(&store))
                 .map_err(|e| e.to_string())
         });
-    }
-
-    fn selected_note(&self) -> Option<leanote_core::Note> {
-        let id = self.selected.as_ref()?;
-        self.store().and_then(|s| s.get_note_any(id).ok().flatten())
     }
 }
 
@@ -1585,8 +1603,9 @@ fn note_list_row(
         )
 }
 
-/// Issue 18: right-click menu on a note row — trash (live notes) or
-/// restore/delete-forever (trash view), plus move-to-notebook.
+/// Issue 18/21: right-click menu on a note row — star toggle + exports
+/// (issue 21) and move/delete. Menu actions act on their OWN row: the
+/// export helpers take an explicit note id, not the selection.
 fn note_row_menu(
     menu: gpui_kit::component::menu::PopupMenu,
     shell: &gpui_kit::WeakEntity<AppShell>,
@@ -1595,8 +1614,16 @@ fn note_row_menu(
 ) -> gpui_kit::component::menu::PopupMenu {
     let shell_mv = shell.clone();
     let shell_del = shell.clone();
+    let shell_star = shell.clone();
+    let shell_html = shell.clone();
+    let shell_md = shell.clone();
+    let shell_pdf = shell.clone();
     let id_mv = id.clone();
     let id_del = id.clone();
+    let id_star = id.clone();
+    let id_html = id.clone();
+    let id_md = id.clone();
+    let id_pdf = id.clone();
     menu.item(
         PopupMenuItem::new(i18n::t(lang, i18n::Key::MoveNoteTo)).on_click(
             move |_ev, _window, cx| {
@@ -1607,6 +1634,40 @@ fn note_row_menu(
             },
         ),
     )
+    .separator()
+    .item(
+        PopupMenuItem::new(i18n::t(lang, i18n::Key::ToggleStar)).on_click(
+            move |_ev, _window, cx| {
+                let _ = shell_star.update(cx, |this, cx| this.toggle_star(id_star.clone(), cx));
+            },
+        ),
+    )
+    .item(
+        PopupMenuItem::new(i18n::t(lang, i18n::Key::ExportHtml)).on_click(
+            move |_ev, _window, cx| {
+                let _ = shell_html.update(cx, |this, cx| {
+                    this.export_note_file(id_html.clone(), false, cx)
+                });
+            },
+        ),
+    )
+    .item(
+        PopupMenuItem::new(i18n::t(lang, i18n::Key::ExportMarkdown)).on_click(
+            move |_ev, _window, cx| {
+                let _ = shell_md.update(cx, |this, cx| {
+                    this.export_note_file(id_md.clone(), true, cx)
+                });
+            },
+        ),
+    )
+    .item(
+        PopupMenuItem::new(i18n::t(lang, i18n::Key::ExportPdf)).on_click(
+            move |_ev, _window, cx| {
+                let _ = shell_pdf.update(cx, |this, cx| this.export_note_pdf(id_pdf.clone(), cx));
+            },
+        ),
+    )
+    .separator()
     .item(
         PopupMenuItem::new(i18n::t(lang, i18n::Key::DeleteNote)).on_click(
             move |_ev, _window, cx| {
@@ -1638,6 +1699,35 @@ impl Render for AppShell {
                     // Issue 19: hide left + middle panes for pure reading.
                     this.focus_mode = !this.focus_mode;
                     cx.notify();
+                },
+            ))
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                // Issue 21 需求10: ESC leaves the full-window preview. A
+                // capture_action can't be used: Escape's key binding lives
+                // in the Input context, which isn't rendered while the
+                // preview is open, so the action never dispatches.
+                if this.full_preview
+                    && ev.keystroke.key == "escape"
+                    && !ev.keystroke.modifiers.platform
+                    && !ev.keystroke.modifiers.control
+                {
+                    this.full_preview = false;
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(
+                |this, _: &crate::search_overlay::ToggleFullPreview, window, cx| {
+                    // Issue 21 需求10: only meaningful with a selected note.
+                    if this.selected.is_some() {
+                        this.full_preview = !this.full_preview;
+                        if this.full_preview {
+                            window.focus(&this.preview_focus, cx);
+                        } else if let Some(ed) = this.editing.as_ref() {
+                            let handle = gpui_kit::Focusable::focus_handle(ed.content.read(cx), cx);
+                            window.focus(&handle, cx);
+                        }
+                        cx.notify();
+                    }
                 },
             ))
             .on_action(cx.listener(
@@ -1775,10 +1865,95 @@ impl Render for AppShell {
                     )
                     .child(resizable_panel().child(render_syncing(dark, lines, &t)));
             }
+            Phase::Shell { .. } if self.full_preview => {
+                // Issue 21 需求10: ⌘T full-window preview — the selected
+                // note's markdown (editor buffer while editing) rendered
+                // edge-to-edge; ESC/⌘T/✕ leave.
+                //
+                // Layout bug fix: the preview must keep the SAME 3-panel
+                // tree (nav | list | reader) as the normal shell. Swapping
+                // in a single-panel body let `sync_panels_count` truncate
+                // the group state (3 → 1) and re-expand it (1 → 3) on
+                // exit, which redistributed sizes and lost the user's
+                // dragged divider positions. `visible(false)` keeps the
+                // panel slots (and their recorded sizes) while collapsing
+                // them, so leaving the preview restores the exact layout.
+                let close = self.selected.is_none();
+                if close {
+                    self.full_preview = false;
+                }
+                let src = self
+                    .editing
+                    .as_ref()
+                    .map(|ed| ed.content.read(cx).value().to_string())
+                    .or_else(|| {
+                        self.selected
+                            .clone()
+                            .and_then(|id| {
+                                self.store()
+                                    .and_then(|s| s.get_note_any(&id).ok().flatten())
+                            })
+                            .map(|n| n.content)
+                    });
+                let title = self
+                    .editing
+                    .as_ref()
+                    .map(|ed| ed.title.read(cx).value().to_string())
+                    .or_else(|| {
+                        self.selected
+                            .clone()
+                            .and_then(|id| {
+                                self.store()
+                                    .and_then(|s| s.get_note_any(&id).ok().flatten())
+                            })
+                            .map(|n| n.title)
+                    });
+                if let (Some(_title), Some(content)) = (title, src) {
+                    let content = self
+                        .store()
+                        .map(|s| browse::resolve_note_images(&content, &s))
+                        .unwrap_or(content);
+                    let preview = gpui_kit::base::v_flex()
+                        .id("full-preview")
+                        .track_focus(&self.preview_focus)
+                        .size_full()
+                        .p(px(32.))
+                        .child(
+                            gpui_kit::base::h_flex().justify_end().child(
+                                Button::new("full-preview-close")
+                                    .icon(IconName::CircleX)
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.full_preview = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                        )
+                        .child(
+                            TextView::markdown("full-preview", content)
+                                .scrollable(true)
+                                .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
+                        );
+                    body = body
+                        .child(
+                            resizable_panel()
+                                .size(px(widths.left.unwrap_or(LEFT_W)))
+                                .size_range(px(LEFT_RANGE.0)..px(LEFT_RANGE.1))
+                                .visible(false),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size(px(widths.mid.unwrap_or(MID_W)))
+                                .size_range(px(MID_RANGE.0)..px(MID_RANGE.1))
+                                .visible(false),
+                        )
+                        .child(resizable_panel().child(preview));
+                } else {
+                    self.full_preview = false;
+                }
+            }
             Phase::Shell { .. } => {
-                // Issue 19: two nesting levels — outer [left | rest] keeps
-                // the nav width, inner [list | reader] resizes the split
-                // between the middle and right panes.
                 let dir = self.data_dir.clone();
                 let widths2 = widths;
                 let inner = gpui_kit::component::h_resizable("mid-reader")
@@ -1887,9 +2062,11 @@ fn drag_header(
         )
 }
 
-/// Issue 17: transparent 28px strip at the top of the right pane — drag
-/// region only, no content.
+/// Issue 17/21: transparent drag strip at the top of the right pane — drag
+/// region only, no content. Reader keeps the 28px strip; the editor uses a
+/// slim 10px strip (issue 21) so the title sits closer to the top.
 fn reader_drag_strip(
+    height: f32,
     window: &mut Window,
     cx: &mut gpui_kit::Context<AppShell>,
 ) -> impl IntoElement + use<> {
@@ -1900,7 +2077,7 @@ fn reader_drag_strip(
         .flex()
         .flex_none()
         .items_center()
-        .h(px(28.))
+        .h(px(height))
         .w_full()
         .when(is_macos, |this| {
             this.on_double_click(|_, window, _| window.titlebar_double_click())
@@ -2226,6 +2403,9 @@ impl AppShell {
             .w_full()
             .h_full()
             .bg(theme::material(Material::Base, dark))
+            // Tests read this element's bounds to prove the pane layout
+            // survives ⌘T full preview (no-op in release).
+            .debug_selector(|| "nav-pane".into())
             // Issue 17: 44px header below is the window-drag region (see
             // the header child below); no global titlebar strip anymore.
             .px_3()
@@ -3067,6 +3247,157 @@ impl AppShell {
         self.schedule_autosave(cx);
     }
 
+    /// Issue 21 需求9: store each image locally (24-hex id) and insert
+    /// `![name](leanote://file/getImage?fileId=<id>)` at the cursor.
+    fn attach_images(
+        &mut self,
+        paths: Vec<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        let Some(ed) = self.editing.as_ref() else {
+            return;
+        };
+        if ed.preview {
+            return;
+        }
+        let editor = ed.content.clone();
+        let mut md = String::new();
+        for p in paths {
+            let Ok(bytes) = std::fs::read(&p) else {
+                continue;
+            };
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "image".into());
+            let mime = match name
+                .rsplit('.')
+                .next()
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("jpg" | "jpeg") => "image/jpeg".to_string(),
+                Some(ext @ ("png" | "gif" | "webp" | "bmp" | "svg")) => {
+                    format!("image/{ext}")
+                }
+                _ => "image/png".to_string(),
+            };
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let id = format!("{nanos:024x}");
+            let img = leanote_core::ImageAttachment {
+                local_id: leanote_core::Id(id.clone()),
+                server_id: String::new(),
+                file_name: name.clone(),
+                mime: mime.clone(),
+                size: bytes.len() as i64,
+                bytes,
+                created_time: 0,
+            };
+            let stored = self.store().map(|s| s.insert_image(&img));
+            if !matches!(stored, Some(Ok(()))) {
+                continue;
+            }
+            md.push_str(&format!("![{name}](leanote://file/getImage?fileId={id})\n"));
+        }
+        if md.is_empty() {
+            return;
+        }
+        editor.update(cx, |state, cx| {
+            let cursor = state.selected_range().end;
+            state.set_selected_range(cursor..cursor, cx);
+            state.insert(md, window, cx);
+        });
+        self.schedule_autosave(cx);
+    }
+
+    /// Issue 21: editor content has focus and vim is off or in insert
+    /// mode — the "type into the buffer" state where input assists run.
+    fn editor_insert_focused(&self, window: &Window, cx: &gpui_kit::Context<Self>) -> bool {
+        let Some(ed) = &self.editing else {
+            return false;
+        };
+        if ed.preview || !ed.content.read(cx).has_selection_focus(window, cx) {
+            return false;
+        }
+        !self.vim_enabled || self.vim.mode == crate::vim::VimMode::Insert
+    }
+
+    /// Issue 21 需求4: Enter on a list line continues the marker
+    /// (insert mode / vim off — the vim capture runs first).
+    fn enter_list_continue(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> bool {
+        let Some(ed) = &self.editing else {
+            return false;
+        };
+        if ed.preview {
+            return false;
+        }
+        let editor = ed.content.clone();
+        let hit = editor.update(cx, |state, cx| {
+            crate::markdown_input::enter_continue_list(state, window, cx)
+        });
+        if hit {
+            self.schedule_autosave(cx);
+        }
+        hit
+    }
+
+    /// Issue 21 需求5: bare-key pair closing / fence completion in the
+    /// editor (insert mode / vim off). Returns true when consumed.
+    fn md_pair_key(
+        &mut self,
+        key_char: char,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> bool {
+        let Some(ed) = &self.editing else {
+            return false;
+        };
+        if ed.preview {
+            return false;
+        }
+        let editor = ed.content.clone();
+        let hit = editor.update(cx, |state, cx| {
+            crate::markdown_input::close_pair_on_key(state, key_char, window, cx)
+        });
+        if hit {
+            self.schedule_autosave(cx);
+        }
+        hit
+    }
+
+    /// Issue 21 需求5: Tab/Shift-Tab on a list line indents the line
+    /// start; other lines keep the kit default. Returns true when
+    /// consumed.
+    fn md_indent(
+        &mut self,
+        outdent: bool,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> bool {
+        let Some(ed) = &self.editing else {
+            return false;
+        };
+        if ed.preview {
+            return false;
+        }
+        let editor = ed.content.clone();
+        let hit = editor.update(cx, |state, cx| {
+            crate::markdown_input::indent_list_line(state, outdent, window, cx)
+        });
+        if hit {
+            self.schedule_autosave(cx);
+        }
+        hit
+    }
+
     /// Flat (id, title, depth) of every valid move target: root + all
     /// notebooks except the moved one and its descendants (no cycles).
     fn notebook_move_targets(&mut self, moved: &leanote_core::Id) -> Vec<(String, String, usize)> {
@@ -3419,7 +3750,7 @@ impl AppShell {
             .min_w_0()
             .bg(theme::material(Material::Background, dark))
             // Issue 17: top strip is the right-pane drag region.
-            .child(reader_drag_strip(window, cx));
+            .child(reader_drag_strip(28., window, cx));
 
         // Ticket 14: adjudication bar when this note (or any note) has an
         // unresolved conflict. Built before the selection check so it also
@@ -3492,25 +3823,10 @@ impl AppShell {
             .cloned()
             .unwrap_or_else(|| n.notebook_id.to_string());
 
-        // Toolbar: star toggle (live notes) / trash actions (trash view).
-        let id = n.note_id.clone();
-        let star_btn = if n.star {
-            Button::new("star-toggle")
-                .icon(IconName::StarFill)
-                .ghost()
-                .on_click(
-                    cx.listener(move |this, _ev, _window, cx| this.toggle_star(id.clone(), cx)),
-                )
-        } else {
-            Button::new("star-toggle")
-                .icon(IconName::Star)
-                .ghost()
-                .on_click(
-                    cx.listener(move |this, _ev, _window, cx| this.toggle_star(id.clone(), cx)),
-                )
-        };
-
-        let mut toolbar = gpui_kit::base::h_flex().gap_2().child(star_btn);
+        // Issue 21: star + exports moved to the row context menu; the
+        // toolbar keeps convert (rich text), trash actions and the
+        // export-status label.
+        let mut toolbar = gpui_kit::base::h_flex().gap_2();
         // Ticket 12: rich-text notes are read-only Markdown renders; the
         // only write path is the explicit convert action. No edit entry
         // exists anywhere for them.
@@ -3557,34 +3873,6 @@ impl AppShell {
             );
         }
 
-        // Ticket 15: export actions (live notes only).
-        if !is_trash_view {
-            toolbar = toolbar
-                .child(
-                    Button::new("export-html")
-                        .label(t(i18n::Key::ExportHtml))
-                        .outline()
-                        .on_click(cx.listener(|this, _ev, _window, cx| {
-                            this.export_selected_file(false, cx)
-                        })),
-                )
-                .child(
-                    Button::new("export-markdown")
-                        .label(t(i18n::Key::ExportMarkdown))
-                        .outline()
-                        .on_click(cx.listener(|this, _ev, _window, cx| {
-                            this.export_selected_file(true, cx)
-                        })),
-                )
-                .child(
-                    Button::new("export-pdf")
-                        .label(t(i18n::Key::ExportPdf))
-                        .outline()
-                        .on_click(
-                            cx.listener(|this, _ev, _window, cx| this.export_selected_pdf(cx)),
-                        ),
-                );
-        }
         if let Some(status) = self.export_status.clone() {
             toolbar = toolbar.child(
                 Label::new(status)
@@ -3593,7 +3881,11 @@ impl AppShell {
             );
         }
 
-        let src = browse::reader_markdown_src(&n.title, &n.content, n.is_markdown);
+        let content = self
+            .store()
+            .map(|s| browse::resolve_note_images(&n.content, &s))
+            .unwrap_or_else(|| n.content.clone());
+        let src = browse::reader_markdown_src(&n.title, &content, n.is_markdown);
 
         let mut col = gpui_kit::base::v_flex().px(px(5.)).gap_2().min_h_0();
         if let Some(bar) = bar {
@@ -3640,10 +3932,9 @@ impl AppShell {
             .h_full()
             .min_w_0()
             .bg(theme::material(Material::Background, dark))
-            // Issue 17: editor runs flush to the top; the reader's 28px
-            // drag strip is above the toolbar when editing (the caller
-            // nests this pane inside the reader).
-            .child(reader_drag_strip(window, cx));
+            // Issue 21: slim 10px drag strip above the title row (the
+            // reader keeps its 28px strip); the caller nests this pane
+            .child(reader_drag_strip(10., window, cx));
 
         let Some(ed) = &self.editing else {
             unreachable!("caller checked")
@@ -3676,9 +3967,13 @@ impl AppShell {
         let title_row = gpui_kit::base::h_flex()
             .gap_2()
             .child(
+                // Issue 21: title 20px (fixed) — Styled .text_size flows
+                // into the state's text element (its prepaint reads
+                // window.text_style()).
                 Input::new(&title_entity)
                     .appearance(false)
                     .bordered(false)
+                    .text_size(px(20.))
                     .h(px(32.))
                     .flex_1()
                     .min_w_0(),
@@ -3710,19 +4005,9 @@ impl AppShell {
                 AssetIcon::Clock,
                 t(i18n::Key::History),
                 Box::new(cx.listener(|this, _ev, window, cx| this.open_history(window, cx))),
-            ))
-            .child(icon_btn(
-                "fullscreen",
-                AssetIcon::Maximize,
-                t(i18n::Key::Fullscreen),
-                Box::new(|_ev, window, _cx| window.toggle_fullscreen()),
-            ))
-            .child(icon_btn(
-                "done",
-                AssetIcon::Check,
-                t(i18n::Key::Done),
-                Box::new(cx.listener(|this, _ev, _window, cx| this.stop_editing(cx))),
             ));
+        // Issue 21: no Done and no OS-fullscreen button — quitting edit is
+        // selecting another note; fullscreen is the ⌘T in-app preview.
 
         // Markdown insertion toolbar (issue 19): wraps selection or inserts
         // at the cursor.
@@ -3766,6 +4051,29 @@ impl AppShell {
             ))
             .child(md_btn("md-hr", AssetIcon::Minus, "\n---\n", ""))
             .child(
+                // Issue 21 需求9: pick images, store locally, insert links.
+                Button::new("md-image")
+                    .icon(AssetIcon::Image)
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(|_this, _ev, window, cx| {
+                        let rx = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+                            files: true,
+                            directories: false,
+                            multiple: true,
+                            prompt: None,
+                        });
+                        cx.spawn_in(window, async move |this, cx| {
+                            if let Ok(Ok(Some(paths))) = rx.await {
+                                _ = this.update_in(cx, |this, window, cx| {
+                                    this.attach_images(paths, window, cx);
+                                });
+                            }
+                        })
+                        .detach();
+                    })),
+            )
+            .child(
                 Button::new("md-help")
                     .icon(AssetIcon::MessageCircleQuestionMark)
                     .ghost()
@@ -3784,7 +4092,14 @@ impl AppShell {
                 .child(
                     TextView::markdown(
                         "editor-preview",
-                        browse::reader_markdown_src(&title_txt, &src, true),
+                        browse::reader_markdown_src(
+                            &title_txt,
+                            &self
+                                .store()
+                                .map(|s| browse::resolve_note_images(&src, &s))
+                                .unwrap_or_else(|| src.clone()),
+                            true,
+                        ),
                     )
                     .scrollable(true)
                     .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
@@ -3808,6 +4123,30 @@ impl AppShell {
             .child(title_row)
             .when(!preview, |el| el.child(md_toolbar))
             .child(body)
+            .on_drop::<gpui_kit::ExternalPaths>(cx.listener(
+                |this, paths: &gpui_kit::ExternalPaths, window, cx| {
+                    // Issue 21 需求9: dropped image files attach to the note.
+                    let imgs: Vec<std::path::PathBuf> = paths
+                        .paths()
+                        .iter()
+                        .filter(|p| {
+                            p.extension()
+                                .and_then(|e| e.to_str())
+                                .map(|e| {
+                                    matches!(
+                                        e.to_ascii_lowercase().as_str(),
+                                        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+                                    )
+                                })
+                                .unwrap_or(false)
+                        })
+                        .cloned()
+                        .collect();
+                    if !imgs.is_empty() {
+                        this.attach_images(imgs, window, cx);
+                    }
+                },
+            ))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 // ⌘S / Ctrl+S save first (IME-safe: key_char is None for
                 // cmd combos, so composition is never touched).
@@ -3829,12 +4168,38 @@ impl AppShell {
                 // intercepted by the capture_action hooks below instead.
                 if this.vim_key_down(&ev.keystroke, window, cx) {
                     cx.stop_propagation();
+                    return;
+                }
+                // Issue 21 需求5: markdown pair closing / fence — insert
+                // mode only (vim normal/visual consumed above), IME-safe
+                // (key_char present, no modifiers), kit defaults for the
+                // pairs are disabled at startup.
+                let m2 = &ev.keystroke.modifiers;
+                if !m2.platform && !m2.control && !m2.alt && !m2.shift {
+                    if let Some(ch) = ev
+                        .keystroke
+                        .key_char
+                        .as_deref()
+                        .and_then(|s| s.chars().next())
+                    {
+                        if matches!(ch, '*' | '~' | '`' | '[' | '(')
+                            && this.editor_insert_focused(window, cx)
+                            && this.md_pair_key(ch, window, cx)
+                        {
+                            cx.stop_propagation();
+                        }
+                    }
                 }
             }))
             .capture_action::<Enter>(cx.listener(move |this, _: &Enter, window, cx| {
-                // Normal-mode enter / cmdline execute. Insert mode and
-                // non-editor focus fall through to the kit handler.
+                // Normal-mode enter / cmdline execute first; insert mode
+                // (or vim off) falls to the list continuation, then to
+                // the kit's plain enter.
                 if this.vim_action_key("enter", window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.enter_list_continue(window, cx) {
                     cx.stop_propagation();
                 }
             }))
@@ -3857,27 +4222,24 @@ impl AppShell {
                     cx.stop_propagation();
                 }
             }))
-            .when(!preview, |el| {
-                // Issue 17: vim mode indicator. Without it a Normal-mode
-                // ESC silently no-ops and vim looks broken.
-                let (label, cmdline) = if self.vim_enabled {
-                    let m = crate::vim::mode_label(self.vim.mode);
-                    (m, self.vim.cmdline().to_string())
-                } else {
-                    ("", String::new())
-                };
-                if label.is_empty() {
-                    el
-                } else {
-                    el.child(
-                        gpui_kit::base::h_flex()
-                            .gap_2()
-                            .px_1()
-                            .child(small_label(label, muted))
-                            .child(small_label(&cmdline, muted)),
-                    )
-                }
-            });
+            .capture_action::<IndentInline>(cx.listener(
+                move |this, _: &IndentInline, window, cx| {
+                    // Issue 21 需求5: list lines indent at line start; other
+                    // lines keep the kit default (2-space at cursor).
+                    if this.editor_insert_focused(window, cx) && this.md_indent(false, window, cx) {
+                        cx.stop_propagation();
+                    }
+                },
+            ))
+            .capture_action::<OutdentInline>(cx.listener(
+                move |this, _: &OutdentInline, window, cx| {
+                    if this.editor_insert_focused(window, cx) && this.md_indent(true, window, cx) {
+                        cx.stop_propagation();
+                    }
+                },
+            ));
+        // Issue 21: vim status line removed — the block caret is the
+        // mode indicator (ADR-0005); :w/:q still work.
 
         // Clear the one-frame saved flash after this render.
         if saved_flash {
@@ -4327,6 +4689,230 @@ mod tests {
                 "d}} deletes caret..next blank line start"
             );
         });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue 21 需求4/5: Enter list continuation and pair closing,
+    /// driven through the real dispatch chain (capture hooks in the
+    /// rendered editor column).
+    #[gpui_kit::test]
+    fn markdown_input_enter_pairs(cx: &mut gpui_kit::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("leanote-mdtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = leanote_core::Store::open(dir.clone(), "user1".to_string()).unwrap();
+        let note = store
+            .add_note(leanote_core::NewNote {
+                title: "t".into(),
+                content: "1. one\n- [ ] task".into(),
+                tags: vec![],
+                notebook_title: "nb".into(),
+                is_markdown: true,
+            })
+            .unwrap();
+
+        cx.update(gpui_kit::init);
+        let mut shell_entity: Option<gpui_kit::Entity<AppShell>> = None;
+        let window = cx
+            .update(|cx| {
+                cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+                    let shell = cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true, // signed in: render the shell, not auth
+                            Some("user1".into()),
+                            None,
+                        )
+                    });
+                    shell_entity = Some(shell.clone());
+                    shell
+                })
+            })
+            .unwrap();
+        let shell_entity = shell_entity.unwrap();
+        let note_id = note.note_id.clone();
+        window
+            .update(cx, |shell, window, cx| {
+                shell.select_note(note_id, window, cx);
+                // prefs default has vim on; turn it off for this test so
+                // insert assists are active from the first keystroke.
+                if shell.vim_enabled {
+                    shell.vim_enabled = false;
+                    shell.vim.reset();
+                }
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.background_executor.allow_parking();
+        let mut cx = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let content = shell_entity.read_with(&cx, |shell, _| {
+            shell.editing.as_ref().unwrap().content.clone()
+        });
+
+        // End of line 1 ("1. one") → Enter continues to "2. ".
+        cx.update(|_, cx| {
+            content.update(cx, |s, cx| s.set_selected_range(6..6, cx));
+        });
+        cx.simulate_keystrokes("enter");
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).value(),
+                "1. one\n2. \n- [ ] task",
+                "ordered list continues with the next number"
+            );
+        });
+        // Empty item Enter drops the marker (ends the list).
+        cx.simulate_keystrokes("enter");
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).value(),
+                "1. one\n\n- [ ] task",
+                "empty item enter clears the prefix"
+            );
+        });
+        // Move to the end of the task line; Enter continues "- [ ]".
+        cx.update(|_, cx| {
+            content.update(cx, |s, cx| s.set_selected_range(18..18, cx));
+        });
+        cx.simulate_keystrokes("enter");
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).value(),
+                "1. one\n\n- [ ] task\n- [ ] ",
+                "task checkbox continues unchecked"
+            );
+        });
+        // Pair closing: `[` inserts `[]` with the caret between.
+        cx.simulate_keystrokes("[");
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).value(),
+                "1. one\n\n- [ ] task\n- [ ] []",
+                "open bracket closes itself"
+            );
+            let r = content.read(cx).selected_range();
+            assert_eq!(r, r.start..r.start, "collapsed caret between the pair");
+        });
+
+        // Tab on a list line indents the line start by two spaces.
+        cx.update(|_, cx| {
+            content.update(cx, |s, cx| s.set_selected_range(0..0, cx));
+        });
+        cx.simulate_keystrokes("tab");
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).value(),
+                "  1. one\n\n- [ ] task\n- [ ] []",
+                "tab indents the list line start"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue 21 需求10: ⌘T toggles the full-window preview state.
+    #[gpui_kit::test]
+    fn full_preview_toggles(cx: &mut gpui_kit::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("leanote-fptest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A distinctive non-default left width so a redistributed layout is
+        // detectable: the bug reset the pane split after a full preview.
+        {
+            let mut p = crate::prefs::Prefs::load(&dir);
+            p.pane_widths.left = Some(333.);
+            p.pane_widths.mid = Some(444.);
+            p.save(&dir);
+        }
+        let store = leanote_core::Store::open(dir.clone(), "user1".to_string()).unwrap();
+        let note = store
+            .add_note(leanote_core::NewNote {
+                title: "t".into(),
+                content: "# hi".into(),
+                tags: vec![],
+                notebook_title: "nb".into(),
+                is_markdown: true,
+            })
+            .unwrap();
+
+        cx.update(gpui_kit::init);
+        // Same binding the real app registers in main.rs.
+        cx.update(|cx| {
+            cx.bind_keys([gpui_kit::KeyBinding::new(
+                "cmd-t",
+                crate::search_overlay::ToggleFullPreview,
+                None,
+            )]);
+        });
+        let mut shell_entity: Option<gpui_kit::Entity<AppShell>> = None;
+        let window = cx
+            .update(|cx| {
+                cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+                    let shell = cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true,
+                            Some("user1".into()),
+                            None,
+                        )
+                    });
+                    shell_entity = Some(shell.clone());
+                    shell
+                })
+            })
+            .unwrap();
+        let shell_entity = shell_entity.unwrap();
+        let note_id = note.note_id.clone();
+        window
+            .update(cx, |shell, window, cx| {
+                shell.select_note(note_id, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.background_executor.allow_parking();
+        let mut cx = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        // The nav pane's width must survive a full-preview round trip: the
+        // bug was the group collapsing to one panel and redistributing.
+        let nav_before = cx
+            .debug_bounds("nav-pane")
+            .expect("nav pane rendered")
+            .size
+            .width;
+
+        cx.simulate_keystrokes("cmd-t");
+        cx.update(|_, cx| {
+            assert!(
+                shell_entity.read(cx).full_preview,
+                "⌘T must open the full-window preview"
+            );
+        });
+
+        // No manual redraw: dispatch_key_event redraws on notify-dirty, and
+        // a manual draw+clear here would wipe the dispatch tree's listeners.
+        cx.simulate_keystrokes("escape");
+        cx.update(|_, cx| {
+            assert!(
+                !shell_entity.read(cx).full_preview,
+                "ESC must leave the full-window preview"
+            );
+        });
+        // The kit state kept all three panel slots through the preview, so
+        // the divider returns to its dragged position, not a redistributed
+        // equal split.
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let nav_after = cx
+            .debug_bounds("nav-pane")
+            .expect("nav pane re-rendered")
+            .size
+            .width;
+        assert_eq!(nav_before, nav_after, "nav pane width must survive ⌘T");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

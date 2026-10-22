@@ -199,6 +199,34 @@ impl Api {
             .to_string())
     }
 
+    /// GET `file/getImage` → `(mime, bytes)` (issue 21 需求9; JSON body
+    /// means `{Ok:false}`).
+    pub fn get_image(&self, file_id: &str) -> Result<(String, Vec<u8>), SyncError> {
+        use std::io::Read;
+        let mut resp = self
+            .agent
+            .get(&self.url("file/getImage", &[("fileId", file_id.to_string())]))
+            .call()
+            .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+        let mime = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/png")
+            .to_string();
+        let mut body = Vec::new();
+        resp.body_mut()
+            .with_config()
+            .reader()
+            .read_to_end(&mut body)
+            .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+        if mime.starts_with("application/json") {
+            Err(SyncError::Api("notExists".into()))
+        } else {
+            Ok((mime, body))
+        }
+    }
+
     /// GET note/exportPdf → raw PDF bytes (src/api.js `exportPdf`: the body
     /// is the file, NOT JSON; the server signals failure with a JSON
     /// `{Ok:false, Msg}` object, which JS detects via `typeof body == 'object'`).
@@ -339,6 +367,7 @@ impl Api {
         tags: &[String],
         created: &str,
         updated: &str,
+        images: &[crate::ImageAttachment],
     ) -> Result<Value, SyncError> {
         let mut form = vec![
             ("Title", title),
@@ -352,7 +381,11 @@ impl Api {
         for t in tags {
             form.push(("Tags", t.as_str()));
         }
-        self.post_form("note/addNote", &[], &form)
+        if images.is_empty() {
+            self.post_form("note/addNote", &[], &form)
+        } else {
+            self.post_note_multipart("note/addNote", &form, images)
+        }
     }
 
     pub fn update_note(
@@ -365,6 +398,7 @@ impl Api {
         tags: &[String],
         content: &str,
         updated: &str,
+        images: &[crate::ImageAttachment],
     ) -> Result<Value, SyncError> {
         // JS always sends Content when ContentIsDirty; we have no such
         // column, so always send it.
@@ -384,7 +418,59 @@ impl Api {
         for t in tags {
             form.push(("Tags", t.as_str()));
         }
-        self.post_form("note/updateNote", &[], &form)
+        if images.is_empty() {
+            self.post_form("note/updateNote", &[], &form)
+        } else {
+            self.post_note_multipart("note/updateNote", &form, images)
+        }
+    }
+
+    /// JS wire format for note pushes carrying image bodies: `Files` is the
+    /// JSON attribute array (src/note.js getFilesPostInfo), each dirty image
+    /// rides as a part named by its local file id (src/api.js FileDatas).
+    fn post_note_multipart(
+        &self,
+        path: &str,
+        form: &[(&str, &str)],
+        images: &[crate::ImageAttachment],
+    ) -> Result<Value, SyncError> {
+        let files = serde_json::to_string(
+            &images
+                .iter()
+                .map(|i| {
+                    json!({
+                        "FileId": i.local_id.0,
+                        "LocalFileId": i.local_id.0,
+                        "Type": "image",
+                        "HasBody": true,
+                        "IsAttach": false,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+        let mut mform = form.to_vec();
+        mform.push(("Files", files.as_str()));
+
+        let mut builder = ureq::unversioned::multipart::Form::new();
+        for (k, v) in &mform {
+            builder = builder.text(k, v);
+        }
+        for img in images {
+            let fname = img.file_name.clone();
+            let part = ureq::unversioned::multipart::Part::bytes(&img.bytes)
+                .file_name(fname.as_str())
+                .mime_str(&img.mime)
+                .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+            builder = builder.part(&img.local_id.0, part);
+        }
+        self.agent
+            .post(&self.url(path, &[]))
+            .send(builder)
+            .map_err(|e| SyncError::Unconnected(e.to_string()))?
+            .body_mut()
+            .read_json::<Value>()
+            .map_err(|e| SyncError::Unconnected(e.to_string()))
     }
 
     pub fn delete_trash(&self, server_note_id: &str, usn: i64) -> Result<Value, SyncError> {
@@ -705,6 +791,9 @@ pub fn full_sync(
         progress.note(format!("content: {sid}"));
     }
 
+    // Issue 21 需求9: download bytes for images referenced by pulled notes.
+    let _ = pull_missing_images(api, store);
+
     // JS `updateLastSyncState`: LastSyncUsn comes from the server.
     let server_usn = api.get_sync_state()?;
     store
@@ -731,6 +820,80 @@ fn check_need_incr_sync_again(
     Ok(())
 }
 
+/// Issue 21 需求9: images referenced by the note's markdown that have not
+/// been uploaded yet (empty ServerId) ride along with the note push.
+fn dirty_images(store: &Store, content: &str) -> Result<Vec<crate::ImageAttachment>, SyncError> {
+    let mut out = Vec::new();
+    for id in Store::image_ids_in_content(content) {
+        if let Some(img) = store.get_image(&id).map_err(db_err)? {
+            if img.server_id.is_empty()
+                && !out
+                    .iter()
+                    .any(|i: &crate::ImageAttachment| i.local_id == img.local_id)
+            {
+                out.push(img);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Issue 21 需求9: after a pull, note markdown may reference images whose
+/// bytes live only on the server (`leanote://file/getImage?fileId=<sid>`).
+/// Download each missing one into the local images table so the reader can
+/// render it. Errors are skipped (next sync retries).
+pub fn pull_missing_images(api: &Api, store: &Store) -> Result<usize, SyncError> {
+    let mut fetched = 0;
+    for n in store.list_notes().map_err(db_err)? {
+        for id in Store::image_ids_in_content(&n.content) {
+            let missing = store
+                .get_image(&id)
+                .map_err(db_err)?
+                .map(|img| img.bytes.is_empty())
+                .unwrap_or(true);
+            if !missing {
+                continue;
+            }
+            let Ok((mime, bytes)) = api.get_image(&id) else {
+                continue;
+            };
+            let img = crate::ImageAttachment {
+                local_id: crate::Id(id.clone()),
+                server_id: if id.starts_with("srvimg") {
+                    id.clone()
+                } else {
+                    String::new()
+                },
+                file_name: format!("{id}.png"),
+                mime,
+                size: bytes.len() as i64,
+                bytes,
+                created_time: 0,
+            };
+            if store.insert_image(&img).map_err(db_err).is_ok() {
+                fetched += 1;
+            }
+        }
+    }
+    Ok(fetched)
+}
+
+/// JS `File.updateImageForce`: map the response's LocalFileId -> FileId into
+/// the images table so later pulls/render resolve server ids.
+fn apply_files_mapping(store: &Store, ret: &Value) -> Result<(), SyncError> {
+    if let Some(files) = ret.get("Files").and_then(Value::as_array) {
+        for f in files {
+            let local = f.get("LocalFileId").and_then(Value::as_str).unwrap_or("");
+            let server = f.get("FileId").and_then(Value::as_str).unwrap_or("");
+            if !local.is_empty() && !server.is_empty() {
+                store
+                    .set_image_server_id(&crate::Id(local.to_string()), server)
+                    .map_err(db_err)?;
+            }
+        }
+    }
+    Ok(())
+}
 fn db_err(e: rusqlite::Error) -> SyncError {
     SyncError::Unconnected(e.to_string())
 }
@@ -821,6 +984,7 @@ pub fn incr_sync(
         }
 
         if !need_again {
+            let _ = pull_missing_images(api, store);
             return Ok(stats);
         }
         again = true;
@@ -911,6 +1075,7 @@ fn push_dirty_notes(
             .unwrap_or_else(|| nb_local.clone());
 
         if n.is_new && !n.is_trash && !n.is_deleted {
+            let images = dirty_images(store, &n.content)?;
             let ret = api.add_note(
                 &nb_server,
                 &n.title,
@@ -919,10 +1084,12 @@ fn push_dirty_notes(
                 &n.tags,
                 &fmt_datetime(n.created_time),
                 &fmt_datetime(n.updated_time),
+                &images,
             )?;
             if ok(&ret) {
                 let sid = str_field(&ret, "NoteId");
                 let usn = i64_field(&ret, "Usn");
+                apply_files_mapping(store, &ret)?;
                 store
                     .note_add_pushed(&n.note_id, &sid, usn)
                     .map_err(db_err)?;
@@ -946,6 +1113,7 @@ fn push_dirty_notes(
                     .map_err(db_err)?;
             }
         } else {
+            let images = dirty_images(store, &n.content)?;
             let ret = api.update_note(
                 &server_note_id,
                 &nb_server,
@@ -955,9 +1123,11 @@ fn push_dirty_notes(
                 &n.tags,
                 &n.content,
                 &fmt_datetime(n.updated_time),
+                &images,
             )?;
             if ok(&ret) {
                 let usn = i64_field(&ret, "Usn");
+                apply_files_mapping(store, &ret)?;
                 store.note_update_pushed(&n.note_id, usn).map_err(db_err)?;
                 check_need_incr_sync_again(store, usn, need_again)?;
             } else if msg_of(&ret) == "conflict" {

@@ -95,7 +95,8 @@ fn counts(s: &Store) -> (i64, i64, i64, i64) {
         s.raw_query_row("SELECT COUNT(*) FROM notebooks").unwrap(),
         s.raw_query_row("SELECT COUNT(*) FROM notes").unwrap(),
         s.raw_query_row("SELECT COUNT(*) FROM tags").unwrap(),
-        s.raw_query_row("SELECT COUNT(*) FROM notes WHERE Content != ''").unwrap(),
+        s.raw_query_row("SELECT COUNT(*) FROM notes WHERE Content != ''")
+            .unwrap(),
     )
 }
 
@@ -107,7 +108,10 @@ async fn login_persists_token_and_wrong_password_errors() {
 
     // wrong password → server Msg, like JS surfacing the login failure
     let err = Api::login(&srv.url(), EMAIL, "wrong", &s).unwrap_err();
-    assert!(matches!(&err, SyncError::Api(m) if m == "WrongPassword"), "got {err:?}");
+    assert!(
+        matches!(&err, SyncError::Api(m) if m == "WrongPassword"),
+        "got {err:?}"
+    );
     assert!(s.active_account().unwrap().is_none());
 
     // ok login persists the token + account, single active row
@@ -136,12 +140,16 @@ async fn login_sends_real_macaddr_and_version() {
     assert!(
         mac.len() == 17
             && mac.bytes().enumerate().all(|(i, c)| {
-                (i % 3 == 2 && c == b':') || (i % 3 != 2 && c.is_ascii_digit() || c.is_ascii_lowercase())
+                (i % 3 == 2 && c == b':')
+                    || (i % 3 != 2 && c.is_ascii_digit() || c.is_ascii_lowercase())
             }),
         "macAddr must look like aa:bb:cc:dd:ee:ff, got {mac:?}"
     );
     assert!(mac != "rust", "placeholder macAddr leaked");
-    assert!(v != "rust" && !v.is_empty(), "v must be the platform string, got {v:?}");
+    assert!(
+        v != "rust" && !v.is_empty(),
+        "v must be the platform string, got {v:?}"
+    );
     assert_eq!(v, leanote_core::sync::client_version());
 }
 
@@ -168,7 +176,10 @@ async fn full_sync_dataset_parity_and_last_sync_usn() {
     assert_eq!(s.last_sync_usn().unwrap(), 1001);
 
     // content actually landed
-    let note = s.get_note(&leanote_core::Id("note0010".into())).unwrap().unwrap();
+    let note = s
+        .get_note(&leanote_core::Id("note0010".into()))
+        .unwrap()
+        .unwrap();
     assert_eq!(note.content, "# Note 10\n\nbody 10");
     assert_eq!(note.tags, vec!["shared".to_string()]);
     // no note content lost: every live note's content matches the dataset
@@ -200,7 +211,10 @@ async fn rerun_is_idempotent_no_dup_rows_no_lost_content() {
     assert_eq!(stats.contents, 0, "content already present, not re-fetched");
     let second = counts(&s);
     assert_eq!(first, second);
-    let n = s.get_note(&leanote_core::Id("note0042".into())).unwrap().unwrap();
+    let n = s
+        .get_note(&leanote_core::Id("note0042".into()))
+        .unwrap()
+        .unwrap();
     assert_eq!(n.content, "# Note 42\n\nbody 42");
     assert_eq!(s.last_sync_usn().unwrap(), 1001);
 }
@@ -215,7 +229,15 @@ async fn killed_mid_sync_rerun_recovers_consistent() {
     let bin = env!("CARGO_BIN_EXE_leanote");
 
     let mut child = Command::new(bin)
-        .args(["sync", "--host", &srv.url(), "--email", EMAIL, "--password", PWD])
+        .args([
+            "sync",
+            "--host",
+            &srv.url(),
+            "--email",
+            EMAIL,
+            "--password",
+            PWD,
+        ])
         .env("LEANOTE_RUST_DATA", &dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -246,7 +268,15 @@ async fn killed_mid_sync_rerun_recovers_consistent() {
 
     // Re-run to convergence.
     let status = Command::new(bin)
-        .args(["sync", "--host", &srv.url(), "--email", EMAIL, "--password", PWD])
+        .args([
+            "sync",
+            "--host",
+            &srv.url(),
+            "--email",
+            EMAIL,
+            "--password",
+            PWD,
+        ])
         .env("LEANOTE_RUST_DATA", &dir)
         .output()
         .unwrap();
@@ -296,7 +326,15 @@ async fn sync_cli_smoke_prints_progress() {
 
     // and a wrong-password run exits non-zero with the server Msg
     let bad = Command::new(bin)
-        .args(["sync", "--host", &srv.url(), "--email", EMAIL, "--password", "nope"])
+        .args([
+            "sync",
+            "--host",
+            &srv.url(),
+            "--email",
+            EMAIL,
+            "--password",
+            "nope",
+        ])
         .env("LEANOTE_RUST_DATA", &dir)
         .output()
         .unwrap();
@@ -346,7 +384,10 @@ async fn incr_push_offline_new_and_edit() {
     .unwrap();
     s.update_note(
         &Id("note0042".into()),
-        NoteUpdate { content: Some("# Note 42\n\nlocal edit".into()), ..Default::default() },
+        NoteUpdate {
+            content: Some("# Note 42\n\nlocal edit".into()),
+            ..Default::default()
+        },
     )
     .unwrap();
 
@@ -382,6 +423,107 @@ async fn incr_push_offline_new_and_edit() {
     assert_eq!(s.last_sync_usn().unwrap(), 1003);
 }
 
+// ---- incr sync: image uploads (issue 21 需求9) ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incr_push_uploads_dirty_images_with_note() {
+    use leanote_core::ImageAttachment;
+
+    let (srv, _dir, s, api) = synced("incr_images").await;
+    let local_id = "img00000000000000000000a";
+    let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    s.insert_image(&ImageAttachment {
+        local_id: Id(local_id.into()),
+        server_id: String::new(),
+        file_name: "shot.png".into(),
+        mime: "image/png".into(),
+        bytes: png.to_vec(),
+        size: png.len() as i64,
+        created_time: 0,
+    })
+    .unwrap();
+    let content = format!("# Note 42\n\n![shot](leanote://file/getImage?fileId={local_id})");
+    s.update_note(
+        &Id("note0042".into()),
+        NoteUpdate {
+            content: Some(content),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    incr_sync(&api, &s, &NoProgress).unwrap();
+
+    // note content pushed as multipart carrying the image part
+    let pushes = srv.pushes();
+    let up = find_push(&pushes, "note/updateNote");
+    let files = up.fields["Files"].as_str().unwrap();
+    assert!(
+        files.contains(local_id),
+        "Files declares the image: {files}"
+    );
+    assert_eq!(
+        up.fields["Content"]
+            .as_str()
+            .unwrap()
+            .contains("leanote://file/getImage"),
+        true
+    );
+
+    // server id mapped back into the images table
+    assert_eq!(
+        s.raw_query_row(
+            "SELECT COUNT(*) FROM images WHERE LocalId='img00000000000000000000a'
+             AND ServerId LIKE 'srvimg%'"
+        )
+        .unwrap(),
+        1
+    );
+
+    // file/getImage serves the exact bytes
+    let images = srv.images();
+    let (sid, (_, mime, bytes)) = images
+        .iter()
+        .find(|(k, _)| k.starts_with("srvimg"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .expect("server stored the image");
+    assert_eq!(mime, "image/png");
+    assert_eq!(&bytes[..], &png[..]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_sync_pulls_referenced_image_bytes() {
+    let (srv, _dir, s, api) = synced("pull_images").await;
+    // new server note referencing an image only the server has
+    srv.set_images([(
+        "srvimg9_0".to_string(),
+        (
+            "dot.png".to_string(),
+            "image/png".to_string(),
+            vec![1, 2, 3, 4],
+        ),
+    )]);
+    let mut notes = srv.notes();
+    notes.push(serde_json::json!({
+        "NoteId":"note0500","Title":"pic","NotebookId":"nb1","Usn":2000,
+        "IsDeleted":false,"IsTrash":false,"IsMarkdown":true,"Tags":"[]"
+    }));
+    srv.set_notes(notes);
+    let mut contents = srv.contents();
+    contents.insert(
+        "note0500".to_string(),
+        serde_json::json!("# pic\n\n![dot](leanote://file/getImage?fileId=srvimg9_0)"),
+    );
+    srv.set_contents(contents);
+    srv.set_sync_usn(2000);
+
+    full_sync(&api, &s, &NoProgress).unwrap();
+
+    let img = s.get_image("srvimg9_0").unwrap().expect("bytes pulled");
+    assert_eq!(img.bytes, vec![1, 2, 3, 4]);
+    assert_eq!(img.mime, "image/png");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn incr_push_hard_delete_sends_delete_trash() {
     let (srv, dir, s, api) = synced("incr_hard_delete").await;
@@ -398,7 +540,11 @@ async fn incr_push_hard_delete_sends_delete_trash() {
     let pushes = srv.pushes();
     let del = find_push(&pushes, "note/deleteTrash");
     assert_eq!(del.fields["noteId"].as_str().unwrap(), "note0042");
-    assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM notes WHERE NoteId='note0042'").unwrap(), 0);
+    assert_eq!(
+        s.raw_query_row("SELECT COUNT(*) FROM notes WHERE NoteId='note0042'")
+            .unwrap(),
+        0
+    );
     assert_eq!(counts(&s).1, 449);
 }
 
@@ -409,7 +555,10 @@ async fn incr_usn_advance_re_rounds_to_convergence() {
     for i in [42, 43] {
         s.update_note(
             &Id(format!("note{i:04}")),
-            NoteUpdate { content: Some(format!("# Note {i}\n\nlocal edit")), ..Default::default() },
+            NoteUpdate {
+                content: Some(format!("# Note {i}\n\nlocal edit")),
+                ..Default::default()
+            },
         )
         .unwrap();
     }
@@ -464,7 +613,10 @@ async fn incr_content_conflict_recorded_not_overwritten() {
     // local edit (dirty)…
     s.update_note(
         &Id("note0042".into()),
-        NoteUpdate { content: Some("# Note 42\n\nlocal edit".into()), ..Default::default() },
+        NoteUpdate {
+            content: Some("# Note 42\n\nlocal edit".into()),
+            ..Default::default()
+        },
     )
     .unwrap();
     // …racing a server edit at a higher usn with different content
@@ -488,7 +640,10 @@ async fn incr_content_conflict_recorded_not_overwritten() {
 
     let conflicts = s.conflicts().unwrap();
     assert_eq!(conflicts.len(), 1);
-    assert_eq!(conflicts[0]["server"]["NoteId"].as_str().unwrap(), "note0042");
+    assert_eq!(
+        conflicts[0]["server"]["NoteId"].as_str().unwrap(),
+        "note0042"
+    );
     assert_eq!(conflicts[0]["server"]["Usn"].as_i64().unwrap(), 1500);
     assert_eq!(
         conflicts[0]["local"]["Content"].as_str().unwrap(),
@@ -563,7 +718,15 @@ async fn editor_save_with_history_pushes_via_cli_sync() {
     // the dirty edit as updateNote with the new content.
     let bin = env!("CARGO_BIN_EXE_leanote");
     let out = Command::new(bin)
-        .args(["sync", "--host", &srv.url(), "--email", EMAIL, "--password", PWD])
+        .args([
+            "sync",
+            "--host",
+            &srv.url(),
+            "--email",
+            EMAIL,
+            "--password",
+            PWD,
+        ])
         .env("LEANOTE_RUST_DATA", &dir)
         .output()
         .unwrap();
@@ -599,7 +762,15 @@ async fn new_note_pushes_add_note_via_cli_sync() {
 
     let bin = env!("CARGO_BIN_EXE_leanote");
     let out = Command::new(bin)
-        .args(["sync", "--host", &srv.url(), "--email", EMAIL, "--password", PWD])
+        .args([
+            "sync",
+            "--host",
+            &srv.url(),
+            "--email",
+            EMAIL,
+            "--password",
+            PWD,
+        ])
         .env("LEANOTE_RUST_DATA", &dir)
         .output()
         .unwrap();
@@ -615,7 +786,10 @@ async fn new_note_pushes_add_note_via_cli_sync() {
     let pushes = srv.pushes();
     let add = find_push(&pushes, "note/addNote");
     assert_eq!(add.fields["Title"].as_str().unwrap(), "Ticket10 note");
-    assert_eq!(add.fields["Content"].as_str().unwrap(), "# fresh\n\nfrom editor");
+    assert_eq!(
+        add.fields["Content"].as_str().unwrap(),
+        "# fresh\n\nfrom editor"
+    );
 }
 /// Ticket 12 end-to-end: legacy rich-text note → read-side convert →
 /// explicit 转存 → incr sync pushes updateNote with the converted Markdown.
@@ -682,7 +856,10 @@ async fn convert_to_markdown_pushes_converted_content() {
 async fn conflicted(srv: &leanote_fakeserver::FakeServer, s: &Store) {
     s.update_note(
         &Id("note0042".into()),
-        NoteUpdate { content: Some("# Note 42\n\nlocal edit".into()), ..Default::default() },
+        NoteUpdate {
+            content: Some("# Note 42\n\nlocal edit".into()),
+            ..Default::default()
+        },
     )
     .unwrap();
     let (mut nb, mut notes, tags, mut contents) = dataset();
@@ -723,7 +900,10 @@ async fn incr_resolve_use_local_pushes_on_next_sync_and_clears() {
     assert_eq!(s.list_conflicts().unwrap().len(), 1);
 
     assert!(s.resolve_conflict_use_local("note0042").unwrap());
-    assert!(s.list_conflicts().unwrap().is_empty(), "bar must disappear after resolution");
+    assert!(
+        s.list_conflicts().unwrap().is_empty(),
+        "bar must disappear after resolution"
+    );
 
     // next sync force-pushes the local version; server accepts
     srv.clear_pushes();
@@ -731,7 +911,10 @@ async fn incr_resolve_use_local_pushes_on_next_sync_and_clears() {
     let pushes = srv.pushes();
     let up = find_push(&pushes, "note/updateNote");
     assert_eq!(up.fields["NoteId"].as_str().unwrap(), "note0042");
-    assert_eq!(up.fields["Content"].as_str().unwrap(), "# Note 42\n\nlocal edit");
+    assert_eq!(
+        up.fields["Content"].as_str().unwrap(),
+        "# Note 42\n\nlocal edit"
+    );
     let n = s.get_note_any(&Id("note0042".into())).unwrap().unwrap();
     assert_eq!(n.content, "# Note 42\n\nlocal edit");
     assert!(!n.is_dirty);
@@ -792,7 +975,10 @@ async fn incr_resolve_keep_both_splits_and_pushes_copy_via_addnote() {
     let pushes = srv.pushes();
     let add = find_push(&pushes, "note/addNote");
     assert_eq!(add.fields["Title"].as_str().unwrap(), "Note 42（本地副本）");
-    assert_eq!(add.fields["Content"].as_str().unwrap(), "# Note 42\n\nlocal edit");
+    assert_eq!(
+        add.fields["Content"].as_str().unwrap(),
+        "# Note 42\n\nlocal edit"
+    );
     assert!(s.list_conflicts().unwrap().is_empty());
 }
 
@@ -801,7 +987,12 @@ async fn incr_resolve_keep_both_splits_and_pushes_copy_via_addnote() {
 #[tokio::test(flavor = "multi_thread")]
 async fn notebook_ops_push_add_update_delete_with_seq() {
     let (srv, _dir, s, api) = synced("t11_nb_ops").await;
-    let nb1 = s.notebooks().unwrap().into_iter().find(|nb| nb.title == "Notebook 1").unwrap();
+    let nb1 = s
+        .notebooks()
+        .unwrap()
+        .into_iter()
+        .find(|nb| nb.title == "Notebook 1")
+        .unwrap();
 
     // offline: create (root) + create (child) + rename + move
     let work = s.create_notebook("Work", "").unwrap();
@@ -814,7 +1005,11 @@ async fn notebook_ops_push_add_update_delete_with_seq() {
         &nb1.notebook_id,
         "",
         0,
-        &[nb1.notebook_id.to_string(), work.notebook_id.to_string(), "nb3".into()],
+        &[
+            nb1.notebook_id.to_string(),
+            work.notebook_id.to_string(),
+            "nb3".into(),
+        ],
     )
     .unwrap();
 
@@ -823,25 +1018,42 @@ async fn notebook_ops_push_add_update_delete_with_seq() {
 
     let pushes = srv.pushes();
     // adds pushed for LocalIsNew notebooks
-    let adds: Vec<&leanote_fakeserver::RecordedPush> =
-        pushes.iter().filter(|p| p.endpoint == "notebook/addNotebook").collect();
+    let adds: Vec<&leanote_fakeserver::RecordedPush> = pushes
+        .iter()
+        .filter(|p| p.endpoint == "notebook/addNotebook")
+        .collect();
     assert_eq!(adds.len(), 2, "Work2 + Work-sub added: {:?}", adds);
-    let titles: Vec<&str> = adds.iter().map(|p| p.fields["title"].as_str().unwrap()).collect();
-    assert!(titles.contains(&"Work2"), "renamed title pushed: {titles:?}");
+    let titles: Vec<&str> = adds
+        .iter()
+        .map(|p| p.fields["title"].as_str().unwrap())
+        .collect();
+    assert!(
+        titles.contains(&"Work2"),
+        "renamed title pushed: {titles:?}"
+    );
     assert!(titles.contains(&"Work-sub"));
     // child seq pushed as its in-group seq
-    let sub_push = adds.iter().find(|p| p.fields["title"] == json!("Work-sub")).unwrap();
+    let sub_push = adds
+        .iter()
+        .find(|p| p.fields["title"] == json!("Work-sub"))
+        .unwrap();
     assert_eq!(sub_push.fields["seq"].as_str().unwrap_or("0"), "0");
     // update pushed for every rewritten root sibling (nb1, nb3); Work2 was
     // LocalIsNew so it travels as addNotebook, not updateNotebook
-    let ups: Vec<&leanote_fakeserver::RecordedPush> =
-        pushes.iter().filter(|p| p.endpoint == "notebook/updateNotebook").collect();
+    let ups: Vec<&leanote_fakeserver::RecordedPush> = pushes
+        .iter()
+        .filter(|p| p.endpoint == "notebook/updateNotebook")
+        .collect();
     assert!(ups.len() >= 2, "moved group rewritten: {:?}", ups);
     let nb1_up = ups
         .iter()
         .find(|p| p.fields["notebookId"] == json!("nb1"))
         .expect("nb1 updateNotebook pushed");
-    assert_eq!(nb1_up.fields["seq"].as_str().unwrap_or("0"), "0", "nb1 moved to front → Seq 0");
+    assert_eq!(
+        nb1_up.fields["seq"].as_str().unwrap_or("0"),
+        "0",
+        "nb1 moved to front → Seq 0"
+    );
 
     // delete: notes to trash + notebook soft-deleted → deleteNotebook + updateNote(IsTrash) pushes
     srv.clear_pushes();
@@ -849,9 +1061,14 @@ async fn notebook_ops_push_add_update_delete_with_seq() {
     incr_sync(&api, &s, &NoProgress).unwrap();
     let pushes = srv.pushes();
     assert!(
-        pushes.iter().any(|p| p.endpoint == "notebook/deleteNotebook"),
+        pushes
+            .iter()
+            .any(|p| p.endpoint == "notebook/deleteNotebook"),
         "deleteNotebook pushed: {:?}",
-        pushes.iter().map(|p| p.endpoint.clone()).collect::<Vec<_>>()
+        pushes
+            .iter()
+            .map(|p| p.endpoint.clone())
+            .collect::<Vec<_>>()
     );
     assert!(s.list_trash().unwrap().is_empty(), "no notes lived in Work");
 }
@@ -859,7 +1076,12 @@ async fn notebook_ops_push_add_update_delete_with_seq() {
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_notebook_pushes_trashed_notes_and_notebook_delete() {
     let (srv, _dir, s, api) = synced("t11_nb_delete").await;
-    let nb2 = s.notebooks().unwrap().into_iter().find(|nb| nb.title == "Notebook 2").unwrap();
+    let nb2 = s
+        .notebooks()
+        .unwrap()
+        .into_iter()
+        .find(|nb| nb.title == "Notebook 2")
+        .unwrap();
     let live: i64 = s
         .raw_query_row("SELECT COUNT(*) FROM notes WHERE NotebookId='nb2' AND IsTrash=0")
         .unwrap();
@@ -868,13 +1090,19 @@ async fn delete_notebook_pushes_trashed_notes_and_notebook_delete() {
     s.delete_notebook(&nb2.notebook_id).unwrap();
     let trash = s.list_trash().unwrap();
     assert_eq!(trash.len(), 150, "notes trashed, not lost");
-    assert!(s.raw_query_row("SELECT COUNT(*) FROM notes WHERE NotebookId='nb2'").unwrap() >= 150);
+    assert!(
+        s.raw_query_row("SELECT COUNT(*) FROM notes WHERE NotebookId='nb2'")
+            .unwrap()
+            >= 150
+    );
 
     srv.clear_pushes();
     incr_sync(&api, &s, &NoProgress).unwrap();
     let pushes = srv.pushes();
     assert!(
-        pushes.iter().any(|p| p.endpoint == "notebook/deleteNotebook"),
+        pushes
+            .iter()
+            .any(|p| p.endpoint == "notebook/deleteNotebook"),
         "notebook delete pushed"
     );
     // trashing is the existing trash_note semantics → note/deleteTrash push
@@ -882,14 +1110,19 @@ async fn delete_notebook_pushes_trashed_notes_and_notebook_delete() {
         .iter()
         .filter(|p| p.endpoint == "note/deleteTrash")
         .collect();
-    assert_eq!(trashed_pushes.len(), 150, "every trashed note pushed deleteTrash");
+    assert_eq!(
+        trashed_pushes.len(),
+        150,
+        "every trashed note pushed deleteTrash"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn note_move_pushes_server_notebook_id() {
     let (srv, _dir, s, api) = synced("t11_note_move").await;
     // note0043: 43 % 3 = 1 → nb2. move it to nb3.
-    s.set_notebook(&Id("note0043".into()), &Id("nb3".into())).unwrap();
+    s.set_notebook(&Id("note0043".into()), &Id("nb3".into()))
+        .unwrap();
 
     srv.clear_pushes();
     incr_sync(&api, &s, &NoProgress).unwrap();
@@ -914,23 +1147,37 @@ async fn tag_rename_and_delete_push_updated_tags() {
     srv.clear_pushes();
     incr_sync(&api, &s, &NoProgress).unwrap();
     let pushes = srv.pushes();
-    let ups: Vec<&leanote_fakeserver::RecordedPush> =
-        pushes.iter().filter(|p| p.endpoint == "note/updateNote").collect();
+    let ups: Vec<&leanote_fakeserver::RecordedPush> = pushes
+        .iter()
+        .filter(|p| p.endpoint == "note/updateNote")
+        .collect();
     assert_eq!(ups.len(), 45, "every tagged note pushed: got {}", ups.len());
     let tags_of = |p: &leanote_fakeserver::RecordedPush| -> String {
         match p.fields.get("Tags") {
-            Some(serde_json::Value::Array(a)) =>
-                a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","),
+            Some(serde_json::Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
             Some(serde_json::Value::String(s)) => s.clone(),
             _ => String::new(),
         }
     };
-    assert!(ups.iter().all(|p| tags_of(p) == "team"), "server sees the renamed tag");
+    assert!(
+        ups.iter().all(|p| tags_of(p) == "team"),
+        "server sees the renamed tag"
+    );
     // the new tag name itself is added on the server
     assert!(
-        pushes.iter().any(|p| p.endpoint == "tag/addTag" && p.fields["tag"] == json!("team")),
+        pushes
+            .iter()
+            .any(|p| p.endpoint == "tag/addTag" && p.fields["tag"] == json!("team")),
         "tag/addTag for the new name: {:?}",
-        pushes.iter().filter(|p| p.endpoint == "tag/addTag").map(|p| p.fields.clone()).collect::<Vec<_>>()
+        pushes
+            .iter()
+            .filter(|p| p.endpoint == "tag/addTag")
+            .map(|p| p.fields.clone())
+            .collect::<Vec<_>>()
     );
 
     // delete: tag row soft-deleted → tag/deleteTag; notes re-pushed without it
@@ -939,11 +1186,18 @@ async fn tag_rename_and_delete_push_updated_tags() {
     incr_sync(&api, &s, &NoProgress).unwrap();
     let pushes = srv.pushes();
     assert!(
-        pushes.iter().any(|p| p.endpoint == "tag/deleteTag" && p.fields["tag"] == json!("team")),
+        pushes
+            .iter()
+            .any(|p| p.endpoint == "tag/deleteTag" && p.fields["tag"] == json!("team")),
         "tag/deleteTag pushed"
     );
-    let ups: Vec<&leanote_fakeserver::RecordedPush> =
-        pushes.iter().filter(|p| p.endpoint == "note/updateNote").collect();
+    let ups: Vec<&leanote_fakeserver::RecordedPush> = pushes
+        .iter()
+        .filter(|p| p.endpoint == "note/updateNote")
+        .collect();
     assert_eq!(ups.len(), 45);
-    assert!(ups.iter().all(|p| tags_of(p).is_empty()), "tag stripped from every note");
+    assert!(
+        ups.iter().all(|p| tags_of(p).is_empty()),
+        "tag stripped from every note"
+    );
 }

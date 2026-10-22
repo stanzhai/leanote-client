@@ -72,6 +72,9 @@ struct Inner {
     pdf_fail: bool,
     /// Issue 19: `fileId -> (filename, bytes)` served by `file/getAttach`.
     attaches: std::collections::HashMap<String, (String, Vec<u8>)>,
+    /// Issue 21: `fileId -> (filename, mime, bytes)` served by
+    /// `file/getImage` and filled by multipart `note/*` pushes.
+    images: std::collections::HashMap<String, (String, String, Vec<u8>)>,
     /// login -> token; token -> valid.
     token: Option<String>,
     /// Next USN handed to push responses (>= max dataset USN).
@@ -157,6 +160,30 @@ impl FakeServer {
         self.inner.lock().unwrap().attaches = attaches;
     }
 
+    /// Issue 21 需求9: seed `fileId -> (filename, mime, bytes)` for demo.
+    pub fn set_images(
+        &self,
+        images: impl IntoIterator<Item = (String, (String, String, Vec<u8>))>,
+    ) {
+        self.inner.lock().unwrap().images = images.into_iter().collect();
+    }
+
+    /// Issue 21: images received by multipart note pushes, keyed by the
+    /// server file id `file/getImage` serves.
+    pub fn images(&self) -> std::collections::HashMap<String, (String, String, Vec<u8>)> {
+        self.inner.lock().unwrap().images.clone()
+    }
+
+    /// Issue 21 需求9: current `noteId -> Content` map (tests mutate+reset).
+    pub fn contents(&self) -> Map<String, Value> {
+        self.inner.lock().unwrap().contents.clone()
+    }
+
+    /// Issue 21 需求9: current note rows (tests append).
+    pub fn notes(&self) -> Vec<Value> {
+        self.inner.lock().unwrap().notes.clone()
+    }
+
     pub fn clear_pushes(&self) {
         self.inner.lock().unwrap().pushes.clear();
     }
@@ -203,6 +230,7 @@ pub async fn start() -> FakeServer {
         .route("/api/note/deleteTrash", post(push("note/deleteTrash")))
         .route("/api/note/exportPdf", get(export_pdf))
         .route("/api/file/getAttach", get(get_attach))
+        .route("/api/file/getImage", get(get_image))
         .route("/api/tag/addTag", post(push("tag/addTag")))
         .route("/api/tag/deleteTag", post(push("tag/deleteTag")))
         .with_state(inner.clone());
@@ -247,6 +275,86 @@ fn parse_fields(body: &str) -> Map<String, Value> {
         }
     }
     map
+}
+
+/// Issue 21 需求9: minimal multipart/form-data split — text fields land in
+/// the returned map (UTF-8), file parts as `(name, filename, mime, bytes)`.
+/// `boundary` comes from the Content-Type header.
+fn parse_multipart(
+    headers: &axum::http::HeaderMap,
+    body: &Bytes,
+) -> (Map<String, Value>, Vec<(String, String, String, Vec<u8>)>) {
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let Some(boundary) = ct
+        .split(';')
+        .find_map(|p| p.trim().strip_prefix("boundary="))
+    else {
+        return (Map::new(), Vec::new());
+    };
+    let delim = format!("--{}", boundary);
+    let mut map = Map::new();
+    let mut files = Vec::new();
+    let d = delim.as_bytes();
+    let mut segments: Vec<&[u8]> = Vec::new();
+    let mut start = 0usize;
+    for i in 0..body.len().saturating_sub(d.len()) {
+        if &body[i..i + d.len()] == d {
+            segments.push(&body[start..i]);
+            start = i + d.len();
+        }
+    }
+    segments.push(&body[start..]);
+    for part in segments {
+        let part = {
+            let mut p = part;
+            while p.starts_with(b"\r\n") {
+                p = &p[2..];
+            }
+            p
+        };
+        if part.is_empty() || part.starts_with(b"--") {
+            continue;
+        }
+        let Some(pos) = part.windows(4).position(|w| w == b"\r\n\r\n") else {
+            continue;
+        };
+        let (head, rest) = part.split_at(pos + 4);
+        let head = &head[..pos];
+        let value = rest.strip_suffix(b"\r\n").unwrap_or(rest);
+        let mut name = String::new();
+        let mut filename = String::new();
+        let mut mime = String::new();
+        for line in String::from_utf8_lossy(head).split("\r\n") {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("content-disposition:") {
+                for p in line.split(';') {
+                    let p = p.trim();
+                    if let Some(v) = p.strip_prefix("name=") {
+                        name = v.trim_matches('"').to_string();
+                    } else if let Some(v) = p.strip_prefix("filename=") {
+                        filename = v.trim_matches('"').to_string();
+                    }
+                }
+            } else if let Some(v) = lower.strip_prefix("content-type:") {
+                mime = v.trim().to_string();
+            }
+        }
+        if name.is_empty() {
+            continue;
+        }
+        if filename.is_empty() {
+            map.insert(
+                name,
+                Value::String(String::from_utf8_lossy(value).into_owned()),
+            );
+        } else {
+            files.push((name, filename, mime, value.to_vec()));
+        }
+    }
+    (map, files)
 }
 
 /// Query strings deserialize numbers as strings; coerce both forms to i64.
@@ -431,6 +539,28 @@ async fn get_attach(
     }
 }
 
+/// `file/getImage` (issue 21 需求9): image bytes with the stored mime type;
+/// unknown fileId answers the usual `{Ok:false}` JSON like getAttach.
+async fn get_image(
+    State(inner): State<Arc<Mutex<Inner>>>,
+    Query(query): Query<Map<String, Value>>,
+) -> Response {
+    let i = inner.lock().unwrap();
+    if let Some(r) = require_token(&query, &i) {
+        return r;
+    }
+    let file_id = query.get("fileId").and_then(Value::as_str).unwrap_or("");
+    match i.images.get(file_id) {
+        Some((_, mime, bytes)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, mime.as_str())],
+            bytes.clone(),
+        )
+            .into_response(),
+        None => json_response(json!({"Ok": false, "Msg": "notExists"})),
+    }
+}
+
 async fn get_sync_tags(
     State(inner): State<Arc<Mutex<Inner>>>,
     Query(query): Query<Map<String, Value>>,
@@ -467,11 +597,16 @@ type PushFuture = Pin<Box<dyn Future<Output = Response> + Send>>;
 #[allow(clippy::type_complexity)]
 fn push(
     endpoint: &'static str,
-) -> impl Fn(State<Arc<Mutex<Inner>>>, Query<Map<String, Value>>, Bytes) -> PushFuture
+) -> impl Fn(
+    State<Arc<Mutex<Inner>>>,
+    axum::http::HeaderMap,
+    Query<Map<String, Value>>,
+    Bytes,
+) -> PushFuture
        + Clone
        + Send
        + 'static {
-    move |State(inner), Query(query), body: Bytes| {
+    move |State(inner), headers, Query(query), body: Bytes| {
         Box::pin(async move {
             {
                 let i = inner.lock().unwrap();
@@ -479,8 +614,21 @@ fn push(
                     return r;
                 }
             }
-            let text = body_to_string(&body);
-            let fields = parse_fields(&text);
+            // Issue 21 需求9: note pushes with images are multipart; the
+            // JSON `Files` field declares each part, matching the JS wire
+            // format (Files + one part per dirty image).
+            let mut uploaded: Vec<(String, String, String, Vec<u8>)> = Vec::new();
+            let fields = if headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("multipart/form-data"))
+            {
+                let (map, files) = parse_multipart(&headers, &body);
+                uploaded = files;
+                map
+            } else {
+                parse_fields(&body_to_string(&body))
+            };
             let mut inner = inner.lock().unwrap();
 
             let mut row_ids = {
@@ -554,6 +702,32 @@ fn push(
                 "tag/deleteTag" => json!({"Ok": true, "Usn": next_usn}),
                 _ => json!({"Ok": true}),
             };
+            // Issue 21 需求9: assign server ids for uploaded images and
+            // echo the JS `Files` mapping (LocalFileId -> FileId).
+            let mut response = response;
+            if !uploaded.is_empty() && (endpoint == "note/addNote" || endpoint == "note/updateNote")
+            {
+                let files: Vec<Value> = uploaded
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, _, _, _))| {
+                        json!({
+                            "FileId": format!("srvimg{}_{}", inner.next_usn, i),
+                            "LocalFileId": name,
+                            "IsAttach": false,
+                        })
+                    })
+                    .collect();
+                for ((name, filename, mime, bytes), f) in uploaded.iter().zip(files.iter()) {
+                    let srv = f["FileId"].as_str().unwrap_or(name).to_string();
+                    inner
+                        .images
+                        .insert(srv, (filename.clone(), mime.clone(), bytes.clone()));
+                }
+                if let Value::Object(m) = &mut response {
+                    m.insert("Files".into(), Value::Array(files));
+                }
+            }
 
             inner.pushes.push(RecordedPush {
                 endpoint: endpoint.to_string(),
