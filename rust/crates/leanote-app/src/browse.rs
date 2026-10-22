@@ -28,7 +28,9 @@ pub fn notebook_nodes(
         if parent.is_empty() {
             roots.push((id.clone(), title.clone(), *seq));
         } else {
-            kids.entry(parent.clone()).or_default().push((id.clone(), title.clone(), *seq));
+            kids.entry(parent.clone())
+                .or_default()
+                .push((id.clone(), title.clone(), *seq));
         }
     }
     let by_seq = |v: &mut Vec<(String, String, i64)>| v.sort_by_key(|(_, _, s)| *s);
@@ -117,8 +119,10 @@ mod tests {
         .map(|(a, b, c, d)| (a.into(), b.into(), c.into(), d))
         .collect();
         let nodes = notebook_nodes(&nbs, &counts(&[("nb1", 1), ("nb2", 2), ("nb2b", 5)]));
-        let flat: Vec<(&str, u8, i64)> =
-            nodes.iter().map(|n| (n.title.as_str(), n.depth, n.count)).collect();
+        let flat: Vec<(&str, u8, i64)> = nodes
+            .iter()
+            .map(|n| (n.title.as_str(), n.depth, n.count))
+            .collect();
         // Roots in Seq order 1,2,3; nb2's children nested after it by Seq.
         assert_eq!(
             flat,
@@ -136,11 +140,10 @@ mod tests {
     fn notebook_nodes_drop_orphans() {
         // Server never sends a notebook whose parent is missing; if it ever
         // did, the walk drops it rather than showing a stray root.
-        let nbs: Vec<(String, String, String, i64)> =
-            vec![("orphan", "Ghost", "gone", 1)]
-                .into_iter()
-                .map(|(a, b, c, d)| (a.into(), b.into(), c.into(), d))
-                .collect();
+        let nbs: Vec<(String, String, String, i64)> = vec![("orphan", "Ghost", "gone", 1)]
+            .into_iter()
+            .map(|(a, b, c, d)| (a.into(), b.into(), c.into(), d))
+            .collect();
         assert!(notebook_nodes(&nbs, &HashMap::new()).is_empty());
     }
 
@@ -149,7 +152,10 @@ mod tests {
         let all = note_meta("Work", &["rust".into(), "gpui".into()], 1_765_235_200_000);
         assert_eq!(all, "Work · rust, gpui · 2025-12-08");
         assert_eq!(note_meta("", &[], 1_765_235_200_000), "2025-12-08");
-        assert_eq!(note_meta("", &["design".into()], 1_765_235_200_000), "design · 2025-12-08");
+        assert_eq!(
+            note_meta("", &["design".into()], 1_765_235_200_000),
+            "design · 2025-12-08"
+        );
     }
 
     #[test]
@@ -164,7 +170,10 @@ mod tests {
         // Plain text (no tags) survives as a paragraph: htmd treats the
         // blank line as a soft break, both lines stay legible.
         let plain = reader_markdown_src("T", "line1\n\nline2", false);
-        assert!(plain.contains("line1") && plain.contains("line2"), "{plain}");
+        assert!(
+            plain.contains("line1") && plain.contains("line2"),
+            "{plain}"
+        );
         // Empty rich body falls back to the title so the pane isn't blank.
         assert_eq!(reader_markdown_src("T", "   ", false), "# T\n");
     }

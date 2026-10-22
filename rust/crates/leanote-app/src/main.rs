@@ -216,7 +216,7 @@ fn main() {
         // Icons: without an AssetSource every svg().path("icons/…") load
         // fails and Icon/IconName render empty — register the kit's
         // embedded Lucide catalog.
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
 
@@ -227,6 +227,12 @@ fn main() {
                 gpui_kit::KeyBinding::new("ctrl-k", search_overlay::ToggleSearch, None),
                 gpui_kit::KeyBinding::new("cmd-shift-p", search_overlay::ToggleSearch, None),
                 gpui_kit::KeyBinding::new("ctrl-shift-p", search_overlay::ToggleSearch, None),
+                // Issue 19: ⇧⌘F focus mode (both cases: macOS reports the
+                // shifted key as "F" on some IME paths).
+                gpui_kit::KeyBinding::new("cmd-shift-f", search_overlay::ToggleFocusMode, None),
+                gpui_kit::KeyBinding::new("cmd-shift-F", search_overlay::ToggleFocusMode, None),
+                gpui_kit::KeyBinding::new("ctrl-shift-f", search_overlay::ToggleFocusMode, None),
+                gpui_kit::KeyBinding::new("ctrl-shift-F", search_overlay::ToggleFocusMode, None),
             ]);
 
             let prefs = prefs::Prefs::load(&dir);
@@ -238,6 +244,13 @@ fn main() {
             // Wake tokens + editor palette. Re-applied on every appearance
             // change. `apply_config` overwrites highlight_theme on every mode
             // reload, so the palette assignment lives here too.
+            // Panes read window.appearance(); keep it in sync with the saved
+            // pref (issue 19 #26).
+            cx.set_window_appearance(match prefs.appearance {
+                prefs::AppearancePref::Follow => None,
+                prefs::AppearancePref::Light => Some(gpui_kit::WindowAppearance::Light),
+                prefs::AppearancePref::Dark => Some(gpui_kit::WindowAppearance::Dark),
+            });
             match prefs.appearance {
                 prefs::AppearancePref::Follow => Theme::sync_system_appearance(None, cx),
                 prefs::AppearancePref::Light => {
@@ -248,6 +261,8 @@ fn main() {
                 }
             }
             Theme::update(cx, move |theme| apply_wake_theme(theme, &palette_boot));
+            // Issue 19: restore persisted accent color.
+            theme::set_accent(&prefs.accent);
 
             let lang = match prefs.lang {
                 prefs::LangPref::Follow => i18n::system_lang(),
@@ -283,6 +298,8 @@ fn main() {
                     traffic_light_position: None,
                 }),
                 window_min_size: Some(gpui_kit::size(px(960.), px(600.))),
+                // Issue 19: frosted window (materials stay translucent).
+                window_background: gpui_kit::WindowBackgroundAppearance::Blurred,
                 ..Default::default()
             };
 

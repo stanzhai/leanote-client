@@ -102,7 +102,12 @@ impl Api {
     }
 
     fn url(&self, path: &str, params: &[(&str, String)]) -> String {
-        let mut url = format!("{}/api/{}?token={}", self.host, path, urlencode(&self.token));
+        let mut url = format!(
+            "{}/api/{}?token={}",
+            self.host,
+            path,
+            urlencode(&self.token)
+        );
         for (k, v) in params {
             url.push_str(&format!("&{k}={}", urlencode(v)));
         }
@@ -139,7 +144,10 @@ impl Api {
     fn ok_or_api(v: Value) -> Result<Value, SyncError> {
         match &v {
             Value::Object(m) if m.get("Ok") == Some(&Value::Bool(false)) => Err(SyncError::Api(
-                m.get("Msg").and_then(Value::as_str).unwrap_or("").to_string(),
+                m.get("Msg")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
             )),
             _ => Ok(v),
         }
@@ -147,9 +155,10 @@ impl Api {
 
     /// GET user/getSyncState → LastSyncUsn.
     pub fn get_sync_state(&self) -> Result<i64, SyncError> {
-        let v = Self::ok_or_api(
-            self.get("user/getSyncState", &[("macAddr", mac_addr()), ("v", client_version())])?
-        )?;
+        let v = Self::ok_or_api(self.get(
+            "user/getSyncState",
+            &[("macAddr", mac_addr()), ("v", client_version())],
+        )?)?;
         Ok(v.get("LastSyncUsn").and_then(Value::as_i64).unwrap_or(0))
     }
 
@@ -180,10 +189,14 @@ impl Api {
 
     /// GET note/getNoteContent → Content for a server note id.
     pub fn get_note_content(&self, server_note_id: &str) -> Result<String, SyncError> {
-        let v = Self::ok_or_api(
-            self.get("note/getNoteContent", &[("noteId", server_note_id.to_string())])?,
-        )?;
-        Ok(v.get("Content").and_then(Value::as_str).unwrap_or("").to_string())
+        let v = Self::ok_or_api(self.get(
+            "note/getNoteContent",
+            &[("noteId", server_note_id.to_string())],
+        )?)?;
+        Ok(v.get("Content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
     }
 
     /// GET note/exportPdf → raw PDF bytes (src/api.js `exportPdf`: the body
@@ -209,14 +222,67 @@ impl Api {
             .map_err(|e| SyncError::Unconnected(e.to_string()))?;
         if is_json {
             // `{"Ok":false,"Msg":...}` → surface the server's own Msg.
-            let v: Value = serde_json::from_slice(&body)
-                .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+            let v: Value =
+                serde_json::from_slice(&body).map_err(|e| SyncError::Unconnected(e.to_string()))?;
             Self::ok_or_api(v).map(|_| body)
         } else if body.starts_with(b"%PDF") {
             Ok(body)
         } else {
             Err(SyncError::Unconnected("response is not a PDF".into()))
         }
+    }
+
+    /// GET file/getAttach → raw attachment bytes + filename (issue 19,
+    /// readonly view/download; upload is issue 20). Like `exportPdf` the
+    /// body is the file; the filename comes from the Content-Disposition
+    /// header (Electron api.js `getAttach`).
+    pub fn get_attach(&self, file_id: &str) -> Result<(String, Vec<u8>), SyncError> {
+        use std::io::Read;
+        let mut resp = self
+            .agent
+            .get(&self.url("file/getAttach", &[("fileId", file_id.to_string())]))
+            .call()
+            .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+        let is_json = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("application/json"));
+        let disposition = resp
+            .headers()
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let mut body = Vec::new();
+        resp.body_mut()
+            .with_config()
+            .reader()
+            .read_to_end(&mut body)
+            .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+        if is_json {
+            let v: Value =
+                serde_json::from_slice(&body).map_err(|e| SyncError::Unconnected(e.to_string()))?;
+            let msg = match Self::ok_or_api(v) {
+                Err(SyncError::Api(msg)) => msg,
+                _ => "attachment not found".into(),
+            };
+            return Err(SyncError::Api(msg));
+        }
+        if body.is_empty() {
+            return Err(SyncError::Api("attachment is empty".into()));
+        }
+        // filename="foo.pdf" (or filename=foo.pdf) from Content-Disposition;
+        // fall back to the file id + .bin.
+        let filename = disposition
+            .split(';')
+            .find_map(|part| {
+                let part = part.trim();
+                part.strip_prefix("filename=")
+                    .map(|n| n.trim_matches('"').to_string())
+            })
+            .unwrap_or_else(|| format!("{file_id}.bin"));
+        Ok((filename, body))
     }
 
     // -- Push endpoints (JS Sync.sendNotebook/sendNote/sendTagChanges forms).
@@ -227,7 +293,11 @@ impl Api {
         self.post_form(
             "notebook/addNotebook",
             &[],
-            &[("title", title), ("seq", &seq.to_string()), ("parentNotebookId", parent)],
+            &[
+                ("title", title),
+                ("seq", &seq.to_string()),
+                ("parentNotebookId", parent),
+            ],
         )
     }
 
@@ -380,8 +450,12 @@ pub fn mac_addr() -> String {
             let bytes = (family == libc::AF_LINK).then(|| {
                 let sdl = &*(ifa.ifa_addr as *const libc::sockaddr_dl);
                 let (nlen, alen) = (sdl.sdl_nlen as usize, sdl.sdl_alen as usize);
-                (alen >= 6)
-                    .then(|| sdl.sdl_data[nlen..nlen + 6].iter().map(|&b| b as u8).collect::<Vec<_>>())
+                (alen >= 6).then(|| {
+                    sdl.sdl_data[nlen..nlen + 6]
+                        .iter()
+                        .map(|&b| b as u8)
+                        .collect::<Vec<_>>()
+                })
             });
             #[cfg(target_os = "linux")]
             let bytes = (family == libc::AF_PACKET).then(|| {
@@ -391,10 +465,18 @@ pub fn mac_addr() -> String {
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             let bytes: Option<Vec<u8>> = None;
             let Some(b) = bytes.flatten() else { continue };
-            mac = b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(":");
+            mac = b
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect::<Vec<_>>()
+                .join(":");
         }
         libc::freeifaddrs(ifap);
-        if mac.is_empty() { FALLBACK.to_string() } else { mac }
+        if mac.is_empty() {
+            FALLBACK.to_string()
+        } else {
+            mac
+        }
     }
 }
 
@@ -403,7 +485,9 @@ fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -434,23 +518,32 @@ fn go_now_ms(v: Option<&Value>, now: i64) -> i64 {
     let b = s.as_bytes();
     let (h, mi, sec) = if b.len() >= 19 && b[10] == b'T' {
         (
-            s.get(11..13).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0),
-            s.get(14..16).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0),
-            s.get(17..19).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0),
+            s.get(11..13)
+                .and_then(|x| x.parse::<i64>().ok())
+                .unwrap_or(0),
+            s.get(14..16)
+                .and_then(|x| x.parse::<i64>().ok())
+                .unwrap_or(0),
+            s.get(17..19)
+                .and_then(|x| x.parse::<i64>().ok())
+                .unwrap_or(0),
         )
     } else {
         (0, 0, 0)
     };
-    let y = s.get(0..4).and_then(|x| x.parse::<i64>().ok()).unwrap_or(1970);
+    let y = s
+        .get(0..4)
+        .and_then(|x| x.parse::<i64>().ok())
+        .unwrap_or(1970);
     let mo = s.get(5..7).and_then(|x| x.parse::<i64>().ok()).unwrap_or(1);
-    let d = s.get(8..10).and_then(|x| x.parse::<i64>().ok()).unwrap_or(1);
+    let d = s
+        .get(8..10)
+        .and_then(|x| x.parse::<i64>().ok())
+        .unwrap_or(1);
     if !(1..=12).contains(&mo) {
         return now;
     }
-    days_from_civil(y, mo, d).saturating_mul(86_400_000)
-        + h * 3_600_000
-        + mi * 60_000
-        + sec * 1_000
+    days_from_civil(y, mo, d).saturating_mul(86_400_000) + h * 3_600_000 + mi * 60_000 + sec * 1_000
 }
 
 /// Days since 1970-01-01 (Howard Hinnant's civil algorithm, no chrono).
@@ -561,11 +654,19 @@ pub fn full_sync(
     store: &Store,
     progress: &dyn SyncProgress,
 ) -> Result<SyncStats, SyncError> {
-    let mut stats = SyncStats { notebooks: 0, notes: 0, contents: 0, tags: 0 };
+    let mut stats = SyncStats {
+        notebooks: 0,
+        notes: 0,
+        contents: 0,
+        tags: 0,
+    };
     let now = now_ms();
 
     for (kind, apply) in [
-        ("notebook", &apply_notebooks as &dyn Fn(&Store, &[Value], i64) -> rusqlite::Result<()>),
+        (
+            "notebook",
+            &apply_notebooks as &dyn Fn(&Store, &[Value], i64) -> rusqlite::Result<()>,
+        ),
         ("note", &apply_notes),
         ("tag", &apply_tags),
     ] {
@@ -614,7 +715,11 @@ pub fn full_sync(
 
 /// JS `Sync.checkNeedIncSyncAgain`: `last+1 == usn` → advance last;
 /// `last > usn` → ignore (stale usn, e.g. tag adds); else → re-round needed.
-fn check_need_incr_sync_again(store: &Store, usn: i64, need_again: &mut bool) -> Result<(), SyncError> {
+fn check_need_incr_sync_again(
+    store: &Store,
+    usn: i64,
+    need_again: &mut bool,
+) -> Result<(), SyncError> {
     let last = store.last_sync_usn().map_err(db_err)?;
     if last + 1 == usn {
         store.set_last_sync_usn(usn).map_err(db_err)?;
@@ -639,7 +744,12 @@ pub fn incr_sync(
     store: &Store,
     progress: &dyn SyncProgress,
 ) -> Result<SyncStats, SyncError> {
-    let mut stats = SyncStats { notebooks: 0, notes: 0, contents: 0, tags: 0 };
+    let mut stats = SyncStats {
+        notebooks: 0,
+        notes: 0,
+        contents: 0,
+        tags: 0,
+    };
     let mut again = false; // first round pushes; re-rounds only pull
     for _round in 0..5 {
         let mut need_again = false;
@@ -650,7 +760,10 @@ pub fn incr_sync(
         if server_usn > last {
             let now = now_ms();
             for (kind, apply) in [
-                ("notebook", &apply_notebooks as &dyn Fn(&Store, &[Value], i64) -> rusqlite::Result<()>),
+                (
+                    "notebook",
+                    &apply_notebooks as &dyn Fn(&Store, &[Value], i64) -> rusqlite::Result<()>,
+                ),
                 ("tag", &apply_tags),
             ] {
                 let mut usn = last;
@@ -690,10 +803,14 @@ pub fn incr_sync(
             // missing one (new rows land with Content='') get filled.
             for sid in store.note_server_ids_needing_content().map_err(db_err)? {
                 let content = api.get_note_content(&sid)?;
-                store.set_note_content_by_server_id(&sid, &content).map_err(db_err)?;
+                store
+                    .set_note_content_by_server_id(&sid, &content)
+                    .map_err(db_err)?;
                 stats.contents += 1;
             }
-            store.set_last_sync_usn(api.get_sync_state()?).map_err(db_err)?;
+            store
+                .set_last_sync_usn(api.get_sync_state()?)
+                .map_err(db_err)?;
         }
 
         // Push phase (JS sendChanges): skipped on re-rounds.
@@ -721,7 +838,9 @@ fn push_dirty_notebooks(
     for nb in store.dirty_notebooks().map_err(db_err)? {
         let server_id = nb.server_id.clone();
         let ret = if nb.is_new && nb.is_deleted {
-            store.notebook_delete_local(&nb.notebook_id).map_err(db_err)?;
+            store
+                .notebook_delete_local(&nb.notebook_id)
+                .map_err(db_err)?;
             continue;
         } else if nb.is_new {
             api.add_notebook(&nb.title, nb.seq, "")?
@@ -741,12 +860,18 @@ fn push_dirty_notebooks(
             // JS: delete branch returns early; row removal (or conflict
             // not-dirty) is handled here from ret.
             if ok(&ret) {
-                store.notebook_delete_local(&nb.notebook_id).map_err(db_err)?;
+                store
+                    .notebook_delete_local(&nb.notebook_id)
+                    .map_err(db_err)?;
                 check_need_incr_sync_again(store, usn_of(&ret), need_again)?;
             } else if msg_of(&ret) == "notExists" {
-                store.notebook_delete_local(&nb.notebook_id).map_err(db_err)?;
+                store
+                    .notebook_delete_local(&nb.notebook_id)
+                    .map_err(db_err)?;
             } else if msg_of(&ret) == "conflict" {
-                store.notebook_set_not_dirty_not_delete(&nb.notebook_id).map_err(db_err)?;
+                store
+                    .notebook_set_not_dirty_not_delete(&nb.notebook_id)
+                    .map_err(db_err)?;
             }
             continue;
         }
@@ -754,12 +879,15 @@ fn push_dirty_notebooks(
             if ok(&ret) {
                 let sid = str_field(&ret, "NotebookId");
                 let usn = i64_field(&ret, "Usn");
-                store.notebook_pushed(&nb.notebook_id, &sid, usn).map_err(db_err)?;
+                store
+                    .notebook_pushed(&nb.notebook_id, &sid, usn)
+                    .map_err(db_err)?;
                 check_need_incr_sync_again(store, usn, need_again)?;
             }
         } else if ok(&ret) {
             let usn = i64_field(&ret, "Usn");
-            store.notebook_pushed(&nb.notebook_id, server_id.as_deref().unwrap_or(""), usn)
+            store
+                .notebook_pushed(&nb.notebook_id, server_id.as_deref().unwrap_or(""), usn)
                 .map_err(db_err)?;
             check_need_incr_sync_again(store, usn, need_again)?;
         }
@@ -795,7 +923,9 @@ fn push_dirty_notes(
             if ok(&ret) {
                 let sid = str_field(&ret, "NoteId");
                 let usn = i64_field(&ret, "Usn");
-                store.note_add_pushed(&n.note_id, &sid, usn).map_err(db_err)?;
+                store
+                    .note_add_pushed(&n.note_id, &sid, usn)
+                    .map_err(db_err)?;
                 check_need_incr_sync_again(store, usn, need_again)?;
             }
         } else if n.is_new && n.is_deleted {
@@ -811,7 +941,9 @@ fn push_dirty_notes(
                 store.note_remove(&n.note_id).map_err(db_err)?;
             } else if msg_of(&ret) == "conflict" {
                 // ticket: 置非脏不删
-                store.note_set_not_dirty_not_delete(&n.note_id).map_err(db_err)?;
+                store
+                    .note_set_not_dirty_not_delete(&n.note_id)
+                    .map_err(db_err)?;
             }
         } else {
             let ret = api.update_note(
@@ -835,7 +967,9 @@ fn push_dirty_notes(
                 // apply_incr_notes instead.
                 match api.get_note_content(&server_note_id) {
                     Ok(c) if c == n.content => {
-                        store.note_update_pushed(&n.note_id, n.usn).map_err(db_err)?;
+                        store
+                            .note_update_pushed(&n.note_id, n.usn)
+                            .map_err(db_err)?;
                     }
                     _ => {} // stay dirty; conflict captured on next pull
                 }
@@ -862,7 +996,9 @@ fn push_dirty_tags(
             if t.is_deleted {
                 store.tag_set_not_dirty(&t.tag).map_err(db_err)?;
             } else {
-                store.tag_set_not_dirty_and_usn(&t.tag, i64_field(&ret, "Usn")).map_err(db_err)?;
+                store
+                    .tag_set_not_dirty_and_usn(&t.tag, i64_field(&ret, "Usn"))
+                    .map_err(db_err)?;
             }
             check_need_incr_sync_again(store, usn_of(&ret), need_again)?;
         } else if msg_of(&ret) == "notExists" && t.is_deleted {
@@ -887,12 +1023,7 @@ fn usn_of(v: &Value) -> i64 {
 }
 
 /// JS `Sync._syncNoteToLocal` (incr pull side), conflict-aware.
-fn apply_incr_notes(
-    store: &Store,
-    rows: &[Value],
-    api: &Api,
-    now: i64,
-) -> Result<(), SyncError> {
+fn apply_incr_notes(store: &Store, rows: &[Value], api: &Api, now: i64) -> Result<(), SyncError> {
     for row in rows {
         let server_id = str_field(row, "NoteId");
         let local = store.note_by_server_id(&server_id).map_err(db_err)?;
@@ -900,7 +1031,9 @@ fn apply_incr_notes(
             match &local {
                 Some(n) if n.is_dirty => {
                     // dirty local beats server delete
-                    store.note_set_not_dirty_not_delete(&n.note_id).map_err(db_err)?;
+                    store
+                        .note_set_not_dirty_not_delete(&n.note_id)
+                        .map_err(db_err)?;
                 }
                 _ => {
                     store.delete_note_by_server_id(&server_id).map_err(db_err)?;
@@ -913,7 +1046,9 @@ fn apply_incr_notes(
             // fill covers it on the next full sync, and the pull below
             // (Content='' row) is fetched by the content phase of a later
             // full sync. ponytail: incr never downloads content here.
-            store.apply_sync_notes(std::slice::from_ref(row), now).map_err(db_err)?;
+            store
+                .apply_sync_notes(std::slice::from_ref(row), now)
+                .map_err(db_err)?;
             continue;
         };
         if i64_field(row, "Usn") == n.usn {
@@ -965,7 +1100,10 @@ impl Store {
     /// `User.saveCurUser`: deactivate every other account, upsert this one.
     pub fn upsert_account(&self, account: &Account) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute("UPDATE accounts SET IsActive=0 WHERE UserId<>?1", params![account.user_id])?;
+        tx.execute(
+            "UPDATE accounts SET IsActive=0 WHERE UserId<>?1",
+            params![account.user_id],
+        )?;
         tx.execute(
             "INSERT INTO accounts (UserId, Email, Username, Host, Token, IsActive, LastSyncUsn)
              VALUES (?1,?2,?3,?4,?5,1,-1)
@@ -992,7 +1130,10 @@ impl Store {
         for row in rows {
             let server_id = str_field(row, "NotebookId");
             if bool_field(row, "IsDeleted") {
-                tx.execute("DELETE FROM notebooks WHERE ServerNotebookId=?1", params![server_id])?;
+                tx.execute(
+                    "DELETE FROM notebooks WHERE ServerNotebookId=?1",
+                    params![server_id],
+                )?;
                 continue;
             }
             tx.execute(
@@ -1028,7 +1169,10 @@ impl Store {
         for row in rows {
             let server_id = str_field(row, "NoteId");
             if bool_field(row, "IsDeleted") {
-                tx.execute("DELETE FROM notes WHERE ServerNoteId=?1", params![server_id])?;
+                tx.execute(
+                    "DELETE FROM notes WHERE ServerNoteId=?1",
+                    params![server_id],
+                )?;
                 continue;
             }
             let tags = match row.get("Tags") {
@@ -1125,8 +1269,10 @@ impl Store {
     }
 
     pub fn set_last_sync_usn(&self, usn: i64) -> rusqlite::Result<()> {
-        self.conn
-            .execute("UPDATE accounts SET LastSyncUsn=?1 WHERE IsActive=1", params![usn])?;
+        self.conn.execute(
+            "UPDATE accounts SET LastSyncUsn=?1 WHERE IsActive=1",
+            params![usn],
+        )?;
         Ok(())
     }
 
@@ -1164,7 +1310,8 @@ impl Store {
     /// JS logout: `db.users.update({_id}, {IsActive: false})` — token dropped
     /// client-side, rows kept for re-login.
     pub fn deactivate_account(&self) -> rusqlite::Result<usize> {
-        self.conn.execute("UPDATE accounts SET IsActive=0 WHERE IsActive=1", [])
+        self.conn
+            .execute("UPDATE accounts SET IsActive=0 WHERE IsActive=1", [])
     }
 
     // -- incr sync (JS Sync.incrSync/sendChanges/_syncNoteToLocal) --
@@ -1204,7 +1351,11 @@ impl Store {
                 notebook_id: r.get(1)?,
                 title: r.get(2)?,
                 content: r.get(3)?,
-                tags: tags_csv.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
+                tags: tags_csv
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
                 is_markdown: r.get::<_, i64>(5)? != 0,
                 is_trash: r.get::<_, i64>(6)? != 0,
                 is_dirty: r.get::<_, i64>(7)? != 0,
@@ -1250,7 +1401,12 @@ impl Store {
     }
 
     /// JS `updateNotebookForceForSendChange`.
-    pub fn notebook_pushed(&self, notebook_id: &str, server_id: &str, usn: i64) -> rusqlite::Result<()> {
+    pub fn notebook_pushed(
+        &self,
+        notebook_id: &str,
+        server_id: &str,
+        usn: i64,
+    ) -> rusqlite::Result<()> {
         let now = now_ms();
         self.conn.execute(
             "UPDATE notebooks SET IsDirty=0, LocalIsNew=0, ServerNotebookId=?2, Usn=?3,
@@ -1261,7 +1417,10 @@ impl Store {
     }
 
     pub fn notebook_delete_local(&self, notebook_id: &str) -> rusqlite::Result<()> {
-        self.conn.execute("DELETE FROM notebooks WHERE NotebookId=?1", params![notebook_id])?;
+        self.conn.execute(
+            "DELETE FROM notebooks WHERE NotebookId=?1",
+            params![notebook_id],
+        )?;
         Ok(())
     }
 
@@ -1273,7 +1432,12 @@ impl Store {
         Ok(())
     }
 
-    pub fn note_add_pushed(&self, note_id: &str, server_note_id: &str, usn: i64) -> rusqlite::Result<()> {
+    pub fn note_add_pushed(
+        &self,
+        note_id: &str,
+        server_note_id: &str,
+        usn: i64,
+    ) -> rusqlite::Result<()> {
         let now = now_ms();
         self.conn.execute(
             "UPDATE notes SET IsDirty=0, LocalIsNew=0, ServerNoteId=?2, Usn=?3,
@@ -1293,7 +1457,8 @@ impl Store {
     }
 
     pub fn note_remove(&self, note_id: &str) -> rusqlite::Result<()> {
-        self.conn.execute("DELETE FROM notes WHERE NoteId=?1", params![note_id])?;
+        self.conn
+            .execute("DELETE FROM notes WHERE NoteId=?1", params![note_id])?;
         Ok(())
     }
 
@@ -1345,7 +1510,11 @@ impl Store {
                         notebook_id: r.get(1)?,
                         title: r.get(2)?,
                         content: r.get(3)?,
-                        tags: tags_csv.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
+                        tags: tags_csv
+                            .split(',')
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect(),
                         is_markdown: r.get::<_, i64>(5)? != 0,
                         is_trash: r.get::<_, i64>(6)? != 0,
                         is_dirty: r.get::<_, i64>(7)? != 0,
@@ -1374,8 +1543,10 @@ impl Store {
     }
 
     pub fn delete_note_by_server_id(&self, server_note_id: &str) -> rusqlite::Result<()> {
-        self.conn
-            .execute("DELETE FROM notes WHERE ServerNoteId=?1", params![server_note_id])?;
+        self.conn.execute(
+            "DELETE FROM notes WHERE ServerNoteId=?1",
+            params![server_note_id],
+        )?;
         Ok(())
     }
 
@@ -1453,8 +1624,7 @@ impl Store {
             let local_id: String = r.get(1)?;
             let title: String = r.get(2)?;
             let content: String = r.get(3)?;
-            let server: Value =
-                serde_json::from_str(&server).unwrap_or(Value::Null);
+            let server: Value = serde_json::from_str(&server).unwrap_or(Value::Null);
             Ok(json!({
                 "server": server,
                 "local": {

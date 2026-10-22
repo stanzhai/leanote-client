@@ -130,6 +130,34 @@ pub struct NoteHistory {
     pub created_time: i64,
 }
 
+/// Issue 19: list-row metadata without the Content column — the middle
+/// pane's lazy-load shape. Full `Note` (with content) loads only when a
+/// row is opened.
+#[derive(Clone, Debug)]
+pub struct NoteMeta {
+    pub note_id: Id,
+    pub notebook_id: Id,
+    pub title: String,
+    /// Plain-text excerpt (notes.Desc, first ~200 chars at add/sync time).
+    pub desc: String,
+    pub tags: Vec<String>,
+    pub is_markdown: bool,
+    pub is_trash: bool,
+    pub star: bool,
+    pub updated_time: i64,
+}
+
+/// Meta columns shared by the lightweight list queries (issue 19).
+pub(crate) const NOTES_META_COLS: &str = "SELECT NoteId, NotebookId, Title, \"Desc\", Tags,
+    IsMarkdown, IsTrash, Star, UpdatedTime
+ FROM notes";
+
+/// Live-note filter for the meta queries (same predicates as
+/// [`NOTES_LIVE_BASE`]).
+pub(crate) const NOTES_META_LIVE: &str = "SELECT NoteId, NotebookId, Title, \"Desc\", Tags,
+    IsMarkdown, IsTrash, Star, UpdatedTime
+ FROM notes WHERE IsTrash=0 AND LocalIsDelete=0 AND IsDeleted=0";
+
 #[derive(Clone, Debug, Default)]
 pub struct Account {
     pub user_id: String,
@@ -145,12 +173,14 @@ pub struct Account {
 pub const DB_FILE: &str = "leanote.db";
 
 /// Column list shared by the browse queries (JS _getNotes).
-pub(crate) const NOTES_COLS: &str = "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
+pub(crate) const NOTES_COLS: &str =
+    "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
     IsMarkdown, IsTrash, IsDirty, LocalIsNew, LocalIsDelete, IsBlog, Star, CreatedTime, UpdatedTime
  FROM notes";
 
 /// Column list + live-note filter shared by the browse queries (JS _getNotes).
-pub(crate) const NOTES_LIVE_BASE: &str = "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
+pub(crate) const NOTES_LIVE_BASE: &str =
+    "SELECT NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc, Tags, Abstract,
     IsMarkdown, IsTrash, IsDirty, LocalIsNew, LocalIsDelete, IsBlog, Star, CreatedTime, UpdatedTime
  FROM notes WHERE IsTrash=0 AND LocalIsDelete=0 AND IsDeleted=0";
 
@@ -180,7 +210,8 @@ impl Store {
     /// `dir` is the app data dir (e.g. `.../leanote-rust`); the SQLite file
     /// lives directly inside it.
     pub fn open(dir: PathBuf, user_id: String) -> rusqlite::Result<Self> {
-        std::fs::create_dir_all(&dir).map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
         let conn = Connection::open(dir.join(DB_FILE))?;
         // WAL: crash-safe + fast. journal_mode is persistent in the db file.
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -265,6 +296,73 @@ impl Store {
         rows.collect()
     }
 
+    /// Issue 19: [`Store::list_notes_filtered`] without Content — the
+    /// middle-pane list rows. Same filters, same ordering.
+    pub fn list_notes_filtered_meta(
+        &self,
+        notebook_id: Option<&Id>,
+        starred: bool,
+    ) -> rusqlite::Result<Vec<NoteMeta>> {
+        let mut sql = NOTES_META_LIVE.to_string();
+        if starred {
+            sql.push_str(" AND Star=1");
+        }
+        if let Some(nb) = notebook_id {
+            sql.push_str(&format!(" AND NotebookId='{}'", nb.replace('\'', "''")));
+        }
+        sql.push_str(" ORDER BY UpdatedTime DESC, rowid ASC");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], row_to_note_meta)?;
+        rows.collect()
+    }
+
+    /// Issue 19: trashed rows without Content.
+    pub fn list_trash_meta(&self) -> rusqlite::Result<Vec<NoteMeta>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{NOTES_META_COLS} WHERE IsTrash=1
+             ORDER BY UpdatedTime DESC, rowid ASC"
+        ))?;
+        let rows = stmt.query_map([], row_to_note_meta)?;
+        rows.collect()
+    }
+
+    /// Issue 19: live notes without Content, newest first, capped (`Recent`
+    /// nav = first 20).
+    pub fn list_notes_meta_recent(&self, limit: usize) -> rusqlite::Result<Vec<NoteMeta>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{NOTES_META_LIVE} ORDER BY UpdatedTime DESC, rowid ASC LIMIT {}",
+            limit.max(1)
+        ))?;
+        let rows = stmt.query_map([], row_to_note_meta)?;
+        rows.collect()
+    }
+
+    /// Issue 19: tag rows without Content (whole-tag CSV match, like
+    /// [`Store::list_notes_by_tag`]).
+    pub fn list_notes_by_tag_meta(&self, tag: &str) -> rusqlite::Result<Vec<NoteMeta>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{NOTES_META_LIVE} AND (',' || Tags || ',') LIKE ?
+             ORDER BY UpdatedTime DESC, rowid ASC"
+        ))?;
+        let pat = format!("%,{},%", tag);
+        let rows = stmt.query_map([pat], row_to_note_meta)?;
+        rows.collect()
+    }
+
+    /// Issue 19: live-note count per distinct tag, from the notes table
+    /// (the tags table's Count column stays stale after sync).
+    pub fn tag_note_counts(&self) -> rusqlite::Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.Tag, COUNT(n.NoteId) FROM tags t
+             LEFT JOIN notes n ON n.IsTrash=0 AND n.LocalIsDelete=0 AND n.IsDeleted=0
+                  AND (',' || n.Tags || ',') LIKE '%,' || t.Tag || ',%'
+             WHERE t.LocalIsDelete=0
+             GROUP BY t.Tag ORDER BY t.Tag",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
     /// Trashed notes newest-first (JS getTrashNotes: IsTrash=1, no other filter).
     pub fn list_trash(&self) -> rusqlite::Result<Vec<Note>> {
         let mut stmt = self.conn.prepare(&format!(
@@ -318,8 +416,10 @@ impl Store {
     /// Hard delete (JS deleteTrash local-user branch): row removed, nothing
     /// left to push. Local history goes with it.
     pub fn hard_delete_note(&self, id: &Id) -> rusqlite::Result<usize> {
-        self.conn.execute("DELETE FROM note_history WHERE NoteId=?1", [id.to_string()])?;
-        self.conn.execute("DELETE FROM notes WHERE NoteId=?1", [id.to_string()])
+        self.conn
+            .execute("DELETE FROM note_history WHERE NoteId=?1", [id.to_string()])?;
+        self.conn
+            .execute("DELETE FROM notes WHERE NoteId=?1", [id.to_string()])
     }
 
     /// Empty trash (JS clearTrash): every trashed row marked deleted+dirty.
@@ -332,9 +432,9 @@ impl Store {
 
     /// Notes newest-first (matches JS `loadNotes` sort by UpdatedTime desc).
     pub fn list_notes(&self) -> rusqlite::Result<Vec<Note>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("{NOTES_LIVE_BASE} ORDER BY UpdatedTime DESC, rowid ASC"))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "{NOTES_LIVE_BASE} ORDER BY UpdatedTime DESC, rowid ASC"
+        ))?;
         let rows = stmt.query_map([], row_to_note)?;
         rows.collect()
     }
@@ -354,7 +454,10 @@ impl Store {
             return Ok(Ok(n));
         }
         let notes = self.list_notes()?;
-        let matches: Vec<&Note> = notes.iter().filter(|n| n.note_id.starts_with(prefix)).collect();
+        let matches: Vec<&Note> = notes
+            .iter()
+            .filter(|n| n.note_id.starts_with(prefix))
+            .collect();
         Ok(match matches.as_slice() {
             [] => Err(PrefixError::NotFound),
             [one] => Ok((*one).clone()),
@@ -419,7 +522,8 @@ impl Store {
     }
 
     pub fn note_count(&self) -> rusqlite::Result<i64> {
-        self.conn.query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+        self.conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
     }
 
     /// JS handleUpdateNote + NoteService.updateNoteOrContent semantics:
@@ -458,14 +562,16 @@ impl Store {
                         [v],
                         |r| r.get::<_, String>(0),
                     )
-                    .optional()?
+                    .optional()?,
             },
             None => None,
         };
         let dirty = title != old.title
             || content != old.content
             || tags_csv(&tags) != tags_csv(&old.tags)
-            || notebook_id.as_deref().map_or(false, |id| id != &*old.notebook_id);
+            || notebook_id
+                .as_deref()
+                .map_or(false, |id| id != &*old.notebook_id);
         if !dirty {
             return Ok(Some(old));
         }
@@ -552,7 +658,14 @@ impl Store {
         tx.execute(
             "INSERT INTO note_history (HistoryId, NoteId, UserId, Title, Content, CreatedTime)
              VALUES (?1,?2,?3,?4,?5,?6)",
-            params![Id::new().to_string(), note_id.to_string(), user_id, title, content, now],
+            params![
+                Id::new().to_string(),
+                note_id.to_string(),
+                user_id,
+                title,
+                content,
+                now
+            ],
         )?;
         tx.execute(
             "DELETE FROM note_history WHERE NoteId=?1 AND HistoryId NOT IN (
@@ -625,14 +738,18 @@ impl Store {
 
     /// Drop all local history rows for a note (UI "clear history").
     pub fn purge_history(&self, note_id: &Id) -> rusqlite::Result<usize> {
-        self.conn
-            .execute("DELETE FROM note_history WHERE NoteId=?1", [note_id.to_string()])
+        self.conn.execute(
+            "DELETE FROM note_history WHERE NoteId=?1",
+            [note_id.to_string()],
+        )
     }
 
     /// Note by exact id regardless of trash/deleted state (JS getNote uses
     /// findOne({NoteId}) with no status filter).
     pub fn get_note_any(&self, id: &Id) -> rusqlite::Result<Option<Note>> {
-        let mut stmt = self.conn.prepare(&format!("{NOTES_COLS} WHERE NoteId=?1"))?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{NOTES_COLS} WHERE NoteId=?1"))?;
         stmt.query_row([id.to_string()], row_to_note).optional()
     }
 
@@ -642,10 +759,13 @@ impl Store {
         if let Some(n) = self.get_note(&Id(prefix.to_string()))? {
             return Ok(Some(n));
         }
-        let mut stmt = self
-            .conn
-            .prepare(&format!("{NOTES_COLS} WHERE NoteId LIKE ?1 || '%' ORDER BY rowid"))?;
-        let rows = stmt.query_map([prefix.replace('%', "\\%").replace('_', "\\_")], row_to_note)?;
+        let mut stmt = self.conn.prepare(&format!(
+            "{NOTES_COLS} WHERE NoteId LIKE ?1 || '%' ORDER BY rowid"
+        ))?;
+        let rows = stmt.query_map(
+            [prefix.replace('%', "\\%").replace('_', "\\_")],
+            row_to_note,
+        )?;
         for n in rows {
             let n = n?;
             if !n.is_trash && !n.is_deleted {
@@ -670,21 +790,18 @@ impl Store {
             "SELECT NotebookId, UserId, Title, ParentNotebookId, Seq, LocalIsNew, IsDirty, LocalIsDelete
              FROM notebooks WHERE UserId=?1 AND Title=?2 AND LocalIsDelete=0 ORDER BY rowid",
         )?;
-        stmt.query_row(
-            params![self.user_id, title],
-            |r| {
-                Ok(Notebook {
-                    notebook_id: Id(r.get(0)?),
-                    user_id: r.get(1)?,
-                    title: r.get(2)?,
-                    parent_notebook_id: r.get(3)?,
-                    seq: r.get(4)?,
-                    is_new: r.get::<_, i64>(5)? != 0,
-                    is_dirty: r.get::<_, i64>(6)? != 0,
-                    is_deleted: r.get::<_, i64>(7)? != 0,
-                })
-            },
-        )
+        stmt.query_row(params![self.user_id, title], |r| {
+            Ok(Notebook {
+                notebook_id: Id(r.get(0)?),
+                user_id: r.get(1)?,
+                title: r.get(2)?,
+                parent_notebook_id: r.get(3)?,
+                seq: r.get(4)?,
+                is_new: r.get::<_, i64>(5)? != 0,
+                is_dirty: r.get::<_, i64>(6)? != 0,
+                is_deleted: r.get::<_, i64>(7)? != 0,
+            })
+        })
         .optional()
     }
 
@@ -696,7 +813,6 @@ impl Store {
             params![id.to_string(), notebook_id.to_string(), now_ms()],
         )
     }
-
 
     // ---- Ticket 11: notebook & tag management (offline, sync-pushed) ----
 
@@ -719,7 +835,14 @@ impl Store {
             "INSERT INTO notebooks (NotebookId, UserId, Title, ParentNotebookId, Seq, Usn,
                 LocalIsNew, IsDirty, LocalIsDelete, CreatedTime, UpdatedTime)
              VALUES (?1,?2,?3,?4,?5,0,1,1,0,?6,?6)",
-            params![id.to_string(), self.user_id, title, parent_id, max_seq + 1, now],
+            params![
+                id.to_string(),
+                self.user_id,
+                title,
+                parent_id,
+                max_seq + 1,
+                now
+            ],
         )?;
         tx.commit()?;
         Ok(self
@@ -869,8 +992,11 @@ impl Store {
         };
         let mut changed = 0;
         for (note_id, csv) in rows {
-            let mut tags: Vec<String> =
-                csv.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
+            let mut tags: Vec<String> = csv
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
             if !tags.iter().any(|t| t == old) {
                 continue;
             }
@@ -917,8 +1043,11 @@ impl Store {
         };
         let mut changed = 0;
         for (note_id, csv) in rows {
-            let mut tags: Vec<String> =
-                csv.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
+            let mut tags: Vec<String> = csv
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
             let before = tags.len();
             tags.retain(|t| t != tag);
             if tags.len() == before {
@@ -945,10 +1074,9 @@ impl Store {
         Ok(search_notes(&self.list_notes()?, keyword, limit))
     }
 
-     pub fn journal_mode(&self) -> rusqlite::Result<String> {
-         self.conn
-             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-     }
+    pub fn journal_mode(&self) -> rusqlite::Result<String> {
+        self.conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))
+    }
 }
 
 #[derive(Debug)]
@@ -1008,7 +1136,11 @@ pub fn search_notes(notes: &[Note], keyword: &str, limit: usize) -> Vec<SearchHi
             continue;
         }
         let score = (in_title as u32) * 3 + (in_tags as u32) * 2 + (in_content as u32) * 1;
-        out.push(SearchHit { note: n.clone(), score, excerpt: excerpt(n, keyword) });
+        out.push(SearchHit {
+            note: n.clone(),
+            score,
+            excerpt: excerpt(n, keyword),
+        });
     }
     out.sort_by(|a, b| b.score.cmp(&a.score));
     out.truncate(limit);
@@ -1153,6 +1285,21 @@ fn row_to_note(r: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
         star: r.get::<_, i64>(15)? != 0,
         created_time: r.get(16)?,
         updated_time: r.get(17)?,
+    })
+}
+
+/// Issue 19: meta-column row mapper (see [`NOTES_META_COLS`] ordering).
+fn row_to_note_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteMeta> {
+    Ok(NoteMeta {
+        note_id: Id(r.get(0)?),
+        notebook_id: Id(r.get(1)?),
+        title: r.get(2)?,
+        desc: r.get(3)?,
+        tags: parse_tags_csv(r.get::<_, String>(4)?),
+        is_markdown: r.get::<_, i64>(5)? != 0,
+        is_trash: r.get::<_, i64>(6)? != 0,
+        star: r.get::<_, i64>(7)? != 0,
+        updated_time: r.get(8)?,
     })
 }
 

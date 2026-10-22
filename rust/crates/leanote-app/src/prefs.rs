@@ -18,16 +18,64 @@ pub enum LangPref {
     En,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Prefs {
     pub appearance: AppearancePref,
     pub lang: LangPref,
     pub editor_palette: String, // "" = default (theme built-in)
+    // Issue 19: vim keys on by default; old prefs files default to true too
+    // (field is `default = ...` so pre-existing files load without it).
+    #[serde(default = "default_vim_true")]
     pub vim_default: bool,
     pub recents: Vec<String>,
     /// Issue 18: last user-set left/middle pane widths (px). None = default.
     #[serde(default)]
     pub pane_widths: PaneWidths,
+    /// Issue 19 Q13: accent color id, e.g. "blue" (default) … "pink".
+    #[serde(default)]
+    pub accent: String,
+    /// Issue 19 Q14: left-nav selection + fold states, restored on launch.
+    #[serde(default)]
+    pub nav: NavStatePref,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            appearance: AppearancePref::default(),
+            lang: LangPref::default(),
+            editor_palette: String::new(),
+            vim_default: true,
+            recents: Vec::new(),
+            pane_widths: PaneWidths::default(),
+            accent: String::new(),
+            nav: NavStatePref::default(),
+        }
+    }
+}
+
+/// Issue 19 Q14: persisted nav state. `selection` is a tagged
+/// (kind, id) pair — a deleted/renamed notebook or tag simply fails the
+/// restore lookup and falls back to Recent.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NavStatePref {
+    #[serde(default)]
+    pub selection: Option<(String, String)>,
+    #[serde(default = "default_true")]
+    pub notebooks_open: bool,
+    #[serde(default = "default_true")]
+    pub tags_open: bool,
+    /// Note the reader last showed (any nav context).
+    #[serde(default)]
+    pub last_note: Option<String>,
+}
+
+fn default_vim_true() -> bool {
+    true
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -89,18 +137,30 @@ mod tests {
                 left: Some(260.),
                 mid: Some(380.),
             },
+            accent: "purple".into(),
+            nav: NavStatePref {
+                selection: Some(("notebook".into(), "n1".into())),
+                notebooks_open: false,
+                tags_open: true,
+                last_note: Some("note9".into()),
+            },
         };
         let dir = std::env::temp_dir().join(format!("lnprefs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         p.save(&dir);
         assert_eq!(Prefs::load(&dir), p);
-        // Old prefs files (pre-issue-18) lack pane_widths: default survives.
+        // Old prefs files (pre-issue-18/19) lack pane_widths/accent/nav:
+        // defaults survive, vim flips to the new default (true).
         std::fs::write(
             dir.join(FILE),
             r#"{"appearance":"Follow","lang":"Follow","editor_palette":"","vim_default":false,"recents":[]}"#,
         )
         .unwrap();
-        assert_eq!(Prefs::load(&dir).pane_widths, PaneWidths::default());
+        let old = Prefs::load(&dir);
+        assert_eq!(old.pane_widths, PaneWidths::default());
+        assert_eq!(old.accent, "");
+        assert_eq!(old.nav, NavStatePref::default());
+        assert!(!old.vim_default); // explicit false in file wins over default
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -25,7 +25,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{px, App, Context, Entity, Window};
 use leanote_core::SearchHit;
 
-gpui_kit::actions!(leanote, [ToggleSearch]);
+gpui_kit::actions!(leanote, [ToggleSearch, ToggleFocusMode]);
 // Issue 17 Q6 quick actions: new note / sync / export backup / vim.
 gpui_kit::actions!(
     leanote,

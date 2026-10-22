@@ -70,6 +70,8 @@ struct Inner {
     pdf_bytes: Option<Vec<u8>>,
     /// When set, `note/exportPdf` answers `{Ok:false, Msg:"exportPdfFailed"}`.
     pdf_fail: bool,
+    /// Issue 19: `fileId -> (filename, bytes)` served by `file/getAttach`.
+    attaches: std::collections::HashMap<String, (String, Vec<u8>)>,
     /// login -> token; token -> valid.
     token: Option<String>,
     /// Next USN handed to push responses (>= max dataset USN).
@@ -150,6 +152,11 @@ impl FakeServer {
         self.inner.lock().unwrap().pdf_fail = true;
     }
 
+    /// Issue 19: `fileId -> (filename, bytes)` for `file/getAttach`.
+    pub fn set_attaches(&self, attaches: std::collections::HashMap<String, (String, Vec<u8>)>) {
+        self.inner.lock().unwrap().attaches = attaches;
+    }
+
     pub fn clear_pushes(&self) {
         self.inner.lock().unwrap().pushes.clear();
     }
@@ -195,6 +202,7 @@ pub async fn start() -> FakeServer {
         .route("/api/note/updateNote", post(push("note/updateNote")))
         .route("/api/note/deleteTrash", post(push("note/deleteTrash")))
         .route("/api/note/exportPdf", get(export_pdf))
+        .route("/api/file/getAttach", get(get_attach))
         .route("/api/tag/addTag", post(push("tag/addTag")))
         .route("/api/tag/deleteTag", post(push("tag/deleteTag")))
         .with_state(inner.clone());
@@ -278,8 +286,14 @@ async fn login(
     let mut inner = inner.lock().unwrap();
     inner.token = Some(TOKEN.to_string());
     inner.login_query = (
-        qs.get("macAddr").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        qs.get("v").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        qs.get("macAddr")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        qs.get("v")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
     );
     // next push USN is max(dataset usn)+1; login itself does not consume one
     inner.next_usn = inner.next_usn.max(inner.sync_usn) + 1;
@@ -382,6 +396,34 @@ async fn export_pdf(
         Some(bytes) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/pdf")],
+            bytes.clone(),
+        )
+            .into_response(),
+        None => json_response(json!({"Ok": false, "Msg": "notExists"})),
+    }
+}
+
+/// `file/getAttach` (issue 19): raw bytes + Content-Disposition filename;
+/// unknown fileId answers the usual `{Ok:false}` JSON.
+async fn get_attach(
+    State(inner): State<Arc<Mutex<Inner>>>,
+    Query(query): Query<Map<String, Value>>,
+) -> Response {
+    let i = inner.lock().unwrap();
+    if let Some(r) = require_token(&query, &i) {
+        return r;
+    }
+    let file_id = query.get("fileId").and_then(Value::as_str).unwrap_or("");
+    match i.attaches.get(file_id) {
+        Some((name, bytes)) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{name}\"").as_str(),
+                ),
+            ],
             bytes.clone(),
         )
             .into_response(),

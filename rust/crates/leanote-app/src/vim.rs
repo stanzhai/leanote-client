@@ -1,119 +1,162 @@
-//! Vim subset (issue 17 / ADR-0004): normal/insert/visual modes over the kit
-//! editor, driven by action dispatch. Pure state machine — no GPUI types — so
-//! the whole key grammar is unit-testable. The shell wires `handle_key` into
-//! `capture_key_down` on the editor container and executes the returned
-//! `VimAction`s.
+//! Vim mode for the kit editor, following rgpui's `editor/vim` architecture
+//! (ADR-0004: keybinding layer, not an engine fork; ADR-0005: cursor shape
+//! is the mode indicator — no status line).
+//!
+//! Three layers:
+//!
+//! - **Grammar** (`VimState::handle_key`): pure state machine, key →
+//!   [`VimAction`]; unit-tested headless.
+//! - **Buffer math**: rgpui-ported rope helpers (UTF-8 byte offsets,
+//!   char-count columns so CJK aligns, preferred-column memory).
+//! - **Execution** ([`exec`]/[`consume`]): mutates `EditorState` directly
+//!   (`set_selected_range`/`replace`/`insert`) — no kit-action round-trips,
+//!   so no dispatch-reentry guard. The one exception is Undo:
+//!   `InputBaseState::undo` is `pub(super)` in gpui-base, so it stays a
+//!   dispatched kit action (deferred by gpui, harmless).
+//!
+//! Caret model (ADR-0005): normal mode rests with a collapsed caret;
+//! entering normal from insert block-selects the char under the cursor
+//! (`off..off+1`); visual selection is `anchor..caret+1` (rgpui's
+//! `extend_to` plus one char, because the block caret covers a char).
+//! `consume` tracks the visual caret itself — the kit reports the
+//! selection end as its cursor, which is not the moving end.
+//!
+//! Deliberate subset (ADR-0004): no `"` registers, no macros, no plugins,
+//! no counts; `:w`/`:q` only. Incompatibilities with full vi are
+//! intentional — do not "fix" them into completeness.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use gpui_kit::component::input::{EditorState, Rope, RopeExt as _};
+use gpui_kit::{Context, Window};
+
+// ---------------------------------------------------------------------------
+// Grammar (pure)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VimMode {
+    #[default]
     Normal,
     Insert,
     Visual,
 }
 
-/// Pending operator in normal mode: `d`/`c`/`y` awaiting a motion, or a
-/// doubled letter awaiting its own confirmation (`dd`, `yy`, `cc`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Pending {
-    None,
-    /// d/c/y pressed once; `expect_double` is the same letter (`dd`).
-    Operator {
-        kind: Op,
-        expect_double: bool,
-    },
-    /// `g` pressed, waiting for the second `g`.
-    G,
+/// Status label (shell may hide it; ADR-0005 relies on cursor shape).
+pub fn mode_label(mode: VimMode) -> &'static str {
+    match mode {
+        VimMode::Normal => "-- NORMAL --",
+        VimMode::Insert => "-- INSERT --",
+        VimMode::Visual => "-- VISUAL --",
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Op {
-    Delete,
-    Change,
-    Yank,
-}
-
-/// Motions and edits the engine can express as a single GPUI input action.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Motion {
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,     // 0
-    End,      // $
-    Start,    // gg
-    Finish,   // G
-    NextWord, // w
-    PrevWord, // b
-}
-
-/// What the shell should execute for one keypress. All variants are cheap;
-/// `LineOp` and paste need direct `EditorState` access in the shell.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VimAction {
-    Dispatch(Motion), // move cursor (or extend, in visual)
-    DispatchDelete(DeleteOp),
-    Undo,
-    /// `dd` / `yy` / `cc` on the current line.
-    LineOp(Op, usize), // (op, current cursor row)
-    /// `p` — paste register before/after cursor.
-    Paste,
-    /// Enter insert mode; if `append`, move cursor right first; `open_below`
-    /// / `open_above` are `o` / `O` (newline then insert).
-    EnterInsert {
-        append: bool,
-        open_below: bool,
-        open_above: bool,
-    },
-    EnterVisual {
-        linewise: bool,
-    },
-    /// `cw` / `c$` / `c0`: delete the motion range, then enter insert.
-    ChangeThenInsert(DeleteOp),
-    /// Leave visual back to normal (keep the cursor where selection started).
-    LeaveVisual,
-    /// `:w` / `:q` parsed from the command line.
-    Command(Cmd),
-    /// Key consumed, nothing to do (mode switch already reflected in state).
-    Consumed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeleteOp {
-    Char,          // x
-    ToNextWordEnd, // dw / cw
-    ToLineStart,   // d0 / c0
-    ToLineEnd,     // d$ / c$ (from cursor to end of line)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `:` command parsed from the cmdline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
     Write,
     Quit,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VimState {
-    pub mode: VimMode,
-    pending: Pending,
-    /// `:` command line being typed (`:w`, `:q`).
-    cmdline: String,
-    /// Register for `p` (set by `yy`/`dd` line ops from the shell).
-    pub register: Option<String>,
-    /// Visual anchor: selection stays anchored while motions extend it.
-    pub visual_anchor: Option<usize>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Motion {
+    Left,
+    Right,
+    Down,
+    Up,
+    /// `0`
+    LineStart,
+    /// `$`
+    LineEnd,
+    /// `gg` — first line, preferred column
+    DocStart,
+    /// `G` — last line, preferred column
+    DocEnd,
+    /// `w`
+    NextWord,
+    /// `b`
+    PrevWord,
 }
 
-impl Default for VimState {
-    fn default() -> Self {
-        Self {
-            mode: VimMode::Normal,
-            pending: Pending::None,
-            cmdline: String::new(),
-            register: None,
-            visual_anchor: None,
-        }
+impl Motion {
+    /// Valid as the target of an operator (`d`/`y`/`c` + motion)?
+    fn as_operator_target(self) -> bool {
+        !matches!(
+            self,
+            Motion::Down | Motion::Up | Motion::DocStart | Motion::DocEnd
+        )
     }
+}
+
+/// A deletion, from `x` or operator+motion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOp {
+    /// `x`/`delete` — char under the caret
+    Char,
+    /// `dw`
+    ToNextWord,
+    /// `d0`
+    ToLineStart,
+    /// `d$`
+    ToLineEnd,
+}
+
+/// `dd`/`yy`/`cc` — the current line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    Delete,
+    Yank,
+    Change,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum VimAction {
+    /// Key eaten, nothing to execute (unknown keys must never type).
+    Consumed,
+    Move(Motion),
+    Delete(DeleteOp),
+    /// `dd`/`yy`/`cc`. `usize::MAX` = current line (the machine does not
+    /// track the cursor; the executor does).
+    LineOp(Op, usize),
+    EnterInsert {
+        append: bool,
+        open_below: bool,
+        open_above: bool,
+    },
+    /// Esc from insert: block-select the char at the insert caret.
+    EnterNormal,
+    EnterVisual,
+    LeaveVisual,
+    /// `y` in visual.
+    YankSelection,
+    /// `x`/`d`/`delete` in visual.
+    DeleteSelection,
+    /// `y{motion}` — yank without deleting.
+    YankMotion(DeleteOp),
+    /// `c{motion}` — delete then insert.
+    ChangeThenInsert(DeleteOp),
+    /// `p`
+    Paste,
+    Undo,
+    Command(Cmd),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VimState {
+    pub mode: VimMode,
+    /// Operator awaiting its second key: `d`/`y`/`c`/`g`.
+    pending: Option<char>,
+    /// Visual anchor (byte offset).
+    pub visual_anchor: Option<usize>,
+    /// Moving end of the visual selection (tracked here; the kit reports
+    /// the selection end as its cursor, which is not always this).
+    pub visual_cursor: usize,
+    /// `:` cmdline being typed.
+    cmdline: String,
+    /// Last yank.
+    pub register: Option<String>,
+    /// Register holds whole lines (`yy`) vs characters.
+    pub register_linewise: bool,
+    /// Preferred column (char count) remembered across j/k.
+    pub preferred_col: usize,
 }
 
 impl VimState {
@@ -121,18 +164,53 @@ impl VimState {
         Self::default()
     }
 
-    /// Handle one bare keypress (callers must filter modifiers + focus
-    /// themselves; insert mode passes everything through before this).
-    /// `key` is the GPUI keystroke key ("h", "d", ":", "enter", …) with
-    /// `key_char` when available.
+    /// Reset for a new session or a vim toggle-off (starts in normal).
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn cmdline(&self) -> &str {
+        &self.cmdline
+    }
+
+    /// Enter visual at `anchor` (the executor knows the caret offset).
+    pub fn begin_visual(&mut self, anchor: usize) {
+        self.mode = VimMode::Visual;
+        self.visual_anchor = Some(anchor);
+        self.visual_cursor = anchor;
+    }
+
+    /// Test/shell helper.
+    #[cfg(test)]
+    pub fn set_mode(&mut self, mode: VimMode) {
+        if mode != VimMode::Visual {
+            self.visual_anchor = None;
+        }
+        self.mode = mode;
+    }
+
+    fn leave_visual(&mut self) {
+        self.visual_anchor = None;
+        self.mode = VimMode::Normal;
+    }
+
+    /// Feed one key: `key` is the binding name ("h", "G", "enter",
+    /// "escape", …); `key_char` the printable it produced, if any.
     pub fn handle_key(&mut self, key: &str, key_char: Option<char>) -> VimAction {
         if !self.cmdline.is_empty() {
             return self.cmdline_key(key, key_char);
         }
         match self.mode {
-            VimMode::Insert => VimAction::Consumed, // caller never routes insert keys here
+            VimMode::Insert => {
+                if key == "escape" {
+                    self.mode = VimMode::Normal;
+                    VimAction::EnterNormal
+                } else {
+                    VimAction::Consumed // the shell never routes insert keys here
+                }
+            }
             VimMode::Normal => self.normal_key(key, key_char),
-            VimMode::Visual => self.visual_key(key, key_char),
+            VimMode::Visual => self.visual_key(key),
         }
     }
 
@@ -143,12 +221,15 @@ impl VimState {
                 VimAction::Consumed
             }
             "enter" => {
-                let cmd = self.cmdline.trim().to_string();
+                let cmd = match self.cmdline.trim() {
+                    ":w" | ":wq" | ":x" => Some(Cmd::Write),
+                    ":q" => Some(Cmd::Quit),
+                    _ => None,
+                };
                 self.cmdline.clear();
-                match cmd.as_str() {
-                    ":w" | ":wq" | ":x" => VimAction::Command(Cmd::Write),
-                    ":q" => VimAction::Command(Cmd::Quit),
-                    _ => VimAction::Consumed,
+                match cmd {
+                    Some(c) => VimAction::Command(c),
+                    None => VimAction::Consumed,
                 }
             }
             "backspace" => {
@@ -156,179 +237,607 @@ impl VimState {
                 VimAction::Consumed
             }
             _ => {
-                // Printable char: append to the command line.
-                if let Some(c) = key_char.filter(|c| c.is_ascii_graphic() && self.cmdline.len() < 8)
-                {
-                    self.cmdline.push(c);
+                // ADR-0004: only :w/:q exist; a few chars of headroom, then
+                // the line stops growing (still enter/esc-able).
+                if self.cmdline.len() < 8 {
+                    if let Some(c) = key_char.filter(|c| c.is_ascii_graphic()) {
+                        self.cmdline.push(c);
+                    }
                 }
                 VimAction::Consumed
             }
         }
-    }
-
-    #[cfg(test)]
-    pub fn cmdline(&self) -> &str {
-        &self.cmdline
     }
 
     fn normal_key(&mut self, key: &str, key_char: Option<char>) -> VimAction {
-        // Printable input routes through key_char (GPUI gives key_char for
-        // bare letters; key is also the letter there).
-        let c = key_char.unwrap_or(' ');
-        match self.pending {
-            Pending::G => {
-                self.pending = Pending::None;
-                return if key == "g" {
-                    VimAction::Dispatch(Motion::Start)
-                } else {
-                    VimAction::Consumed
-                };
+        // Pending operator: dd/yy/cc, gg, or operator+motion. A key that
+        // completes nothing voids the prefix and is swallowed (it must
+        // not also run as a fresh command).
+        if let Some(op) = self.pending.take() {
+            if key == "escape" {
+                return VimAction::Consumed;
             }
-            Pending::Operator {
-                kind,
-                expect_double,
-            } => {
-                self.pending = Pending::None;
-                // doubled letter: dd/yy/cc
-                let doubled = matches!(
-                    (kind, key),
-                    (Op::Delete, "d") | (Op::Yank, "y") | (Op::Change, "c")
-                );
-                if expect_double && doubled {
-                    return VimAction::LineOp(kind, usize::MAX); // row filled in by shell
+            // Doubled operators (dd/yy/cc) and gg complete line-wise.
+            if let Some(line_op) = match (op, key) {
+                ('d', "d") => Some(Op::Delete),
+                ('y', "y") => Some(Op::Yank),
+                ('c', "c") => Some(Op::Change),
+                ('g', "g") => {
+                    return VimAction::Move(Motion::DocStart);
                 }
-                return match key {
-                    "w" => match kind {
-                        Op::Delete => VimAction::DispatchDelete(DeleteOp::ToNextWordEnd),
-                        Op::Change => VimAction::ChangeThenInsert(DeleteOp::ToNextWordEnd),
-                        Op::Yank => VimAction::Dispatch(Motion::NextWord),
-                    },
-                    "0" => match kind {
-                        Op::Yank => VimAction::Dispatch(Motion::Home),
-                        Op::Change => VimAction::ChangeThenInsert(DeleteOp::ToLineStart),
-                        Op::Delete => VimAction::DispatchDelete(DeleteOp::ToLineStart),
-                    },
-                    "$" => match kind {
-                        Op::Yank => VimAction::Dispatch(Motion::End),
-                        Op::Change => VimAction::ChangeThenInsert(DeleteOp::ToLineEnd),
-                        Op::Delete => VimAction::DispatchDelete(DeleteOp::ToLineEnd),
-                    },
-                    _ => VimAction::Consumed,
-                };
+                _ => None,
+            } {
+                return VimAction::LineOp(line_op, usize::MAX);
             }
-            Pending::None => {}
+            if let Some(m) = motion_of(key).filter(|m| m.as_operator_target()) {
+                return operator_motion(op, m);
+            }
+            return VimAction::Consumed;
         }
 
         match key {
-            "escape" => VimAction::Consumed,
-            "h" => VimAction::Dispatch(Motion::Left),
-            "j" => VimAction::Dispatch(Motion::Down),
-            "k" => VimAction::Dispatch(Motion::Up),
-            "l" => VimAction::Dispatch(Motion::Right),
-            "0" => VimAction::Dispatch(Motion::Home),
-            "$" => VimAction::Dispatch(Motion::End),
-            "g" => {
-                self.pending = Pending::G;
+            "h" => VimAction::Move(Motion::Left),
+            "l" => VimAction::Move(Motion::Right),
+            "j" | "enter" => VimAction::Move(Motion::Down),
+            "k" => VimAction::Move(Motion::Up),
+            "0" => VimAction::Move(Motion::LineStart),
+            "$" => VimAction::Move(Motion::LineEnd),
+            "G" => VimAction::Move(Motion::DocEnd),
+            "w" => VimAction::Move(Motion::NextWord),
+            "b" => VimAction::Move(Motion::PrevWord),
+            "g" | "d" | "y" | "c" => {
+                self.pending = key.chars().next();
                 VimAction::Consumed
             }
-            "G" => VimAction::Dispatch(Motion::Finish),
-            "w" => VimAction::Dispatch(Motion::NextWord),
-            "b" => VimAction::Dispatch(Motion::PrevWord),
-            "x" => VimAction::DispatchDelete(DeleteOp::Char),
-            "u" => VimAction::Undo,
-            "d" | "c" | "y" => {
-                let kind = match key {
-                    "d" => Op::Delete,
-                    "c" => Op::Change,
-                    _ => Op::Yank,
-                };
-                self.pending = Pending::Operator {
-                    kind,
-                    expect_double: true,
-                };
-                VimAction::Consumed
+            "x" | "delete" => VimAction::Delete(DeleteOp::Char),
+            "backspace" => VimAction::Move(Motion::Left),
+            "i" => VimAction::EnterInsert {
+                append: false,
+                open_below: false,
+                open_above: false,
+            },
+            "a" => VimAction::EnterInsert {
+                append: true,
+                open_below: false,
+                open_above: false,
+            },
+            "o" => VimAction::EnterInsert {
+                append: false,
+                open_below: true,
+                open_above: false,
+            },
+            "O" => VimAction::EnterInsert {
+                append: false,
+                open_below: false,
+                open_above: true,
+            },
+            "v" => {
+                self.mode = VimMode::Visual; // anchor set by exec
+                VimAction::EnterVisual
             }
             "p" => VimAction::Paste,
-            "i" => {
-                self.mode = VimMode::Insert;
-                VimAction::EnterInsert {
-                    append: false,
-                    open_below: false,
-                    open_above: false,
-                }
-            }
-            "a" => {
-                self.mode = VimMode::Insert;
-                VimAction::EnterInsert {
-                    append: true,
-                    open_below: false,
-                    open_above: false,
-                }
-            }
-            "o" => {
-                self.mode = VimMode::Insert;
-                VimAction::EnterInsert {
-                    append: false,
-                    open_below: true,
-                    open_above: false,
-                }
-            }
-            "O" => {
-                self.mode = VimMode::Insert;
-                VimAction::EnterInsert {
-                    append: false,
-                    open_below: false,
-                    open_above: true,
-                }
-            }
-            "v" => {
-                self.mode = VimMode::Visual;
-                VimAction::EnterVisual { linewise: false }
-            }
-            "V" => {
-                self.mode = VimMode::Visual;
-                VimAction::EnterVisual { linewise: true }
-            }
+            "u" => VimAction::Undo,
+            "escape" => VimAction::Consumed, // no pending (taken above)
             ":" => {
+                self.cmdline.clear();
                 self.cmdline.push(':');
                 VimAction::Consumed
             }
-            "enter" => VimAction::Dispatch(Motion::Down),
             _ => {
-                let _ = c;
-                VimAction::Consumed
+                let _ = key_char;
+                VimAction::Consumed // subset: swallow, never type
             }
         }
     }
 
-    fn visual_key(&mut self, key: &str, _key_char: Option<char>) -> VimAction {
+    fn visual_key(&mut self, key: &str) -> VimAction {
         match key {
-            "escape" => {
-                self.mode = VimMode::Normal;
+            "h" => VimAction::Move(Motion::Left),
+            "l" => VimAction::Move(Motion::Right),
+            "j" | "enter" => VimAction::Move(Motion::Down),
+            "k" => VimAction::Move(Motion::Up),
+            "0" => VimAction::Move(Motion::LineStart),
+            "$" => VimAction::Move(Motion::LineEnd),
+            "G" => VimAction::Move(Motion::DocEnd),
+            "g" => VimAction::Move(Motion::DocStart),
+            "w" => VimAction::Move(Motion::NextWord),
+            "b" => VimAction::Move(Motion::PrevWord),
+            "x" | "d" | "delete" => VimAction::DeleteSelection,
+            "y" => VimAction::YankSelection,
+            "p" => VimAction::Paste,
+            "v" | "V" | "escape" => {
+                self.leave_visual();
                 VimAction::LeaveVisual
-            }
-            "h" => VimAction::Dispatch(Motion::Left),
-            "j" => VimAction::Dispatch(Motion::Down),
-            "k" => VimAction::Dispatch(Motion::Up),
-            "l" => VimAction::Dispatch(Motion::Right),
-            "0" => VimAction::Dispatch(Motion::Home),
-            "$" => VimAction::Dispatch(Motion::End),
-            "w" => VimAction::Dispatch(Motion::NextWord),
-            "b" => VimAction::Dispatch(Motion::PrevWord),
-            "d" | "x" => VimAction::DispatchDelete(DeleteOp::Char), // shell maps to selection delete
-            "y" => {
-                self.mode = VimMode::Normal;
-                VimAction::Consumed // shell yanks the selection itself
             }
             _ => VimAction::Consumed,
         }
     }
+}
 
-    pub fn set_mode(&mut self, mode: VimMode) {
-        self.mode = mode;
-        self.pending = Pending::None;
+fn motion_of(key: &str) -> Option<Motion> {
+    Some(match key {
+        "h" => Motion::Left,
+        "l" => Motion::Right,
+        "j" => Motion::Down,
+        "k" => Motion::Up,
+        "0" => Motion::LineStart,
+        "$" => Motion::LineEnd,
+        "w" => Motion::NextWord,
+        "b" => Motion::PrevWord,
+        _ => return None,
+    })
+}
+
+fn operator_motion(op: char, m: Motion) -> VimAction {
+    let del = match m {
+        Motion::NextWord => DeleteOp::ToNextWord,
+        Motion::LineStart => DeleteOp::ToLineStart,
+        Motion::LineEnd => DeleteOp::ToLineEnd,
+        Motion::Left | Motion::Right => DeleteOp::Char,
+        _ => return VimAction::Consumed,
+    };
+    match op {
+        'y' => VimAction::YankMotion(del),
+        'c' => VimAction::ChangeThenInsert(del),
+        _ => VimAction::Delete(del),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Buffer math (rgpui ports) — byte offsets, char-count columns
+// ---------------------------------------------------------------------------
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Line span excluding its `\n`: `(start, end)`.
+fn line_range(text: &Rope, row: usize) -> (usize, usize) {
+    (text.line_start_offset(row), text.line_end_offset(row))
+}
+
+fn row_of(text: &Rope, offset: usize) -> usize {
+    text.offset_to_point(offset).row
+}
+
+/// Byte offset of the `col`-th char of `row`, clamped to the line end.
+fn char_offset_in_line(text: &Rope, row: usize, col: usize) -> usize {
+    let (start, end) = line_range(text, row);
+    let mut offset = start;
+    for (n, ch) in text.slice(start..end).chars().enumerate() {
+        if n >= col {
+            break;
+        }
+        offset += ch.len_utf8();
+    }
+    offset
+}
+
+/// Chars from the line start to `offset` — the preferred-column metric.
+fn char_col(text: &Rope, offset: usize) -> usize {
+    let (start, _) = line_range(text, row_of(text, offset));
+    text.slice(start..offset).chars().count()
+}
+
+/// End of the char starting at `offset` (start of the next char).
+fn next_char(text: &Rope, offset: usize) -> usize {
+    let len = text.len();
+    if offset >= len {
+        return len;
+    }
+    text.ceil_char_boundary(offset + 1).min(len)
+}
+
+/// Start of the char before `offset`.
+fn prev_char(text: &Rope, offset: usize) -> usize {
+    text.floor_char_boundary(offset.saturating_sub(1))
+}
+
+/// `w`: next word start, crossing lines and trailing punctuation.
+fn word_forward(text: &Rope, cursor: usize) -> usize {
+    let len = text.len();
+    let mut offset = cursor.min(len);
+    let mut chars = text.chars_at(offset).peekable();
+    if chars.peek().is_some_and(|&c| is_word_char(c)) {
+        while let Some(&c) = chars.peek() {
+            if !is_word_char(c) {
+                break;
+            }
+            offset += c.len_utf8();
+            chars.next();
+        }
+    }
+    while let Some(&c) = chars.peek() {
+        if is_word_char(c) {
+            break;
+        }
+        offset += c.len_utf8();
+        chars.next();
+    }
+    offset.min(len)
+}
+
+/// `b`: previous word start; from mid-word, back to that word's start.
+fn word_backward(text: &Rope, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    let mut boundary = cursor;
+    for c in text.chars_at(cursor).reversed() {
+        if is_word_char(c) {
+            boundary -= c.len_utf8();
+            let mut back = text.chars_at(boundary).reversed();
+            while let Some(c2) = back.next() {
+                if !is_word_char(c2) {
+                    break;
+                }
+                boundary -= c2.len_utf8();
+            }
+            return boundary;
+        }
+        boundary -= c.len_utf8();
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Execution — direct EditorState mutation
+// ---------------------------------------------------------------------------
+
+fn goto(state: &mut EditorState, offset: usize, cx: &mut Context<EditorState>) {
+    let offset = offset.min(state.text().len());
+    state.set_selected_range(offset..offset, cx);
+}
+/// Normal-mode rest position (ADR-0005): a block caret on the char at
+/// `offset`. Insert mode keeps the thin caret, so callers routing
+/// mode-dependent rests go through this instead of `goto`.
+fn rest(state: &mut EditorState, mode: VimMode, offset: usize, cx: &mut Context<EditorState>) {
+    if mode == VimMode::Insert {
+        goto(state, offset, cx);
+    } else {
+        block_caret(state, offset, cx);
+    }
+}
+
+/// ADR-0005 block caret: select the char at `offset`.
+fn block_caret(state: &mut EditorState, offset: usize, cx: &mut Context<EditorState>) {
+    let text = state.text().clone();
+    let (line_start, line_end) = line_range(&text, row_of(&text, offset));
+    let end = next_char(&text, offset).min(line_end).max(line_start);
+    state.set_selected_range(offset..end, cx);
+}
+
+fn delete_range(
+    state: &mut EditorState,
+    range: std::ops::Range<usize>,
+    window: &mut Window,
+    cx: &mut Context<EditorState>,
+) {
+    state.set_selected_range(range, cx);
+    state.replace("", window, cx);
+}
+
+/// The caret this action should act from: the visual moving end in visual
+/// mode, else the start of the (possibly block) selection.
+fn caret_of(vim: &VimState, state: &EditorState) -> usize {
+    if vim.mode == VimMode::Visual {
+        vim.visual_cursor
+    } else {
+        state.selected_range().start
+    }
+}
+
+/// Execute one action directly against the editor. `dispatch_undo` sends
+/// the kit's `Undo` action (the engine's undo is not public API).
+pub fn exec(
+    action: &VimAction,
+    vim: &mut VimState,
+    state: &mut EditorState,
+    window: &mut Window,
+    cx: &mut Context<EditorState>,
+    dispatch_undo: &mut dyn FnMut(&mut Window, &mut Context<EditorState>),
+) {
+    let text = state.text().clone();
+    let caret = caret_of(vim, state).min(text.len());
+    match action {
+        VimAction::Consumed => {}
+
+        VimAction::Move(m) => {
+            let (line_start, line_end) = line_range(&text, row_of(&text, caret));
+            let target = match m {
+                Motion::Left => prev_char(&text, caret).max(line_start),
+                // Visual extends across the line break; normal stops at it.
+                Motion::Right => {
+                    if vim.mode == VimMode::Visual {
+                        next_char(&text, caret).min(text.len())
+                    } else {
+                        next_char(&text, caret).min(line_end)
+                    }
+                }
+                Motion::Down | Motion::Up => {
+                    let delta = if *m == Motion::Up { -1isize } else { 1 };
+                    let row = row_of(&text, caret) as isize;
+                    let last = (text.lines_len() - 1) as isize;
+                    let row = (row + delta).clamp(0, last) as usize;
+                    char_offset_in_line(&text, row, vim.preferred_col)
+                }
+                Motion::LineStart => line_start,
+                // On the last char (empty line: line_start).
+                Motion::LineEnd => prev_char(&text, line_end).max(line_start),
+                Motion::DocStart | Motion::DocEnd => {
+                    let row = if *m == Motion::DocStart {
+                        0
+                    } else {
+                        text.lines_len() - 1
+                    };
+                    char_offset_in_line(&text, row, vim.preferred_col)
+                }
+                Motion::NextWord => word_forward(&text, caret),
+                Motion::PrevWord => word_backward(&text, caret),
+            };
+            if vim.mode == VimMode::Visual {
+                extend_selection(vim, state, target, cx);
+            } else {
+                rest(state, vim.mode, target, cx);
+            }
+            // rgpui: horizontal moves refresh the preferred column;
+            // vertical moves keep the remembered one.
+            if matches!(
+                m,
+                Motion::Left
+                    | Motion::Right
+                    | Motion::LineStart
+                    | Motion::LineEnd
+                    | Motion::NextWord
+                    | Motion::PrevWord
+            ) {
+                vim.preferred_col = char_col(&text, target);
+            }
+            cx.notify();
+        }
+
+        VimAction::Delete(op) => {
+            if let Some(range) = delete_range_for(*op, &text, caret) {
+                vim.register = Some(text.slice(range.start..range.end).to_string());
+                vim.register_linewise = false;
+                let start = range.start;
+                delete_range(state, range, window, cx);
+                rest(state, vim.mode, start, cx);
+            }
+            cx.notify();
+        }
+
+        VimAction::DeleteSelection => {
+            let range = state.selected_range();
+            if !range.is_empty() {
+                vim.register = Some(text.slice(range.start..range.end).to_string());
+                vim.register_linewise = false;
+                let start = range.start;
+                delete_range(state, range, window, cx);
+                rest(state, vim.mode, start, cx);
+            }
+            vim.leave_visual();
+            cx.notify();
+        }
+
+        VimAction::YankSelection => {
+            let range = state.selected_range();
+            vim.register = Some(text.slice(range.start..range.end).to_string());
+            vim.register_linewise = false;
+            let start = range.start;
+            vim.leave_visual();
+            rest(state, vim.mode, start, cx);
+            cx.notify();
+        }
+
+        VimAction::YankMotion(op) => {
+            if let Some(range) = delete_range_for(*op, &text, caret) {
+                vim.register = Some(text.slice(range.start..range.end).to_string());
+                vim.register_linewise = false;
+            }
+            cx.notify();
+        }
+
+        VimAction::ChangeThenInsert(op) => {
+            if let Some(range) = delete_range_for(*op, &text, caret) {
+                let start = range.start;
+                delete_range(state, range, window, cx);
+                goto(state, start, cx);
+            }
+            vim.mode = VimMode::Insert;
+            cx.notify();
+        }
+
+        VimAction::LineOp(op, _) => {
+            let row = row_of(&text, caret);
+            let (start, end) = line_range(&text, row);
+            vim.register = Some(text.slice(start..end).to_string());
+            vim.register_linewise = true;
+            match op {
+                Op::Yank => {}
+                Op::Delete => {
+                    // rgpui: eat the trailing newline so no blank line
+                    // remains; the last line eats the preceding newline;
+                    // a single-line buffer empties entirely.
+                    let (del_start, del_end) = if text.lines_len() <= 1 {
+                        (0, text.len())
+                    } else if row + 1 < text.lines_len() {
+                        (start, text.line_start_offset(row + 1))
+                    } else {
+                        (start.saturating_sub(1), text.len())
+                    };
+                    delete_range(state, del_start..del_end, window, cx);
+                    rest(state, vim.mode, del_start.min(state.text().len()), cx);
+                }
+                Op::Change => {
+                    // cc keeps the line (and its newline), clears content.
+                    delete_range(state, start..end, window, cx);
+                    goto(state, start, cx);
+                    vim.mode = VimMode::Insert;
+                }
+            }
+            cx.notify();
+        }
+
+        VimAction::EnterInsert {
+            append,
+            open_below,
+            open_above,
+        } => {
+            let mut at = caret;
+            if *append {
+                let (_, line_end) = line_range(&text, row_of(&text, at));
+                at = next_char(&text, at).min(line_end).max(at);
+            }
+            if *open_below || *open_above {
+                let row = row_of(&text, at);
+                let offset = if *open_below {
+                    line_range(&text, row).1 // before the `\n`
+                } else {
+                    line_range(&text, row).0
+                };
+                goto(state, offset, cx);
+                state.insert("\n", window, cx);
+                if *open_above {
+                    goto(state, offset, cx); // caret on the new upper line
+                }
+            } else {
+                goto(state, at, cx);
+            }
+            vim.mode = VimMode::Insert;
+            cx.notify();
+        }
+
+        VimAction::EnterNormal => {
+            // Esc from insert: block-select the char at the insert caret
+            // (no left shift — pinned by the pipeline test).
+            block_caret(state, caret, cx);
+            vim.preferred_col = char_col(&text, caret);
+            cx.notify();
+        }
+
+        VimAction::EnterVisual => {
+            // Grammar already set mode=Visual; anchor at the real caret
+            // (caret_of would return the stale visual_cursor).
+            let caret = state.selected_range().start;
+            vim.begin_visual(caret);
+            extend_selection(vim, state, caret, cx);
+            cx.notify();
+        }
+
+        VimAction::LeaveVisual => {
+            let start = state.selected_range().start;
+            rest(state, vim.mode, start, cx);
+            cx.notify();
+        }
+
+        VimAction::Paste => {
+            put_register(vim, state, window, cx);
+            cx.notify();
+        }
+
+        VimAction::Undo => dispatch_undo(window, cx),
+
+        VimAction::Command(_) => {} // the shell maps Write/Quit itself
+    }
+}
+
+/// Byte range a delete op covers at `caret`; None when it is empty
+/// (e.g. `x` past the last char of the line).
+fn delete_range_for(op: DeleteOp, text: &Rope, caret: usize) -> Option<std::ops::Range<usize>> {
+    let (line_start, line_end) = line_range(text, row_of(text, caret));
+    Some(match op {
+        DeleteOp::Char => {
+            if caret >= line_end {
+                return None;
+            }
+            caret..next_char(text, caret).min(line_end)
+        }
+        DeleteOp::ToNextWord => caret..word_forward(text, caret),
+        DeleteOp::ToLineStart => line_start..caret,
+        DeleteOp::ToLineEnd => caret..line_end,
+    })
+}
+
+/// rgpui `extend_to` + block caret: selection spans `anchor..target+1`
+/// (whichever end is greater gets the +1); the moving caret is `target`.
+fn extend_selection(
+    vim: &mut VimState,
+    state: &mut EditorState,
+    target: usize,
+    cx: &mut Context<EditorState>,
+) {
+    let anchor = vim.visual_anchor.unwrap_or(target);
+    vim.visual_cursor = target;
+    let (start, end) = if anchor <= target {
+        (anchor, next_char(state.text(), target))
+    } else {
+        (target, next_char(state.text(), anchor))
+    };
+    state.set_selected_range(start..end, cx);
+}
+
+/// rgpui `put_register`: linewise pastes a new line below; charwise
+/// inserts at the caret.
+fn put_register(
+    vim: &VimState,
+    state: &mut EditorState,
+    window: &mut Window,
+    cx: &mut Context<EditorState>,
+) {
+    let Some(reg) = vim.register.as_ref() else {
+        return;
+    };
+    let text = state.text().clone();
+    if vim.register_linewise {
+        if text.len() == 0 {
+            state.insert(reg.clone(), window, cx);
+            rest(state, vim.mode, 0, cx);
+            return;
+        }
+        let row = row_of(&text, state.cursor());
+        let at = line_range(&text, row).1; // before the `\n`
+        goto(state, at, cx);
+        state.insert(format!("\n{reg}"), window, cx);
+        rest(state, vim.mode, at + 1, cx); // first char of the pasted line
+    } else {
+        let at = state.cursor().min(text.len());
+        goto(state, at, cx);
+        state.insert(reg.clone(), window, cx);
+        // p leaves the caret on the last pasted char.
+        rest(state, vim.mode, prev_char(state.text(), state.cursor()), cx);
+    }
+}
+
+/// Feed one key and execute it. Returns the completed `:` command, if any
+/// (the shell owns save/quit). Always "consumed" — the caller stops
+/// propagation; unknown keys must never reach the editor as text.
+pub fn consume(
+    vim: &mut VimState,
+    state: &mut EditorState,
+    key: &str,
+    key_char: Option<char>,
+    window: &mut Window,
+    cx: &mut Context<EditorState>,
+) -> Option<Cmd> {
+    let action = vim.handle_key(key, key_char);
+    let cmd = if let VimAction::Command(c) = action {
+        Some(c)
+    } else {
+        None
+    };
+    if !matches!(action, VimAction::Consumed) {
+        exec(&action, vim, state, window, cx, &mut |window, cx| {
+            // Undo is engine-internal; dispatch the kit action instead.
+            // Deferred by gpui, so it cannot re-enter this call.
+            window.dispatch_action(Box::new(gpui_kit::component::input::Undo), cx);
+        });
+    }
+    cmd
+}
+
+// ---------------------------------------------------------------------------
+// Tests — grammar is pure; execution is covered end-to-end in
+// app_shell.rs (kit `EditorState` needs a windowed context).
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -341,23 +850,24 @@ mod tests {
     #[test]
     fn motions_in_normal() {
         let mut v = VimState::new();
-        assert_eq!(run(&mut v, "h"), VimAction::Dispatch(Motion::Left));
-        assert_eq!(run(&mut v, "l"), VimAction::Dispatch(Motion::Right));
-        assert_eq!(run(&mut v, "0"), VimAction::Dispatch(Motion::Home));
-        assert_eq!(run(&mut v, "$"), VimAction::Dispatch(Motion::End));
-        assert_eq!(run(&mut v, "G"), VimAction::Dispatch(Motion::Finish));
+        assert_eq!(run(&mut v, "h"), VimAction::Move(Motion::Left));
+        assert_eq!(run(&mut v, "l"), VimAction::Move(Motion::Right));
+        assert_eq!(run(&mut v, "0"), VimAction::Move(Motion::LineStart));
+        assert_eq!(run(&mut v, "$"), VimAction::Move(Motion::LineEnd));
+        assert_eq!(run(&mut v, "G"), VimAction::Move(Motion::DocEnd));
+        assert_eq!(run(&mut v, "enter"), VimAction::Move(Motion::Down));
     }
 
     #[test]
     fn gg_is_two_keys() {
         let mut v = VimState::new();
         assert_eq!(run(&mut v, "g"), VimAction::Consumed);
-        assert_eq!(run(&mut v, "g"), VimAction::Dispatch(Motion::Start));
-        // g followed by something else cancels the pending g (x is swallowed)
+        assert_eq!(run(&mut v, "g"), VimAction::Move(Motion::DocStart));
+        // g followed by something else voids the pending g (x is swallowed)
         assert_eq!(run(&mut v, "g"), VimAction::Consumed);
         assert_eq!(run(&mut v, "x"), VimAction::Consumed);
         // next x works normally
-        assert_eq!(run(&mut v, "x"), VimAction::DispatchDelete(DeleteOp::Char));
+        assert_eq!(run(&mut v, "x"), VimAction::Delete(DeleteOp::Char));
     }
 
     #[test]
@@ -371,21 +881,19 @@ mod tests {
         // dw deletes to word end
         let mut v = VimState::new();
         assert_eq!(run(&mut v, "d"), VimAction::Consumed);
-        assert_eq!(
-            run(&mut v, "w"),
-            VimAction::DispatchDelete(DeleteOp::ToNextWordEnd)
-        );
-        // d0 / d$
+        assert_eq!(run(&mut v, "w"), VimAction::Delete(DeleteOp::ToNextWord));
+        // d0 / d$ / y$ / cw
         let mut v = VimState::new();
         run(&mut v, "d");
-        assert_eq!(
-            run(&mut v, "0"),
-            VimAction::DispatchDelete(DeleteOp::ToLineStart)
-        );
+        assert_eq!(run(&mut v, "0"), VimAction::Delete(DeleteOp::ToLineStart));
         run(&mut v, "d");
+        assert_eq!(run(&mut v, "$"), VimAction::Delete(DeleteOp::ToLineEnd));
+        run(&mut v, "y");
+        assert_eq!(run(&mut v, "$"), VimAction::YankMotion(DeleteOp::ToLineEnd));
+        run(&mut v, "c");
         assert_eq!(
-            run(&mut v, "$"),
-            VimAction::DispatchDelete(DeleteOp::ToLineEnd)
+            run(&mut v, "w"),
+            VimAction::ChangeThenInsert(DeleteOp::ToNextWord)
         );
     }
 
@@ -401,7 +909,6 @@ mod tests {
             }
         );
         v.set_mode(VimMode::Insert);
-        // caller routes insert keys to the editor, not here
         v.set_mode(VimMode::Normal);
         assert_eq!(
             run(&mut v, "a"),
@@ -432,13 +939,35 @@ mod tests {
     }
 
     #[test]
+    fn insert_escape_returns_to_normal() {
+        let mut v = VimState::new();
+        v.set_mode(VimMode::Insert);
+        assert_eq!(run(&mut v, "escape"), VimAction::EnterNormal);
+        assert_eq!(v.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn normal_mode_enter_delete_backspace() {
+        let mut v = VimState::new();
+        // Enter in normal moves down a line (rgpui semantics).
+        assert_eq!(run(&mut v, "enter"), VimAction::Move(Motion::Down));
+        assert_eq!(run(&mut v, "delete"), VimAction::Delete(DeleteOp::Char));
+        assert_eq!(run(&mut v, "backspace"), VimAction::Move(Motion::Left));
+    }
+
+    #[test]
     fn visual_motions_and_exit() {
         let mut v = VimState::new();
-        run(&mut v, "v");
+        assert_eq!(run(&mut v, "v"), VimAction::EnterVisual);
         assert_eq!(v.mode, VimMode::Visual);
-        assert_eq!(run(&mut v, "l"), VimAction::Dispatch(Motion::Right));
+        assert_eq!(run(&mut v, "l"), VimAction::Move(Motion::Right));
+        assert_eq!(run(&mut v, "y"), VimAction::YankSelection);
+        // Grammar only: mode/anchor flips happen in exec.
         assert_eq!(run(&mut v, "escape"), VimAction::LeaveVisual);
-        v.set_mode(VimMode::Normal);
+        assert_eq!(v.mode, VimMode::Normal);
+        assert_eq!(run(&mut v, "v"), VimAction::EnterVisual);
+        assert_eq!(run(&mut v, "d"), VimAction::DeleteSelection);
+        assert_eq!(run(&mut v, "escape"), VimAction::LeaveVisual);
     }
 
     #[test]
@@ -459,5 +988,22 @@ mod tests {
         run(&mut v, "w");
         assert_eq!(run(&mut v, "escape"), VimAction::Consumed);
         assert_eq!(v.cmdline(), "");
+    }
+
+    #[test]
+    fn word_helpers_cjk_and_lines() {
+        let text: Rope = "foo bar\nbaz".into();
+        assert_eq!(word_forward(&text, 0), 4);
+        assert_eq!(word_forward(&text, 4), 8);
+        assert_eq!(word_backward(&text, 8), 4);
+        assert_eq!(word_backward(&text, 4), 0);
+        assert_eq!(line_range(&text, 0), (0, 7));
+        assert_eq!(line_range(&text, 1), (8, 11));
+        // CJK: char columns, not bytes
+        let cjk: Rope = "你好\n世界".into();
+        assert_eq!(next_char(&cjk, 0), 3);
+        assert_eq!(prev_char(&cjk, 3), 0);
+        assert_eq!(char_offset_in_line(&cjk, 1, 1), 10);
+        assert_eq!(char_col(&cjk, 3), 1);
     }
 }

@@ -40,12 +40,36 @@ pub fn spacing(n: i32) -> Pixels {
 pub const RADIUS_PANEL: f32 = 12.;
 pub const RADIUS_SELECTION: f32 = 8.;
 
-/// Wake blue (Q16): used for selection + actions only.
-pub fn accent() -> Hsla {
-    gpui_kit::rgb(0x3b82f6).into()
+/// Issue 19 Q13: user-selectable accents. "blue" is the ADR-0003 default.
+pub const ACCENTS: &[(&str, u32)] = &[
+    ("blue", 0x3b82f6),
+    ("purple", 0x8b5cf6),
+    ("green", 0x22c55e),
+    ("orange", 0xf97316),
+    ("red", 0xef4444),
+    ("pink", 0xec4899),
+];
+
+static CURRENT_ACCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3b82f6);
+
+/// Set the current accent by id; unknown ids (incl. "") fall back to blue.
+/// Callers re-apply the theme afterwards so derived colors update.
+pub fn set_accent(id: &str) {
+    let hex = ACCENTS
+        .iter()
+        .find(|(k, _)| *k == id)
+        .map(|(_, v)| *v)
+        .unwrap_or(0x3b82f6);
+    CURRENT_ACCENT.store(hex, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Foreground color that stays legible on `accent()`.
+/// The active accent color (Wake blue by default) — selection + actions only.
+pub fn accent() -> Hsla {
+    gpui_kit::rgb(CURRENT_ACCENT.load(std::sync::atomic::Ordering::Relaxed)).into()
+}
+
+/// Foreground color that stays legible on `accent()` (all six are mid-lightness;
+/// white wins for every swatch).
 pub fn accent_foreground() -> Hsla {
     hsla(0., 0., 1., 1.)
 }
@@ -61,17 +85,19 @@ pub fn border(dark: bool) -> Hsla {
 /// Material layer color for a light or dark theme.
 pub fn material(layer: Material, dark: bool) -> Hsla {
     let (h, s) = (222. / 360., 0.);
-    let l = match (layer, dark) {
-        (Material::Base, false) => 0.955,
-        (Material::List, false) => 0.985,
-        (Material::Background, false) => 1.0,
-        (Material::Popover, false) => 1.0,
-        (Material::Base, true) => 0.13,
-        (Material::List, true) => 0.165,
-        (Material::Background, true) => 0.19,
-        (Material::Popover, true) => 0.23,
+    // Issue 19: Base/List stay translucent so the window blur (Blurred
+    // background) shows through; higher layers stay opaque for readability.
+    let (l, a) = match (layer, dark) {
+        (Material::Base, false) => (0.955, 0.85),
+        (Material::List, false) => (0.985, 0.85),
+        (Material::Background, false) => (1.0, 1.),
+        (Material::Popover, false) => (1.0, 1.),
+        (Material::Base, true) => (0.13, 0.72),
+        (Material::List, true) => (0.165, 0.78),
+        (Material::Background, true) => (0.19, 1.),
+        (Material::Popover, true) => (0.23, 1.),
     };
-    hsla(h, s, l, 1.)
+    hsla(h, s, l, a)
 }
 
 pub fn foreground(dark: bool) -> Hsla {

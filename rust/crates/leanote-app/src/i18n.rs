@@ -27,7 +27,7 @@ pub fn system_lang() -> Lang {
 }
 
 macro_rules! keys {
-    ($($key:ident => ($zh:expr, $en:expr)),* $(,)?) => {
+    ($($key:ident => ($zh:literal, $en:literal)),* $(,)?) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub enum Key { $($key),* }
 
@@ -55,7 +55,7 @@ keys! {
     SyncDone => ("同步完成", "Sync complete"),
     SyncFailed => ("同步失败", "Sync failed"),
     // Shell: left nav (ADR-0003).
-    NavAllNotes => ("全部笔记", "All Notes"),
+    NavRecent => ("最近", "Recent"),
     NavStarred => ("星标", "Starred"),
     NavTrash => ("废纸篓", "Trash"),
     NavNotebooks => ("笔记本", "Notebooks"),
@@ -77,7 +77,6 @@ keys! {
     Done => ("完成", "Done"),
     EditorPreview => ("预览", "Preview"),
     EditorSource => ("源码", "Source"),
-    Save => ("保存", "Save"),
     History => ("历史版本", "History"),
     RestoreVersion => ("恢复此版本", "Restore this version"),
     HistoryEmpty => ("暂无历史版本", "No history yet"),
@@ -134,19 +133,48 @@ keys! {
     PaletteWarm => ("暖色", "Warm"),
     PaletteSolarized => ("Solarized", "Solarized"),
     VimOn => ("Vim", "Vim"),
-    VimDefault => ("默认启用 Vim", "Enable Vim by default"),
     AccountInfo => ("账户", "Account"),
     ServerLabel => ("服务器", "Server"),
-    // Issue 17: Vim status line.
-    VimNormal => ("-- NORMAL --", "-- NORMAL --"),
-    VimInsert => ("-- INSERT --", "-- INSERT --"),
-    VimVisual => ("-- VISUAL --", "-- VISUAL --"),
+    SearchNotesAction => ("搜索笔记", "Search notes"),
+    Attachments => ("附件", "Attachments"),
+    AttachmentsEmpty => ("此笔记没有附件", "No attachments"),
+    Download => ("下载", "Download"),
+    DownloadFailed => ("下载失败", "Download failed"),
+    MarkdownHelpTitle => ("Markdown 语法", "Markdown syntax"),
+    Fullscreen => ("全屏", "Fullscreen"),
+    AccentColor => ("强调色", "Accent color"),
+    // MarkdownHelpBody: see `markdown_help_body` (multi-line raw strings).
     // Issue 17: logout confirmation.
     LogoutConfirmTitle => ("退出登录？", "Log out?"),
     LogoutConfirmBody => (
         "退出后将清除本地数据，需要重新登录。",
         "Local data is cleared; you will need to sign in again."
     ),
+}
+
+/// Issue 19: Markdown cheat-sheet (multi-line raw strings — kept out of the
+/// single-line `keys!` table).
+pub fn markdown_help_body(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Zh => {
+            r"# 标题 1  …  ###### 标题 6
+**粗体**  *斜体*  ~~删除线~~
+`行内代码` 与 ``` 代码块
+- 列表 / 1. 有序列表
+> 引用
+[链接](url)  ![图片](url)
+--- 分隔线"
+        }
+        Lang::En => {
+            r"# Heading 1  …  ###### Heading 6
+**bold**  *italic*  ~~strike~~
+`inline code` and ``` fenced block
+- list / 1. ordered
+> quote
+[link](url)  ![image](url)
+--- rule"
+        }
+    }
 }
 
 #[cfg(test)]
@@ -175,8 +203,8 @@ mod tests {
             assert!(!t(Lang::En, *key).is_empty(), "{key:?} en empty");
         }
         // Spot-check a few so a table swap cannot silently pass.
-        assert_eq!(t(Lang::Zh, Key::NavAllNotes), "全部笔记");
-        assert_eq!(t(Lang::En, Key::NavAllNotes), "All Notes");
+        assert_eq!(t(Lang::Zh, Key::NavRecent), "最近");
+        assert_eq!(t(Lang::En, Key::NavRecent), "Recent");
     }
 
     // Exhaustive key list, kept next to the tables so a new key must be added here too.
@@ -195,7 +223,7 @@ mod tests {
         Key::SyncingSubtitle,
         Key::SyncDone,
         Key::SyncFailed,
-        Key::NavAllNotes,
+        Key::NavRecent,
         Key::NavStarred,
         Key::NavTrash,
         Key::NavNotebooks,
@@ -209,7 +237,6 @@ mod tests {
         Key::Done,
         Key::EditorPreview,
         Key::EditorSource,
-        Key::Save,
         Key::History,
         Key::RestoreVersion,
         Key::HistoryEmpty,
@@ -260,12 +287,16 @@ mod tests {
         Key::PaletteDefault,
         Key::PaletteWarm,
         Key::VimOn,
-        Key::VimDefault,
         Key::AccountInfo,
         Key::ServerLabel,
-        Key::VimNormal,
-        Key::VimInsert,
-        Key::VimVisual,
+        Key::SearchNotesAction,
+        Key::Attachments,
+        Key::AttachmentsEmpty,
+        Key::Download,
+        Key::DownloadFailed,
+        Key::MarkdownHelpTitle,
+        Key::Fullscreen,
+        Key::AccentColor,
         Key::LogoutConfirmTitle,
         Key::LogoutConfirmBody,
     ];
