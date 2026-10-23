@@ -66,15 +66,12 @@ pub fn notebook_nodes(
     out
 }
 
-/// Middle-list row meta: notebook name, joined tags, updated date.
-/// Parts skip when empty; at least the date survives.
-pub fn note_meta(notebook: &str, tags: &[String], updated_ms: i64) -> String {
+/// Middle-list row meta: notebook name + updated date. Tags are dropped —
+/// long tag lists pushed the date off the truncated line.
+pub fn note_meta(notebook: &str, updated_ms: i64) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !notebook.is_empty() {
         parts.push(notebook.to_string());
-    }
-    if !tags.is_empty() {
-        parts.push(tags.join(", "));
     }
     parts.push(crate::app_shell::fmt_time(updated_ms));
     parts.join(" · ")
@@ -169,13 +166,9 @@ mod tests {
 
     #[test]
     fn note_meta_joins_present_parts() {
-        let all = note_meta("Work", &["rust".into(), "gpui".into()], 1_765_235_200_000);
-        assert_eq!(all, "Work · rust, gpui · 2025-12-08");
-        assert_eq!(note_meta("", &[], 1_765_235_200_000), "2025-12-08");
-        assert_eq!(
-            note_meta("", &["design".into()], 1_765_235_200_000),
-            "design · 2025-12-08"
-        );
+        let all = note_meta("Work", 1_765_235_200_000);
+        assert_eq!(all, "Work · 2025-12-08");
+        assert_eq!(note_meta("", 1_765_235_200_000), "2025-12-08");
     }
 
     #[test]

@@ -37,9 +37,9 @@ const MID_W: f32 = 336.;
 /// Issue 18: drag ranges for the left/middle panes.
 const LEFT_RANGE: (f32, f32) = (180., 400.);
 const MID_RANGE: (f32, f32) = (240., 600.);
-/// Issue 18: uniform note-row height — 2-line title (19px each) + meta line
-/// (16px) + py_2 padding (16px) + gap_1 (4px).
-const NOTE_ROW_H: f32 = 96.;
+/// Issue 18: uniform note-row height — py 4 + title 19 + meta 20 + excerpt
+/// 20 + 2× 1px gaps = 65px.
+const NOTE_ROW_H: f32 = 65.;
 /// macOS transparent titlebar height, same material as the sidebar.
 const TITLEBAR_H: f32 = 44.;
 
@@ -182,13 +182,6 @@ pub struct AppShell {
     history_open: bool,
     /// Which history row is previewed (None = list view).
     history_preview: Option<leanote_core::Id>,
-    // --- Issue 19 middle-column search box ---
-    /// Filter input entity for the note list (None until first render).
-    list_filter: Option<gpui_kit::Entity<InputState>>,
-    /// Committed filter text (title + desc substring match).
-    list_query: String,
-    /// Debounced filter task.
-    list_filter_task: Option<Task<()>>,
     /// List caches — invalidated by invalidate_lists() on any mutation
     /// (select/sync/save/nav edit/...). Avoids re-querying the DB every frame.
     cached_notebook_nodes: Option<Vec<NavNode>>,
@@ -313,9 +306,6 @@ impl AppShell {
             search_rows: Vec::new(),
             search_query: String::new(),
             search_task: None,
-            list_filter: None,
-            list_query: String::new(),
-            list_filter_task: None,
             converted_note: None,
             nav_edit: None,
             editing: None,
@@ -1103,17 +1093,6 @@ impl AppShell {
         }));
     }
 
-    /// Issue 19: middle-column search box debounce (150ms, newest wins).
-    fn queue_list_filter(&mut self, query: String, cx: &mut gpui_kit::Context<Self>) {
-        self.list_query = query;
-        self.list_filter_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(150))
-                .await;
-            let _ = this.update(cx, |_shell, cx| cx.notify());
-        }));
-    }
-
     /// ↩ on a row: open the note in the editor (`selected` drives it), then
     /// close the overlay. The middle list keeps its filter/nav untouched.
     /// Issue 17 Q6: with an empty query, section 1 = recents (section 0 is
@@ -1527,8 +1506,10 @@ impl AppShell {
 
 /// One note entry for the virtualized middle list. Issue 18: fixed row
 /// height so every row (and thus its selection band) is identical —
-/// uniform_list is an equal-height model. Title wraps up to 2 lines then
-/// ellipsizes; meta is one truncated line.
+/// uniform_list is an equal-height model. Title is one truncated line;
+/// meta and excerpt likewise (compact rows, see NOTE_ROW_H).
+/// Horizontal inset: the row pads itself 5px (selection-band breathing
+/// room); the column adds its own padding on top.
 /// `shell` (weak) routes the click to select_note — uniform_list closures
 /// only get `&mut App`, not the view context.
 fn note_list_row(
@@ -1551,10 +1532,15 @@ fn note_list_row(
         .id(n.note_id.to_string())
         .h(px(NOTE_ROW_H))
         .w_full()
-        .px_2()
-        .py_2()
-        .gap_1()
-        .justify_between()
+        // px(), not py_1_5()/gap_0p5(): those are rem units (0.375/0.125 rem)
+        // and uniform_list's measure_item lays the item out as root without
+        // the shell's rem context — the resolved padding inflates ~4x
+        // (measured 25px/side) and the row grows 75 -> 125px, leaving a
+        // blank block under the text. Absolute px pins the row at
+        // NOTE_ROW_H.
+        .justify_center()
+        .gap(px(1.))
+        .px(px(5.))
         .rounded(px(theme::RADIUS_SELECTION))
         .when(is_sel, |el| el.bg(theme::accent()))
         .on_click(move |_ev, window, cx| {
@@ -1565,16 +1551,17 @@ fn note_list_row(
         .context_menu({
             let shell = shell_menu;
             let id = id_menu;
+            let starred = n.star;
             let lang = crate::i18n::system_lang();
-            move |menu, _window, _cx| note_row_menu(menu, &shell, &id, lang)
+            move |menu, _window, _cx| note_row_menu(menu, &shell, &id, lang, starred)
         })
         .child(
-            // Title block: 2 wrapped lines max, then ellipsis. The star
-            // rides in the corner without stealing title width.
+            // Title block: one truncated line. The star rides in the
+            // corner without stealing title width.
             gpui_kit::base::h_flex()
                 .gap_1()
                 .child(
-                    gpui_kit::div().flex_1().min_w_0().line_clamp(2).child(
+                    gpui_kit::div().flex_1().min_w_0().truncate().child(
                         Label::new(n.title.clone())
                             .text_size(px(14.))
                             .line_height(px(19.))
@@ -1593,12 +1580,17 @@ fn note_list_row(
         .child(
             gpui_kit::div()
                 .truncate()
+                .flex_shrink_0()
                 .child(small_label(meta, row_muted)),
         )
         .child(
             // Issue 19: content excerpt — single truncated line.
+            // truncate() alone shrinks to 0 height in a column flex
+            // (overflow_hidden divs measure 0 under compression) —
+            // flex_shrink_0 keeps the line's natural 20px.
             gpui_kit::div()
                 .truncate()
+                .flex_shrink_0()
                 .child(small_label(desc, row_muted)),
         )
 }
@@ -1611,6 +1603,7 @@ fn note_row_menu(
     shell: &gpui_kit::WeakEntity<AppShell>,
     id: &leanote_core::Id,
     lang: Lang,
+    starred: bool,
 ) -> gpui_kit::component::menu::PopupMenu {
     let shell_mv = shell.clone();
     let shell_del = shell.clone();
@@ -1636,11 +1629,14 @@ fn note_row_menu(
     )
     .separator()
     .item(
-        PopupMenuItem::new(i18n::t(lang, i18n::Key::ToggleStar)).on_click(
-            move |_ev, _window, cx| {
-                let _ = shell_star.update(cx, |this, cx| this.toggle_star(id_star.clone(), cx));
-            },
-        ),
+        PopupMenuItem::new(if starred {
+            i18n::t(lang, i18n::Key::UnstarNote)
+        } else {
+            i18n::t(lang, i18n::Key::StarNote)
+        })
+        .on_click(move |_ev, _window, cx| {
+            let _ = shell_star.update(cx, |this, cx| this.toggle_star(id_star.clone(), cx));
+        }),
     )
     .item(
         PopupMenuItem::new(i18n::t(lang, i18n::Key::ExportHtml)).on_click(
@@ -3509,27 +3505,14 @@ impl AppShell {
         &mut self,
         dark: bool,
         t: &dyn Fn(i18n::Key) -> &'static str,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) -> gpui_kit::Div {
         let fg = theme::foreground(dark);
         let muted = theme::muted_foreground(dark);
         let sel_fg = theme::accent_foreground();
         let notebook_names = self.notebook_names().clone();
-        let all_notes = self.visible_notes().clone();
-        // Issue 19: search box filters by title+desc substring.
-        let q = self.list_query.to_lowercase();
-        let notes: Vec<_> = if q.is_empty() {
-            all_notes
-        } else {
-            all_notes
-                .into_iter()
-                .filter(|n| {
-                    n.title.to_lowercase().contains(&q) || n.desc.to_lowercase().contains(&q)
-                })
-                .collect()
-        };
-        let count = notes.len();
+        let notes = self.visible_notes().clone();
         let title: std::borrow::Cow<str> = match &self.nav {
             NavSelection::Recent => t(i18n::Key::NavRecent).into(),
             NavSelection::Starred => t(i18n::Key::NavStarred).into(),
@@ -3541,15 +3524,24 @@ impl AppShell {
                 .into(),
             NavSelection::Tag(tag) => tag.as_str().into(),
         };
+        // Mirrors the left nav row: same icon + 14px label + muted icon
+        // color (user round: header should read as the selected nav row).
+        let icon = match &self.nav {
+            NavSelection::Recent => Some(AssetIcon::BookOpen),
+            NavSelection::Starred => Some(AssetIcon::Star),
+            NavSelection::Trash => Some(AssetIcon::Delete),
+            NavSelection::Notebook(_) => Some(AssetIcon::FolderClosed),
+            NavSelection::Tag(_) => Some(AssetIcon::Tag),
+        };
 
         // Trash view has no new-note; every other context does (ticket 10).
         let mut header = gpui_kit::base::h_flex()
             .gap_2()
-            .child(
-                Label::new(format!("{} · {}", title, count))
-                    .text_size(px(16.))
-                    .text_color(fg),
-            )
+            .pl(px(4.))
+            .when_some(icon, |el, icon| {
+                el.child(Icon::new(icon).small().text_color(muted))
+            })
+            .child(Label::new(title.clone()).text_size(px(14.)).text_color(fg))
             .child(gpui_kit::base::h_flex().flex_1());
         if self.nav != NavSelection::Trash {
             header = header.child(
@@ -3560,22 +3552,6 @@ impl AppShell {
             );
         }
 
-        // Issue 19: search box under the header — filters the current list
-        // (150ms debounce, ↩ jumps to the first hit).
-        if self.list_filter.is_none() {
-            let input = cx
-                .new(|cx| InputState::new(window, cx).placeholder(t(i18n::Key::SearchNotesAction)));
-            cx.subscribe(&input, |this, state, ev: &InputEvent, cx| {
-                if matches!(ev, InputEvent::Change) {
-                    let q = state.read(cx).value().to_string();
-                    this.queue_list_filter(q, cx);
-                }
-            })
-            .detach();
-            self.list_filter = Some(input);
-        }
-        let filter_entity = self.list_filter.clone().unwrap();
-
         let mut list = gpui_kit::base::v_flex()
             .w_full()
             .h_full()
@@ -3584,29 +3560,10 @@ impl AppShell {
             // region is the left nav's 44px header only).
             .px_3()
             .gap_1()
-            // Issue 19: top pad clears the transparent titlebar strip.
-            .pt(px(44.))
-            .child(header)
-            .child(
-                gpui_kit::div()
-                    .id("list-filter")
-                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                        if ev.keystroke.key == "enter" {
-                            let notes = this.visible_notes();
-                            if let Some(n) = notes.first() {
-                                let id = n.note_id.clone();
-                                this.select_note(id, window, cx);
-                            }
-                        }
-                    }))
-                    .child(
-                        Input::new(&filter_entity)
-                            .appearance(true)
-                            .bordered(true)
-                            .h_8()
-                            .small(),
-                    ),
-            );
+            // UI round: 10px from the window top — only the left nav yields
+            // to the traffic lights; this column needs no titlebar clearance.
+            .pt(px(10.))
+            .child(header);
 
         if notes.is_empty() {
             list = list.child(small_label(t(i18n::Key::EmptyNotes), muted));
@@ -3634,7 +3591,6 @@ impl AppShell {
                                             .get(&n.notebook_id.to_string())
                                             .map(|s| s.as_str())
                                             .unwrap_or(""),
-                                        &n.tags,
                                         n.updated_time,
                                     );
                                     // Issue 19: content excerpt (store-side
@@ -3723,6 +3679,7 @@ impl AppShell {
                 .bg(theme::material(Material::List, dark))
                 .px_3()
                 .gap_1()
+                .pt(px(10.))
                 .child(picker);
         }
         list
@@ -3896,7 +3853,7 @@ impl AppShell {
                 gpui_kit::base::h_flex()
                     .gap_2()
                     .child(small_label(
-                        browse::note_meta(&nb_name, &n.tags, n.updated_time),
+                        browse::note_meta(&nb_name, n.updated_time),
                         muted,
                     ))
                     .child(gpui_kit::base::h_flex().flex_1()),
@@ -4289,6 +4246,7 @@ mod tests {
     /// End-to-end vim pipeline check: real AppShell view rendered in a test
     /// window, keystrokes dispatched through the full gpui pipeline (bindings
     /// → actions → key listeners), asserting against the real editor buffer.
+
     #[gpui_kit::test]
     fn vim_pipeline_moves_cursor_and_inserts(cx: &mut gpui_kit::TestAppContext) {
         let dir = std::env::temp_dir().join(format!("leanote-vimtest-{}", std::process::id()));
