@@ -30,7 +30,7 @@
 
 ## 存储与文件
 
-- **存储层 (Store)** — 本地持久化。现实现为 NeDB JSONL 文件（`~/Library/Application Support/leanote/nedb55/`）；Rust 版换用新本地存储，**不迁移旧缓存**，重登录后全量同步重建（ADR-0002）。
+- **存储层 (Store)** — 本地持久化。Rust 版实现为 SQLite（`~/Library/Application Support/leanote/leanote.db`；win `%APPDATA%\leanote`、linux `~/.config/leanote`，可用 `LEANOTE_DATA` 覆盖），与 Electron 遗留 NeDB（同 mac 目录的 `nedb55/` 子树）永不互读写；不迁移旧缓存，重登录后全量同步重建（ADR-0002、ADR-0008）。
 - **附件 (Attachment)** — 笔记内图片/文件的服务器对象（`file/getImage`、`file/getAttach`）；本地 `attachs.db` 为下载缓存。当前语料 0 附件，Rust 版将其列为显式缺口而非隐式删除。
 
 ## 布局与界面（Rust 版）

@@ -1,5 +1,8 @@
 //! leanote-app: GPUI desktop shell (login → full sync → three-pane reader).
 
+// No console window on Windows GUI.
+#![windows_subsystem = "windows"]
+
 mod app_shell;
 mod browse;
 mod conflict_bar;
@@ -21,9 +24,9 @@ use gpui_kit::component::Theme;
 use gpui_kit::{px, AppContext as _, TitlebarOptions, WindowOptions};
 use std::path::PathBuf;
 
-/// `LEANOTE_RUST_DATA` wins (CLI convention); else the core default.
+/// `LEANOTE_DATA` wins (CLI convention); else the core default.
 fn data_dir() -> PathBuf {
-    std::env::var_os("LEANOTE_RUST_DATA")
+    std::env::var_os("LEANOTE_DATA")
         .map(PathBuf::from)
         .unwrap_or_else(leanote_core::app_data_dir)
 }

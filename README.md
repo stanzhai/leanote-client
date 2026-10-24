@@ -41,23 +41,27 @@ $> npm run dev
 
 ```sh
 cd rust
-cargo build --release            # 产出 target/release/leanote-app（GUI）与 leanote（CLI）
+cargo build --release            # 产出 target/release/Leanote（GUI）与 leanote（CLI）
 cargo test                       # 全工作区测试（145 个）
-./target/release/leanote-app     # 直接运行桌面端
+./target/release/Leanote         # 直接运行桌面端
 
 # 冒烟（假服务器 + 自动登录，无需真实账号）：
-LEANOTE_RUST_DATA=/tmp/smoke LEANOTE_FAKE_SERVER=1 LEANOTE_FAKE_AUTOSUBMIT=1 ./target/release/leanote-app
+LEANOTE_DATA=/tmp/smoke LEANOTE_FAKE_SERVER=1 LEANOTE_FAKE_AUTOSUBMIT=1 ./target/release/Leanote
 ```
 
-数据目录：`~/Library/Application Support/leanote-rust/`（可用 `LEANOTE_RUST_DATA` 覆盖），与 Electron 版的 NeDB 数据完全隔离。日志：`<数据目录>/logs/app.log`；`LEANOTE_MCP_DEBUG=1` 时追加 `~/leanote_mcp.log`（与 JS 版一致）。
+数据目录：`~/Library/Application Support/leanote/`（win `%APPDATA%\leanote`、linux `~/.config/leanote`，可用 `LEANOTE_DATA` 覆盖）；与 Electron 遗留 NeDB（`nedb55/`）同目录共存但永不互读写（ADR-0008）。日志：`<数据目录>/logs/app.log`；`LEANOTE_MCP_DEBUG=1` 时追加 `~/leanote_mcp.log`（与 JS 版一致）。
 
-### 打包（macOS）
+### 打包
 
 ```sh
-sh rust/scripts/package-macos.sh        # 默认输出 ../dist（相对 rust/）
+sh rust/scripts/package-macos.sh aarch64            # 本机架构；x86_64 同理
+sh rust/scripts/package-linux.sh x86_64             # 需 dpkg-deb + patchelf
+powershell rust/scripts/package-windows.ps1 -Arch x64   # 需 makensis (NSIS)
 ```
 
-产出 `dist/Leanote.app`（GUI + CLI 双二进制、`icon.icns`、ad-hoc 签名）、`dist/Leanote.dmg`（hdiutil），并把 `~/bin/leanote` 指向包内 CLI。Linux/Windows 暂无打包脚本，见 `rust/README.md` 平台说明。
+产出 `dist/Leanote_<ver>_<os>_<arch>.{dmg,AppImage,deb,exe,zip}`。GUI 二进制名 `Leanote`，CLI 随包（mac `.app` 内为 `leanote-cli`，win 在 `bin\leanote.exe` 可选加 PATH，linux `/usr/bin/leanote`）。图标源 `build/icon.png`，经 `rust/scripts/gen-icons.sh` 再生成入库。
+
+推 `v*` tag 触发 `.github/workflows/release.yml`：6 目标（mac/win/linux × x64/arm64）并行构建，产物自动附到 GitHub Release。
 
 验收脚本：`sh rust/scripts/acceptance-macos.sh`（CLI/HTTP/MCP/日志/打包产物，15 项）。
 

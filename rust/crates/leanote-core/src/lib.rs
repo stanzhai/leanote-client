@@ -2,8 +2,8 @@
 //!
 //! Wire/storage field names are PascalCase exactly as the existing JS
 //! (see src/sync.js, src/note.js — those are the authority).
-//! New SQLite store at `~/Library/Application Support/leanote-rust/` —
-//! NEVER reads/writes the Electron NeDB dir (ADR-0002).
+//! SQLite store at `~/Library/Application Support/leanote/leanote.db` (see
+//! ADR-0008: succeeds the Electron app; its NeDB `nedb55/` is never read).
 
 use std::fmt;
 use std::path::PathBuf;
@@ -199,17 +199,34 @@ pub(crate) const NOTES_LIVE_BASE: &str =
     IsMarkdown, IsTrash, IsDirty, LocalIsNew, LocalIsDelete, IsBlog, Star, CreatedTime, UpdatedTime
  FROM notes WHERE IsTrash=0 AND LocalIsDelete=0 AND IsDeleted=0";
 
-/// Rust app data dir; MUST differ from Electron's
-/// `~/Library/Application Support/leanote/` (which contains NeDB `nedb55/`).
+/// App data dir, now `leanote` on every platform (ADR-0008: the Rust client
+/// is a fresh app that succeeds the Electron one; the Electron NeDB store
+/// under the same macOS dir is legacy and never touched — different files,
+/// `leanote.db` vs `nedb55/`). No migration from the old `leanote-rust` dir.
 pub fn app_data_dir() -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME");
-    #[cfg(target_os = "macos")]
-    return PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("leanote-rust");
-    #[cfg(not(target_os = "macos"))]
-    return PathBuf::from(home).join(".config").join("leanote-rust");
+    // Windows: %APPDATA%\leanote (HOME is usually unset there — the old
+    // `var("HOME").expect()` would panic). Linux: XDG_CONFIG_HOME or
+    // ~/.config. macOS: ~/Library/Application Support.
+    let base = if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::var_os("HOME").expect("APPDATA or HOME").into())
+    } else {
+        match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(x) if !x.is_empty() => PathBuf::from(x),
+            _ => {
+                let home = std::env::var_os("HOME").expect("HOME");
+                if cfg!(target_os = "macos") {
+                    PathBuf::from(home)
+                        .join("Library")
+                        .join("Application Support")
+                } else {
+                    PathBuf::from(home).join(".config")
+                }
+            }
+        }
+    };
+    base.join("leanote")
 }
 
 pub struct Store {
@@ -222,7 +239,7 @@ impl Store {
         Self::open(app_data_dir(), default_user_id())
     }
 
-    /// `dir` is the app data dir (e.g. `.../leanote-rust`); the SQLite file
+    /// `dir` is the app data dir (e.g. `.../leanote`); the SQLite file
     /// lives directly inside it.
     pub fn open(dir: PathBuf, user_id: String) -> rusqlite::Result<Self> {
         std::fs::create_dir_all(&dir)

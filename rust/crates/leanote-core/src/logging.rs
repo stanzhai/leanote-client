@@ -8,8 +8,8 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 
 /// Rotate when the live file exceeds this. 2MB keeps ~3 files under 8MB.
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
@@ -25,10 +25,10 @@ static LOG_DIR: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 });
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
-/// `LEANOTE_RUST_DATA` wins (same convention as the store), else the
+/// `LEANOTE_DATA` wins (same convention as the store), else the
 /// platform app data dir.
 fn data_dir_override() -> Option<PathBuf> {
-    std::env::var_os("LEANOTE_RUST_DATA").map(PathBuf::from)
+    std::env::var_os("LEANOTE_DATA").map(PathBuf::from)
 }
 
 /// Memoized `<dir>/logs`. `None` → logging disabled (dir un-probeable).
@@ -36,7 +36,7 @@ fn log_dir() -> Option<&'static PathBuf> {
     LOG_DIR.as_ref()
 }
 
-/// `logs/app.log` under the app data dir (or `LEANOTE_RUST_DATA`).
+/// `logs/app.log` under the app data dir (or `LEANOTE_DATA`).
 pub fn log_path() -> Option<PathBuf> {
     log_dir().map(|d| d.join("app.log"))
 }
@@ -54,9 +54,17 @@ fn stamp() -> String {
         }
         #[repr(C)]
         struct Tm {
-            tm_sec: i32, tm_min: i32, tm_hour: i32, tm_mday: i32,
-            tm_mon: i32, tm_year: i32, tm_wday: i32, tm_yday: i32, tm_isdst: i32,
-            tm_gmtoff: i64, tm_zone: *const i8,
+            tm_sec: i32,
+            tm_min: i32,
+            tm_hour: i32,
+            tm_mday: i32,
+            tm_mon: i32,
+            tm_year: i32,
+            tm_wday: i32,
+            tm_yday: i32,
+            tm_isdst: i32,
+            tm_gmtoff: i64,
+            tm_zone: *const i8,
         }
         let p = localtime(&t);
         if p.is_null() {
@@ -65,8 +73,12 @@ fn stamp() -> String {
         let tm = &*p;
         format!(
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-            tm.tm_hour, tm.tm_min, tm.tm_sec
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
         )
     }
 }
@@ -76,7 +88,10 @@ fn append(tag: &str, msg: &str) {
     let Some(dir) = log_dir() else { return };
     let path = dir.join("app.log");
     let _guard = WRITE_LOCK.lock();
-    if std::fs::metadata(&path).map(|m| m.len() > MAX_BYTES).unwrap_or(false) {
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > MAX_BYTES)
+        .unwrap_or(false)
+    {
         // app.log.(N-1) → app.log.N, newest last; drop the oldest first.
         for n in (1..ROTATIONS).rev() {
             let _ = std::fs::rename(
@@ -112,14 +127,21 @@ mod tests {
 
     #[test]
     fn rotation_caps_files() {
-        // LOG_DIR binds to LEANOTE_RUST_DATA at first use and test order
+        // LOG_DIR binds to LEANOTE_DATA at first use and test order
         // within a binary is undefined → run the real check in a child
         // process so this binary's global state stays untouched.
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("logging::tests::rotation_child")
             .env("LEANOTE_ROTATION_CHILD", "1")
-            .env("LEANOTE_RUST_DATA", std::env::temp_dir().join("nonexistent-leanote-log").join("leanote.db").parent().unwrap())
+            .env(
+                "LEANOTE_DATA",
+                std::env::temp_dir()
+                    .join("nonexistent-leanote-log")
+                    .join("leanote.db")
+                    .parent()
+                    .unwrap(),
+            )
             .output()
             .expect("spawn child");
         assert!(
@@ -135,7 +157,7 @@ mod tests {
         if std::env::var_os("LEANOTE_ROTATION_CHILD").is_none() {
             return;
         }
-        let dir = data_dir_override().expect("LEANOTE_RUST_DATA set by parent");
+        let dir = data_dir_override().expect("LEANOTE_DATA set by parent");
         let path = dir.join("logs").join("app.log");
         let _ = std::fs::create_dir_all(path.parent().unwrap());
         // Seed a live file over cap → the next write rotates.

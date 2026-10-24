@@ -1,32 +1,36 @@
 #!/bin/sh
-# Package leanote-rust for macOS (ticket 16): .app bundle + .dmg.
+# Package Leanote for macOS: arch-specific .app + .dmg.
 #
-# Usage: rust/scripts/package-macos.sh [output-dir]
-#   - builds the release binaries (leanote CLI + leanote-app GUI)
-#   - assembles Leanote.app (Info.plist + icon.icns + both binaries)
-#   - writes a .dmg via hdiutil
+# Usage: package-macos.sh <arch> [output-dir] [version]
+#   arch    aarch64 | x86_64 (build target triple suffix)
+#   version defaults to Cargo.toml workspace version
 #
-# The CLI binary lives inside the .app so `~/bin/leanote` (rewritten by the
-# first CLI run, or manually below) points at the packaged binary and keeps
-# working when target/ is cleaned.
-
+# Env override for CI: VERSION (3rd arg wins), used for release naming.
+# The GUI exe is `Leanote`; the CLI ships as `leanote-cli` because the
+# default APFS/NTFS volumes are case-insensitive (`Leanote` == `leanote`).
+# ~/bin/leanote shim points at the packaged CLI.
 set -eu
 
+ARCH=${1:?usage: package-macos.sh <aarch64|x86_64> [output-dir] [version]}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-OUT=${1:-"$ROOT/dist"}
+OUT=${2:-"$ROOT/dist"}
+VERSION=${3:-$(grep -A1 '^version' "$ROOT/rust/Cargo.toml" | grep -m1 '"' | sed 's/.*"\(.*\)".*/\1/')}
+TARGET="$ARCH-apple-darwin"
 APP_NAME=Leanote
-BUNDLE_ID=site.stanzhai.leanote-rust
+BUNDLE_ID=site.stanzhai.leanote
 APP="$OUT/$APP_NAME.app"
-VERSION=$(grep -m1 '^version' "$ROOT/rust/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+DMG="$OUT/Leanote_${VERSION}_macos_${ARCH}.dmg"
 
-echo "==> cargo build --release"
-(cd "$ROOT/rust" && cargo build --release --workspace)
+echo "==> cargo build --release --target $TARGET"
+(cd "$ROOT/rust" && cargo build --release --workspace --target "$TARGET")
 
+BIN_DIR="$ROOT/rust/target/$TARGET/release"
 echo "==> assembling $APP"
+rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$ROOT/rust/target/release/leanote-app" "$APP/Contents/MacOS/$APP_NAME"
-cp "$ROOT/rust/target/release/leanote" "$APP/Contents/MacOS/leanote"
-cp "$ROOT/icon.icns" "$APP/Contents/Resources/app.icns"
+cp "$BIN_DIR/Leanote"     "$APP/Contents/MacOS/$APP_NAME"
+cp "$BIN_DIR/leanote-cli" "$APP/Contents/MacOS/leanote-cli"
+cp "$ROOT/rust/packaging/icon.icns" "$APP/Contents/Resources/app.icns"
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -51,18 +55,17 @@ EOF
 # Gatekeeper-friendly quarantine-free local build: ad-hoc codesign.
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "    (codesign skipped)"
 
-echo "==> $OUT/$APP_NAME.dmg"
-DMG="$OUT/$APP_NAME.dmg"
+echo "==> $DMG"
 rm -f "$DMG"
 hdiutil create -volname "$APP_NAME" -srcfolder "$APP" -ov -format UDZO "$DMG" >/dev/null
 
-echo "==> pointing ~/bin/leanote at the packaged binary"
-SHIM="$HOME/bin/leanote"
-mkdir -p "$HOME/bin"
-printf '#!/bin/sh\nexec "%s/Contents/MacOS/leanote" "$@"\n' "$APP" > "$SHIM"
-chmod +x "$SHIM"
+# Local convenience only (not part of CI output): point the shim at the
+# packaged CLI so `leanote` keeps working after target/ cleanups.
+if [ -d "$HOME/bin" ] && [ "${LEANOTE_SKIP_SHIM:-0}" != "1" ]; then
+  printf '#!/bin/sh\nexec "%s/Contents/MacOS/leanote-cli" "$@"\n' "$APP" > "$HOME/bin/leanote"
+  chmod +x "$HOME/bin/leanote"
+fi
 
 echo "done:"
 echo "  $APP"
 echo "  $DMG"
-echo "  $SHIM -> $APP/Contents/MacOS/leanote"

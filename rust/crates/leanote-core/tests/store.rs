@@ -9,7 +9,11 @@ fn tmpdir(name: &str) -> PathBuf {
 
 fn tmpdir_live(name: &str) -> PathBuf {
     // keep-on-drop variant for tests that reopen the db file directly
-    let d = std::env::temp_dir().join(format!("leanote-core-testlive-{}-{}", name, std::process::id()));
+    let d = std::env::temp_dir().join(format!(
+        "leanote-core-testlive-{}-{}",
+        name,
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -105,8 +109,16 @@ fn prefix_ambiguous_reports_ambiguous() {
     add(&s, "one", "c", &[], "AI札");
     add(&s, "two", "c", &[], "AI札");
     let c = rusqlite::Connection::open(dir.join("leanote.db")).unwrap();
-    c.execute("UPDATE notes SET NoteId='dddd11111111111111111111' WHERE rowid=1", []).unwrap();
-    c.execute("UPDATE notes SET NoteId='dddd22111111111111111111' WHERE rowid=2", []).unwrap();
+    c.execute(
+        "UPDATE notes SET NoteId='dddd11111111111111111111' WHERE rowid=1",
+        [],
+    )
+    .unwrap();
+    c.execute(
+        "UPDATE notes SET NoteId='dddd22111111111111111111' WHERE rowid=2",
+        [],
+    )
+    .unwrap();
     drop(c);
     match s.resolve_prefix("dddd").unwrap() {
         Ok(_) => panic!("expected ambiguity"),
@@ -116,13 +128,16 @@ fn prefix_ambiguous_reports_ambiguous() {
 }
 
 #[test]
-fn store_path_differs_from_electron_nedb_dir() {
+fn store_path_is_leanote_and_never_touches_nedb() {
+    // ADR-0008: data dir is `leanote` on every platform (same dir as the
+    // legacy Electron app on macOS); the NeDB `nedb55/` subtree is never
+    // read or written.
     let d = app_data_dir();
     let s = d.to_string_lossy();
-    assert!(s.ends_with("leanote-rust"), "store dir {} must be leanote-rust", s);
-    assert!(!s.ends_with("leanote/"), "must not be the Electron dir");
+    assert!(s.ends_with("leanote"), "store dir {} must be leanote", s);
+    assert!(!s.contains("leanote-rust"), "no legacy leanote-rust dir");
     assert!(!s.contains("nedb55"), "must never touch NeDB files");
-    // and the actual file we write is SQLite, not .db JSONL of NeDB
+    // and the actual file we write is SQLite, not NeDB JSONL
     let f = d.join(DB_FILE);
     assert_eq!(f.file_name().unwrap(), "leanote.db");
 }
@@ -171,7 +186,12 @@ fn trash_and_deleted_notes_are_hidden() {
     c.execute("INSERT INTO notes (NoteId, UserId, NotebookId, Title, IsTrash) VALUES ('t1','user1','x','trashed',1)", []).unwrap();
     c.execute("INSERT INTO notes (NoteId, UserId, NotebookId, Title, LocalIsDelete) VALUES ('d1','user1','x','deleted',1)", []).unwrap();
     drop(c);
-    let titles: Vec<String> = s.list_notes().unwrap().into_iter().map(|n| n.title).collect();
+    let titles: Vec<String> = s
+        .list_notes()
+        .unwrap()
+        .into_iter()
+        .map(|n| n.title)
+        .collect();
     assert_eq!(titles, vec!["visible".to_string()]);
 }
 
@@ -190,7 +210,10 @@ fn convert_to_markdown_rewrites_content_flags_dirty() {
     // simulate a synced clean row, as it would arrive after full_sync
     s.note_set_not_dirty_not_delete(&n.note_id).unwrap();
 
-    let out = s.convert_to_markdown(&n.note_id).unwrap().expect("converted");
+    let out = s
+        .convert_to_markdown(&n.note_id)
+        .unwrap()
+        .expect("converted");
     assert!(out.is_markdown);
     assert!(out.is_dirty);
     assert_eq!(out.title, "rich");
@@ -215,7 +238,12 @@ fn filtered_queries_return_right_sets() {
     let b = add(&s, "B", "c", &["rust", "gpui"], "Work");
     add(&s, "C", "c", &["design"], "Work");
     // newest-first ordering (B then A, by UpdatedTime tie → rowid)
-    let all: Vec<String> = s.list_notes().unwrap().into_iter().map(|n| n.title).collect();
+    let all: Vec<String> = s
+        .list_notes()
+        .unwrap()
+        .into_iter()
+        .map(|n| n.title)
+        .collect();
     assert_eq!(all, vec!["C", "B", "A"]);
     let work: Vec<String> = s
         .list_notes_filtered(Some(&b.notebook_id), false)
@@ -233,10 +261,20 @@ fn filtered_queries_return_right_sets() {
         .collect();
     assert_eq!(inbox, vec!["A"]);
     // tag matches whole tags only
-    let rust: Vec<String> = s.list_notes_by_tag("rust").unwrap().into_iter().map(|n| n.title).collect();
+    let rust: Vec<String> = s
+        .list_notes_by_tag("rust")
+        .unwrap()
+        .into_iter()
+        .map(|n| n.title)
+        .collect();
     assert_eq!(rust, vec!["B", "A"]);
     assert!(s.list_notes_by_tag("ru").unwrap().is_empty());
-    let gpui: Vec<String> = s.list_notes_by_tag("gpui").unwrap().into_iter().map(|n| n.title).collect();
+    let gpui: Vec<String> = s
+        .list_notes_by_tag("gpui")
+        .unwrap()
+        .into_iter()
+        .map(|n| n.title)
+        .collect();
     assert_eq!(gpui, vec!["B"]);
 }
 
@@ -263,7 +301,10 @@ fn toggle_star_flips_star_without_setting_isdirty() {
     assert!(to, "first toggle stars");
     let after = s.get_note_any(&n.note_id).unwrap().unwrap();
     assert!(after.star);
-    assert!(!after.is_dirty, "JS Note.star sets Star+UpdatedTime only, never IsDirty");
+    assert!(
+        !after.is_dirty,
+        "JS Note.star sets Star+UpdatedTime only, never IsDirty"
+    );
     let to2 = s.toggle_star(&n.note_id).unwrap().unwrap();
     assert!(!to2, "second toggle unstars");
     let after2 = s.get_note_any(&n.note_id).unwrap().unwrap();
@@ -287,18 +328,34 @@ fn trash_restore_hard_delete_and_empty() {
     let keep = add(&s, "keep", "c", &[], "Inbox");
     let t1 = add(&s, "t1", "c", &[], "Inbox");
     let t2 = add(&s, "t2", "c", &[], "Work");
-    let work_nb = s.notebooks().unwrap().into_iter().find(|nb| nb.title == "Work").unwrap();
+    let work_nb = s
+        .notebooks()
+        .unwrap()
+        .into_iter()
+        .find(|nb| nb.title == "Work")
+        .unwrap();
     // trash two
     s.trash_note(&t1.note_id).unwrap();
     s.trash_note(&t2.note_id).unwrap();
-    let trash: Vec<String> = s.list_trash().unwrap().into_iter().map(|n| n.title).collect();
+    let trash: Vec<String> = s
+        .list_trash()
+        .unwrap()
+        .into_iter()
+        .map(|n| n.title)
+        .collect();
     assert_eq!(trash.len(), 2);
     assert!(s.list_notes().unwrap().iter().all(|n| n.title == "keep"));
     // restore t2 back into its original notebook
-    assert_eq!(s.restore_note(&t2.note_id, &work_nb.notebook_id).unwrap(), 1);
+    assert_eq!(
+        s.restore_note(&t2.note_id, &work_nb.notebook_id).unwrap(),
+        1
+    );
     let t2b = s.get_note_any(&t2.note_id).unwrap().unwrap();
     assert!(!t2b.is_trash && !t2b.is_deleted && t2b.notebook_id == work_nb.notebook_id);
-    assert!(t2b.is_dirty, "restore is a server-visible change (JS moveNote sets IsDirty)");
+    assert!(
+        t2b.is_dirty,
+        "restore is a server-visible change (JS moveNote sets IsDirty)"
+    );
     // hard delete t1: row gone entirely
     assert_eq!(s.hard_delete_note(&t1.note_id).unwrap(), 1);
     assert!(s.get_note_any(&t1.note_id).unwrap().is_none());
@@ -312,9 +369,17 @@ fn trash_restore_hard_delete_and_empty() {
     // notebook counts only live notes: Inbox's only note is trashed, so the
     // GROUP BY emits no Inbox row at all.
     let counts = s.notebook_note_counts().unwrap();
-    let inbox = s.notebooks().unwrap().into_iter().find(|nb| nb.title == "Inbox").unwrap();
+    let inbox = s
+        .notebooks()
+        .unwrap()
+        .into_iter()
+        .find(|nb| nb.title == "Inbox")
+        .unwrap();
     assert!(!counts.iter().any(|(id, _)| *id == inbox.notebook_id));
-    let work_count = counts.iter().find(|(id, _)| *id == work_nb.notebook_id).map(|(_, c)| *c);
+    let work_count = counts
+        .iter()
+        .find(|(id, _)| *id == work_nb.notebook_id)
+        .map(|(_, c)| *c);
     assert_eq!(work_count, Some(1));
 }
 
@@ -347,7 +412,10 @@ fn notebook_crud_flags_and_seq() {
     let s = store("t11_crud");
     let a = s.create_notebook("A", "").unwrap();
     let b = s.create_notebook("B", "").unwrap();
-    assert!(a.is_new && a.is_dirty, "create sets LocalIsNew+IsDirty (JS addNotebook)");
+    assert!(
+        a.is_new && a.is_dirty,
+        "create sets LocalIsNew+IsDirty (JS addNotebook)"
+    );
     assert_eq!((a.seq, b.seq), (0, 1), "Seq = max sibling + 1");
     // nested: seq independent per parent group
     let a1 = s.create_notebook("A1", &a.notebook_id).unwrap();
@@ -355,7 +423,12 @@ fn notebook_crud_flags_and_seq() {
     assert_eq!(a1.parent_notebook_id, a.notebook_id.to_string());
     // rename: dirty, new title
     assert_eq!(s.rename_notebook(&b.notebook_id, "B2").unwrap(), 1);
-    let b2 = s.notebooks().unwrap().into_iter().find(|nb| nb.notebook_id == b.notebook_id).unwrap();
+    let b2 = s
+        .notebooks()
+        .unwrap()
+        .into_iter()
+        .find(|nb| nb.notebook_id == b.notebook_id)
+        .unwrap();
     assert_eq!((b2.title.as_str(), b2.is_dirty), ("B2", true));
 }
 
@@ -382,7 +455,9 @@ fn delete_notebook_trashes_notes_not_lost() {
     assert_eq!(dirty, 3);
     // notebook subtree soft-deleted (hidden from nav, dirty for the push)
     let nbs = s.notebooks().unwrap();
-    assert!(nbs.iter().all(|nb| nb.notebook_id != a.notebook_id && nb.notebook_id != child.notebook_id));
+    assert!(nbs
+        .iter()
+        .all(|nb| nb.notebook_id != a.notebook_id && nb.notebook_id != child.notebook_id));
     let deleted_rows: i64 = s
         .raw_query_row("SELECT COUNT(*) FROM notebooks WHERE LocalIsDelete=1 AND IsDirty=1")
         .unwrap();
@@ -403,7 +478,11 @@ fn move_notebook_rewrites_both_sibling_groups() {
         &c.notebook_id,
         "",
         0,
-        &[c.notebook_id.to_string(), a.notebook_id.to_string(), b.notebook_id.to_string()],
+        &[
+            c.notebook_id.to_string(),
+            a.notebook_id.to_string(),
+            b.notebook_id.to_string(),
+        ],
     )
     .unwrap();
     assert_eq!(
@@ -416,7 +495,8 @@ fn move_notebook_rewrites_both_sibling_groups() {
     );
 
     // 2. reparent by index: A under B at index 1 (between B1 and B2)
-    s.move_notebook(&a.notebook_id, &b.notebook_id.to_string(), 1, &[]).unwrap();
+    s.move_notebook(&a.notebook_id, &b.notebook_id.to_string(), 1, &[])
+        .unwrap();
     assert_eq!(
         group_seq(&s, ""),
         vec![("C".into(), 0), ("B".into(), 1)],
@@ -426,7 +506,12 @@ fn move_notebook_rewrites_both_sibling_groups() {
         group_seq(&s, &b.notebook_id.to_string()),
         vec![("B1".into(), 0), ("A".into(), 1), ("B2".into(), 2)]
     );
-    let a_row = s.notebooks().unwrap().into_iter().find(|nb| nb.title == "A").unwrap();
+    let a_row = s
+        .notebooks()
+        .unwrap()
+        .into_iter()
+        .find(|nb| nb.title == "A")
+        .unwrap();
     assert_eq!(a_row.parent_notebook_id, b.notebook_id.to_string());
     assert!(a_row.is_dirty);
     let _ = b1;
@@ -441,7 +526,9 @@ fn tag_rename_and_delete_are_global() {
 
     // rename: whole-tag match only ("rustlang" untouched), notes dirty
     assert_eq!(s.rename_tag("rust", "rust2").unwrap(), 2);
-    let n1 = s.get_note_any(&s.list_notes().unwrap()[0].note_id.clone()).unwrap();
+    let n1 = s
+        .get_note_any(&s.list_notes().unwrap()[0].note_id.clone())
+        .unwrap();
     let _ = n1;
     let by_title = |t: &str| {
         s.list_notes()
@@ -452,7 +539,11 @@ fn tag_rename_and_delete_are_global() {
     };
     assert_eq!(by_title("n1").tags, vec!["rust2", "gpui"]);
     assert_eq!(by_title("n2").tags, vec!["rust2"]);
-    assert_eq!(by_title("n3").tags, vec!["rustlang", "other"], "no substring hit");
+    assert_eq!(
+        by_title("n3").tags,
+        vec!["rustlang", "other"],
+        "no substring hit"
+    );
     assert!(by_title("n1").is_dirty && by_title("n2").is_dirty);
     // n3 is a fresh add_note (IsDirty=1 from creation); the rename must
     // not touch it — verified by its unchanged Tags.
@@ -466,9 +557,14 @@ fn tag_rename_and_delete_are_global() {
     let live: Vec<String> = s.tags().unwrap().into_iter().map(|t| t.tag).collect();
     assert!(!live.contains(&"rust2".to_string()));
     let deleted_row: i64 = s
-        .raw_query_row("SELECT COUNT(*) FROM tags WHERE Tag='rust2' AND LocalIsDelete=1 AND IsDirty=1")
+        .raw_query_row(
+            "SELECT COUNT(*) FROM tags WHERE Tag='rust2' AND LocalIsDelete=1 AND IsDirty=1",
+        )
         .unwrap();
-    assert_eq!(deleted_row, 1, "tag row soft-deleted + dirty → deleteTag push");
+    assert_eq!(
+        deleted_row, 1,
+        "tag row soft-deleted + dirty → deleteTag push"
+    );
 }
 
 #[test]
@@ -477,11 +573,15 @@ fn dirty_flags_ready_for_sync_push() {
     // notebook create/rename/move leave IsDirty=1 rows the push phase reads
     let a = s.create_notebook("A", "").unwrap();
     s.rename_notebook(&a.notebook_id, "A2").unwrap();
-    let dirty_nb: i64 = s.raw_query_row("SELECT COUNT(*) FROM notebooks WHERE IsDirty=1").unwrap();
+    let dirty_nb: i64 = s
+        .raw_query_row("SELECT COUNT(*) FROM notebooks WHERE IsDirty=1")
+        .unwrap();
     assert_eq!(dirty_nb, 1);
-    s.move_notebook(&a.notebook_id, "", 0, &[a.notebook_id.to_string()]).unwrap();
+    s.move_notebook(&a.notebook_id, "", 0, &[a.notebook_id.to_string()])
+        .unwrap();
     assert_eq!(
-        s.raw_query_row("SELECT COUNT(*) FROM notebooks WHERE IsDirty=1").unwrap(),
+        s.raw_query_row("SELECT COUNT(*) FROM notebooks WHERE IsDirty=1")
+            .unwrap(),
         1
     );
     // tag ops mark notes dirty
@@ -489,7 +589,8 @@ fn dirty_flags_ready_for_sync_push() {
     s.rename_tag("t", "t2").unwrap();
     s.delete_tag("t2").unwrap();
     assert_eq!(
-        s.raw_query_row("SELECT COUNT(*) FROM notes WHERE IsDirty=1").unwrap(),
+        s.raw_query_row("SELECT COUNT(*) FROM notes WHERE IsDirty=1")
+            .unwrap(),
         1
     );
 }
@@ -499,7 +600,10 @@ fn dirty_flags_ready_for_sync_push() {
 fn save(s: &Store, id: &Id, content: &str) {
     s.save_note_with_history(
         id,
-        NoteUpdate { content: Some(content.to_string()), ..Default::default() },
+        NoteUpdate {
+            content: Some(content.to_string()),
+            ..Default::default()
+        },
     )
     .unwrap();
 }
@@ -511,12 +615,20 @@ fn history_consecutive_identical_saves_dedup() {
     save(&s, &n.note_id, "v2");
     save(&s, &n.note_id, "v2"); // identical to last snapshot target — no new row
     save(&s, &n.note_id, "v2");
-    assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM note_history").unwrap(), 1);
+    assert_eq!(
+        s.raw_query_row("SELECT COUNT(*) FROM note_history")
+            .unwrap(),
+        1
+    );
     assert_eq!(s.list_history(&n.note_id).unwrap()[0].content, "v1");
     // same content twice in a row with a DIFFERENT other save between → kept
     save(&s, &n.note_id, "v3");
     save(&s, &n.note_id, "v1");
-    assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM note_history").unwrap(), 3);
+    assert_eq!(
+        s.raw_query_row("SELECT COUNT(*) FROM note_history")
+            .unwrap(),
+        3
+    );
 }
 
 #[test]
@@ -528,7 +640,10 @@ fn history_caps_at_20_rows_dropping_oldest() {
     }
     let h = s.list_history(&n.note_id).unwrap();
     assert_eq!(h.len(), 20);
-    assert_eq!(h[0].content, "v24", "newest snapshot is the last pre-change content");
+    assert_eq!(
+        h[0].content, "v24",
+        "newest snapshot is the last pre-change content"
+    );
     assert_eq!(h[19].content, "v5", "oldest five trimmed");
     assert!(!h.iter().any(|x| x.content == "v4"));
 }
@@ -541,7 +656,10 @@ fn restore_makes_old_version_the_latest_and_dirty() {
     let h = s.list_history(&n.note_id).unwrap();
     assert_eq!(h.len(), 1);
 
-    let restored = s.restore_history(&n.note_id, &h[0].history_id).unwrap().unwrap();
+    let restored = s
+        .restore_history(&n.note_id, &h[0].history_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(restored.content, "old body");
     assert_eq!(restored.title, "Old title");
     assert!(restored.is_dirty, "restore is a server-visible change");
@@ -551,9 +669,15 @@ fn restore_makes_old_version_the_latest_and_dirty() {
     assert_eq!(h2[0].content, "new body");
     assert_eq!(h2.len(), 2);
     // and restoring back again flips content again (bounce is lossless)
-    let back = s.restore_history(&n.note_id, &h2[0].history_id).unwrap().unwrap();
+    let back = s
+        .restore_history(&n.note_id, &h2[0].history_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(back.content, "new body");
-    assert!(s.restore_history(&n.note_id, &Id("bogus".into())).unwrap().is_none());
+    assert!(s
+        .restore_history(&n.note_id, &Id("bogus".into()))
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -561,9 +685,17 @@ fn hard_delete_purges_history_rows() {
     let s = store("hist_purge");
     let n = add(&s, "T", "v1", &[], "Inbox");
     save(&s, &n.note_id, "v2");
-    assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM note_history").unwrap(), 1);
+    assert_eq!(
+        s.raw_query_row("SELECT COUNT(*) FROM note_history")
+            .unwrap(),
+        1
+    );
     assert_eq!(s.hard_delete_note(&n.note_id).unwrap(), 1);
-    assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM note_history").unwrap(), 0);
+    assert_eq!(
+        s.raw_query_row("SELECT COUNT(*) FROM note_history")
+            .unwrap(),
+        0
+    );
     assert!(s.list_history(&n.note_id).unwrap().is_empty());
     assert!(s.purge_history(&n.note_id).is_ok());
 }
@@ -577,7 +709,11 @@ fn save_with_history_no_change_writes_nothing() {
         .unwrap()
         .unwrap();
     assert_eq!(saved.content, "v1");
-    assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM note_history").unwrap(), 0);
+    assert_eq!(
+        s.raw_query_row("SELECT COUNT(*) FROM note_history")
+            .unwrap(),
+        0
+    );
     assert_eq!(s.raw_query_row("SELECT COUNT(*) FROM notes").unwrap(), 1);
 }
 
@@ -588,7 +724,12 @@ fn store_scopes_dirty_notes_to_opened_user() {
     let s = Store::open(tmpdir_live("scoped-user"), "userX".to_string()).expect("open store");
     let n = add(&s, "Mine", "# x", &[], "NB");
     let dirty: Vec<_> = s.dirty_notes().expect("dirty_notes");
-    assert!(dirty.iter().any(|d| d.note_id.to_string() == n.note_id.to_string()), "userX's note must be dirty for userX");
+    assert!(
+        dirty
+            .iter()
+            .any(|d| d.note_id.to_string() == n.note_id.to_string()),
+        "userX's note must be dirty for userX"
+    );
 
     let other = Store::open(tmpdir_live("scoped-user"), "user1".to_string()).expect("open store");
     assert!(

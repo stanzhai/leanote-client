@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "leanote"
+# `Leanote` (GUI) and `leanote` (this bin) collide on case-insensitive
+# filesystems (APFS/NTFS): cargo writes both to target/release and one
+# clobbers the other. Distinct cargo names; installers present it as
+# `leanote` on case-sensitive fs / bin\leanote.exe / leanote-cli in .app.
+name = "leanote-cli"
 path = "src/main.rs"
 
 [dependencies]

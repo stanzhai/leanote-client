@@ -1,4 +1,4 @@
-# leanote-rust
+# Leanote (Rust)
 
 Rust rewrite of the leanote desktop app. Workspace layout:
 
@@ -11,43 +11,34 @@ Rust rewrite of the leanote desktop app. Workspace layout:
 ## Build
 
 ```sh
-cargo build --release          # all binaries → target/release/{leanote,leanote-app}
+cargo build --release          # all binaries → target/release/{leanote,Leanote}
 cargo test                     # workspace tests
 ```
 
-Data dir: `~/Library/Application Support/leanote-rust/` (macOS) or
-`~/.config/leanote-rust/` (Linux). Override with `LEANOTE_RUST_DATA`.
+Data dir: `~/Library/Application Support/leanote/` (macOS), `%APPDATA%\leanote`
+(Windows), `~/.config/leanote` (Linux, honors `XDG_CONFIG_HOME`). Override with
+`LEANOTE_DATA`. The legacy Electron NeDB files (`nedb55/`) may live in the
+same macOS dir; they are never read or written (ADR-0008).
 Logs: `<data dir>/logs/app.log` (crashes, sync errors, HTTP server errors;
 size-capped rotation). `LEANOTE_MCP_DEBUG=1` additionally appends to
 `~/leanote_mcp.log`, unchanged from the JS app.
 
 ## Packaging
 
-### macOS
+Per-platform scripts (CI runs the same ones; see `.github/workflows/release.yml`):
 
 ```sh
-scripts/package-macos.sh [output-dir]   # default: ../dist
+scripts/package-macos.sh <aarch64|x86_64> [output-dir] [version]   # .app + .dmg
+scripts/package-linux.sh <x86_64|aarch64> [output-dir] [version]   # AppImage + .deb
+scripts/package-windows.ps1 -Arch <x64|arm64> [-OutDir …] [-Version …]  # NSIS + zip
 ```
 
-Produces `Leanote.app` (GUI + CLI binaries, `icon.icns` reused from the repo
-root, ad-hoc codesigned) and `Leanote.dmg` via `hdiutil`, then repoints
-`~/bin/leanote` at the packaged CLI (`…/Leanote.app/Contents/MacOS/leanote`).
-The CLI also rewrites the shim itself on first run (`shim-switch`, ticket 07).
-
-Manual .dmg alternative:
-
-```sh
-hdiutil create -volname Leanote -srcfolder dist/Leanote.app -ov -format UDZO dist/Leanote.dmg
-```
-
-### Linux / Windows
-
-Not packaged here — the acceptance bar is `cargo check`/`cargo build` per
-platform plus runtime checks on real hardware (see ticket 16 notes):
-`cargo check --target x86_64-unknown-linux-gnu` /
-`cargo check --target x86_64-pc-windows-msvc` with the matching target
-installed via `rustup target add …`; without a full cross toolchain (GTK,
-X11, MSVC SDK) a *build* of the GUI cannot be produced on a Mac host.
+Artifacts are named `Leanote_<version>_<os>_<arch>.<ext>`. The GUI binary is
+`Leanote` everywhere; the CLI ships alongside as `leanote-cli` (inside the
+macOS .app — APFS/NTFS are case-insensitive so it can't be `leanote`),
+`bin\leanote.exe` (Windows, optional PATH section in NSIS), and `/usr/bin/leanote`
+(Linux). Icons are generated from `build/icon.png` by `scripts/gen-icons.sh`
+and committed under `packaging/` so CI needs no graphics toolchain.
 
 ## Tray
 

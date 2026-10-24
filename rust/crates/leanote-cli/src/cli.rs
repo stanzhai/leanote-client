@@ -265,7 +265,7 @@ fn cmd_add(args: &[String], piped: &str, api: Api) -> i32 {
 }
 
 fn open_store() -> Result<Store, String> {
-    let dir = std::env::var("LEANOTE_RUST_DATA").unwrap_or_else(|_| {
+    let dir = std::env::var("LEANOTE_DATA").unwrap_or_else(|_| {
         leanote_core::app_data_dir().to_string_lossy().into_owned()
     });
     Store::open(std::path::PathBuf::from(dir), "user1".to_string()).map_err(|e| e.to_string())
@@ -870,7 +870,7 @@ fn shim_switch() {
     if home.is_empty() {
         return;
     }
-    let data_dir = std::env::var("LEANOTE_RUST_DATA")
+    let data_dir = std::env::var("LEANOTE_DATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| leanote_core::app_data_dir());
     let marker = data_dir.join("shim-switched");

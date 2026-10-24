@@ -226,7 +226,7 @@ async fn killed_mid_sync_rerun_recovers_consistent() {
     // convergence.
     let srv = seeded().await;
     let dir = tmpdir("killed");
-    let bin = env!("CARGO_BIN_EXE_leanote");
+    let bin = env!("CARGO_BIN_EXE_leanote-cli");
 
     let mut child = Command::new(bin)
         .args([
@@ -238,7 +238,7 @@ async fn killed_mid_sync_rerun_recovers_consistent() {
             "--password",
             PWD,
         ])
-        .env("LEANOTE_RUST_DATA", &dir)
+        .env("LEANOTE_DATA", &dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -277,7 +277,7 @@ async fn killed_mid_sync_rerun_recovers_consistent() {
             "--password",
             PWD,
         ])
-        .env("LEANOTE_RUST_DATA", &dir)
+        .env("LEANOTE_DATA", &dir)
         .output()
         .unwrap();
     assert!(
@@ -304,7 +304,7 @@ async fn killed_mid_sync_rerun_recovers_consistent() {
 async fn sync_cli_smoke_prints_progress() {
     let srv = seeded().await;
     let dir = tmpdir("smoke");
-    let bin = env!("CARGO_BIN_EXE_leanote");
+    let bin = env!("CARGO_BIN_EXE_leanote-cli");
 
     let out = Command::new(bin)
         .args([
@@ -316,7 +316,7 @@ async fn sync_cli_smoke_prints_progress() {
             "--password",
             PWD,
         ])
-        .env("LEANOTE_RUST_DATA", &dir)
+        .env("LEANOTE_DATA", &dir)
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -335,7 +335,7 @@ async fn sync_cli_smoke_prints_progress() {
             "--password",
             "nope",
         ])
-        .env("LEANOTE_RUST_DATA", &dir)
+        .env("LEANOTE_DATA", &dir)
         .output()
         .unwrap();
     assert!(!bad.status.success());
@@ -716,7 +716,7 @@ async fn editor_save_with_history_pushes_via_cli_sync() {
 
     // `leanote sync` runs (pull-only full pass), then the incr round pushes
     // the dirty edit as updateNote with the new content.
-    let bin = env!("CARGO_BIN_EXE_leanote");
+    let bin = env!("CARGO_BIN_EXE_leanote-cli");
     let out = Command::new(bin)
         .args([
             "sync",
@@ -727,7 +727,7 @@ async fn editor_save_with_history_pushes_via_cli_sync() {
             "--password",
             PWD,
         ])
-        .env("LEANOTE_RUST_DATA", &dir)
+        .env("LEANOTE_DATA", &dir)
         .output()
         .unwrap();
     assert!(
@@ -760,7 +760,7 @@ async fn new_note_pushes_add_note_via_cli_sync() {
     })
     .unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_leanote");
+    let bin = env!("CARGO_BIN_EXE_leanote-cli");
     let out = Command::new(bin)
         .args([
             "sync",
@@ -771,7 +771,7 @@ async fn new_note_pushes_add_note_via_cli_sync() {
             "--password",
             PWD,
         ])
-        .env("LEANOTE_RUST_DATA", &dir)
+        .env("LEANOTE_DATA", &dir)
         .output()
         .unwrap();
     assert!(

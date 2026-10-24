@@ -8,7 +8,7 @@
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-BIN="$ROOT/rust/target/release/leanote"
+BIN="$ROOT/rust/target/release/leanote-cli"
 WORK=$(mktemp -d /tmp/leanote-accept.XXXXXX)
 PASS=0; FAIL=0
 
@@ -21,7 +21,7 @@ check() { # check <name> <cmd...>
   fi
 }
 
-export LEANOTE_RUST_DATA="$WORK/data"
+export LEANOTE_DATA="$WORK/data"
 export LEANOTE_NO_SHIM_SWITCH=1
 export LEANOTE_PORT=8933
 mkdir -p "$WORK/data"

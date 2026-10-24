@@ -1,0 +1,106 @@
+name: release
+
+# Tag push (v*) → build all 6 targets → attach packages to a published
+# GitHub release. Cross-arch macOS builds on the arm64 runner; Linux and
+# Windows build natively per-arch. Version comes from the tag.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            runs-on: macos-latest
+            target: aarch64-apple-darwin
+            arch: aarch64
+            script: package-macos.sh
+          - name: macos-x64
+            runs-on: macos-latest
+            target: x86_64-apple-darwin
+            arch: x86_64
+            script: package-macos.sh
+          - name: linux-x64
+            runs-on: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            script: package-linux.sh
+            test: "1"
+          - name: linux-arm64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            script: package-linux.sh
+          - name: windows-x64
+            runs-on: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x64
+            script: package-windows.ps1
+          - name: windows-arm64
+            runs-on: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            arch: arm64
+            script: package-windows.ps1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: ${{ matrix.target }}
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libx11-dev libwayland-dev \
+            libfontconfig-dev libfreetype-dev patchelf
+
+      - name: Build and package
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          cd rust
+          rustup target add ${{ matrix.target }}
+          if [[ -n "${{ matrix.test }}" ]]; then cargo test --workspace --release; fi
+          if [[ "${{ matrix.script }}" == *.ps1 ]]; then
+            powershell -ExecutionPolicy Bypass -File scripts/${{ matrix.script }} \
+              -Arch ${{ matrix.arch }} -OutDir ../dist -Version "$VERSION"
+          else
+            sh scripts/${{ matrix.script }} ${{ matrix.arch }} ../dist "$VERSION"
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/Leanote_*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Leanote_*
+          generate_release_notes: true

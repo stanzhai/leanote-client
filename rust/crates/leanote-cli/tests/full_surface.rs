@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_leanote")
+    env!("CARGO_BIN_EXE_leanote-cli")
 }
 
 fn tmpdir(name: &str) -> PathBuf {
@@ -48,7 +48,7 @@ fn run(home_dir: &PathBuf, args: &[&str], stdin: Option<&str>) -> (String, Strin
     let mut cmd = Command::new(bin());
     cmd.args(args)
         .env("HOME", home_dir)
-        .env("LEANOTE_RUST_DATA", home_dir.join("data"))
+        .env("LEANOTE_DATA", home_dir.join("data"))
         .env("LEANOTE_PORT", "8913")
         .env_remove("LEANOTE_NO_SHIM_SWITCH")
         .stdout(Stdio::piped())
@@ -72,7 +72,7 @@ fn quiet(home_dir: &PathBuf, args: &[&str], stdin: Option<&str>) -> (String, Str
     let mut cmd = Command::new(bin());
     cmd.args(args)
         .env("HOME", home_dir)
-        .env("LEANOTE_RUST_DATA", home_dir.join("data"))
+        .env("LEANOTE_DATA", home_dir.join("data"))
         .env("LEANOTE_NO_SHIM_SWITCH", "1")
         .env("LEANOTE_PORT", "8913")
         .stdout(Stdio::piped())
@@ -101,7 +101,7 @@ fn spawn_server(home_dir: &PathBuf) -> std::process::Child {
     let child = Command::new(bin())
         .args(["serve", "-p", "8913"])
         .env("HOME", home_dir)
-        .env("LEANOTE_RUST_DATA", home_dir.join("data"))
+        .env("LEANOTE_DATA", home_dir.join("data"))
         .env("LEANOTE_NO_SHIM_SWITCH", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -402,7 +402,7 @@ fn shim_switch_rewrites_known_electron_shim_and_creates_when_absent() {
     let out = Command::new(shim.to_str().unwrap())
         .arg("list")
         .env("HOME", &h)
-        .env("LEANOTE_RUST_DATA", h.join("data"))
+        .env("LEANOTE_DATA", h.join("data"))
         .output()
         .unwrap();
     assert!(out.status.success(), "shim must exec the Rust binary");

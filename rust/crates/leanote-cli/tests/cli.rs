@@ -10,7 +10,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_leanote")
+    env!("CARGO_BIN_EXE_leanote-cli")
 }
 
 fn datadir(name: &str) -> std::path::PathBuf {
@@ -21,7 +21,12 @@ fn datadir(name: &str) -> std::path::PathBuf {
 
 fn run(dir: &std::path::PathBuf, args: &[&str], stdin: Option<&str>) -> (String, String, i32) {
     let mut cmd = Command::new(bin());
-    cmd.args(args).env("LEANOTE_RUST_DATA", dir).env("LEANOTE_NO_SHIM_SWITCH", "1").env("LEANOTE_PORT", "8913").stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args)
+        .env("LEANOTE_DATA", dir)
+        .env("LEANOTE_NO_SHIM_SWITCH", "1")
+        .env("LEANOTE_PORT", "8913")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if stdin.is_some() {
         cmd.stdin(Stdio::piped());
     }
@@ -43,7 +48,11 @@ fn run(dir: &std::path::PathBuf, args: &[&str], stdin: Option<&str>) -> (String,
 #[test]
 fn add_via_stdin_pipe() {
     let d = datadir("stdin");
-    let (out, err, code) = run(&d, &["add", "-t", "Piped", "-g", "a, b"], Some("# Body\nline2"));
+    let (out, err, code) = run(
+        &d,
+        &["add", "-t", "Piped", "-g", "a, b"],
+        Some("# Body\nline2"),
+    );
     assert_eq!(code, 0, "stdout={} err={}", out, err);
     assert_eq!(out, "Added: \"Piped\" -> AI札 [a, b]\n");
     let (out2, _, _) = run(&d, &["list", "-v"], None);
@@ -66,7 +75,10 @@ fn add_missing_title_or_content_errors_match_js() {
     let (_, err, code) = run(&d, &["add", "-c", "x"], None);
     assert_eq!((code, err.as_str()), (1, "Error: --title is required.\n"));
     let (_, err, code) = run(&d, &["add", "-t", "x"], None);
-    assert_eq!((code, err.as_str()), (1, "Error: --content is required (or pipe via stdin).\n"));
+    assert_eq!(
+        (code, err.as_str()),
+        (1, "Error: --content is required (or pipe via stdin).\n")
+    );
 }
 
 #[test]
@@ -77,7 +89,14 @@ fn show_prefix_semantics_match_js() {
     let d = datadir("show");
     run(&d, &["add", "-t", "A", "-c", "aa"], None);
     let (l, _, _) = run(&d, &["list"], None);
-    let id = l.lines().next().unwrap().split_whitespace().next().unwrap().to_string();
+    let id = l
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
     // unique prefix
     let (out, _, code) = run(&d, &["show", &id[..6]], None);
     assert_eq!(code, 0);
@@ -85,7 +104,10 @@ fn show_prefix_semantics_match_js() {
     assert!(out.contains("---\naa\n"));
     // no match
     let (_, err, code) = run(&d, &["show", "zzzzzz"], None);
-    assert_eq!((code, err.as_str()), (1, "Error: Note \"zzzzzz\" not found.\n"));
+    assert_eq!(
+        (code, err.as_str()),
+        (1, "Error: Note \"zzzzzz\" not found.\n")
+    );
     // missing arg
     let (_, err, code) = run(&d, &["show"], None);
     assert_eq!((code, err.as_str()), (1, "Error: <note-id> is required.\n"));
@@ -110,7 +132,11 @@ fn show_ambiguous_prefix_takes_first_newest_match_like_js() {
     // show takes the FIRST prefix hit = the earlier-inserted note.
     let (out, _, code) = run(&d, &["show", "dddd"], None);
     assert_eq!(code, 0);
-    assert!(out.contains("ID:       dddd11111111111111111111"), "{}", out);
+    assert!(
+        out.contains("ID:       dddd11111111111111111111"),
+        "{}",
+        out
+    );
     assert!(out.contains("Title:    first"), "{}", out);
 }
 
@@ -139,14 +165,18 @@ fn list_limit_more_message_matches_js() {
         run(&d, &["add", "-t", &format!("n{}", i), "-c", "c"], None);
     }
     let (out, _, _) = run(&d, &["list", "-N", "2"], None);
-    assert!(out.ends_with("... (1 more, use -N to show more)\n"), "{}", out);
+    assert!(
+        out.ends_with("... (1 more, use -N to show more)\n"),
+        "{}",
+        out
+    );
 }
 
 #[test]
-fn store_dir_is_not_electron_dir() {
-    // The default (no LEANOTE_RUST_DATA) path must be leanote-rust, not the
-    // Electron NeDB dir. Checked by running without the env override in a HOME
-    // sandbox we then inspect.
+fn store_dir_is_leanote_never_nedb() {
+    // ADR-0008: default (no LEANOTE_DATA) path is `leanote` — the same dir
+    // the Electron app used — but only our SQLite file may appear there.
+    // Run without the env override in a HOME sandbox and inspect.
     let home = datadir("home");
     std::fs::create_dir_all(&home).unwrap();
     let out = Command::new(bin())
@@ -156,10 +186,15 @@ fn store_dir_is_not_electron_dir() {
         .env("PATH", "/usr/bin:/bin")
         .output()
         .unwrap();
-    // No NeDB anything; app_data_dir is leanote-rust
-    let created = home.join("Library/Application Support/leanote-rust/leanote.db");
-    assert!(created.exists(), "expected {}", created.display());
-    assert!(!home.join("Library/Application Support/leanote").exists(), "must not touch Electron dir");
+    let appsupport = home.join("Library/Application Support/leanote");
+    assert!(
+        appsupport.join("leanote.db").exists(),
+        "expected leanote.db"
+    );
+    assert!(
+        !appsupport.join("nedb55").exists(),
+        "must never create NeDB files"
+    );
     let _ = String::from_utf8_lossy(&out.stdout);
 }
 

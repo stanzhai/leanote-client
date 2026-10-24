@@ -42,7 +42,7 @@ EOF
 # --- identical fixtures on both sides ---
 seed() { # $1 = side dir
   local NB="$1/Library/Application Support/leanote/nedb55/user1"
-  mkdir -p "$1/bin" "$NB" "$1/Library/Application Support/leanote-rust"
+  mkdir -p "$1/bin" "$NB" "$1/Library/Application Support/leanote"
   printf '{"Ok":true,"UserId":"user1","_id":"u1","IsActive":true}\n' > "$1/Library/Application Support/leanote/nedb55/users.db"
   printf '{"_id":"n1","NotebookId":"notebookaaaa000000000001","Title":"AI札","Seq":-1,"UserId":"user1","ParentNotebookId":"","LocalIsNew":true,"IsDirty":true}\n' > "$NB/notebooks.db"
   cat > "$NB/notes.db" <<'NEOF'
@@ -62,7 +62,7 @@ export LEANOTE_NO_SHIM_SWITCH=1
 # Point the Rust side at a dead port so both CLIs take their offline path.
 export LEANOTE_PORT=8913
 seed "$JH"; seed "$RH"
-sqlite3 "$RH/Library/Application Support/leanote-rust/leanote.db" "
+sqlite3 "$RH/Library/Application Support/leanote/leanote.db" "
 CREATE TABLE IF NOT EXISTS notebooks (NotebookId TEXT PRIMARY KEY, UserId TEXT NOT NULL, Title TEXT NOT NULL, ParentNotebookId TEXT NOT NULL DEFAULT '', Seq INTEGER NOT NULL DEFAULT 0, Usn INTEGER NOT NULL DEFAULT 0, LocalIsNew INTEGER NOT NULL DEFAULT 0, IsDirty INTEGER NOT NULL DEFAULT 0, LocalIsDelete INTEGER NOT NULL DEFAULT 0, ServerNotebookId TEXT DEFAULT NULL);
 CREATE TABLE IF NOT EXISTS notes (NoteId TEXT PRIMARY KEY, UserId TEXT NOT NULL, NotebookId TEXT NOT NULL, Title TEXT NOT NULL DEFAULT '', Content TEXT NOT NULL DEFAULT '', \"Desc\" TEXT NOT NULL DEFAULT '', ImgSrc TEXT NOT NULL DEFAULT '', Tags TEXT NOT NULL DEFAULT '', Abstract TEXT NOT NULL DEFAULT '', IsMarkdown INTEGER NOT NULL DEFAULT 1, IsTrash INTEGER NOT NULL DEFAULT 0, IsDeleted INTEGER NOT NULL DEFAULT 0, IsDirty INTEGER NOT NULL DEFAULT 0, LocalIsNew INTEGER NOT NULL DEFAULT 0, LocalIsDelete INTEGER NOT NULL DEFAULT 0, IsBlog INTEGER NOT NULL DEFAULT 0, Star INTEGER NOT NULL DEFAULT 0, Usn INTEGER NOT NULL DEFAULT 0, CreatedTime INTEGER NOT NULL DEFAULT 0, UpdatedTime INTEGER NOT NULL DEFAULT 0, ServerNoteId TEXT DEFAULT NULL);
 CREATE TABLE IF NOT EXISTS tags (TagId TEXT PRIMARY KEY, UserId TEXT NOT NULL, Tag TEXT NOT NULL, IsDirty INTEGER NOT NULL DEFAULT 0, Count INTEGER NOT NULL DEFAULT 0, LocalIsDelete INTEGER NOT NULL DEFAULT 0, CreatedTime INTEGER NOT NULL DEFAULT 0, UpdatedTime INTEGER NOT NULL DEFAULT 0, UNIQUE(UserId, Tag));
@@ -117,8 +117,8 @@ cmp_case list -n Nope
 cmp_case list -g ai
 cmp_case list -g nomatch
 NEDB_SUM_BEFORE=$(find "$RH/Library/Application Support/leanote" -type f -exec shasum {} \; | sort | shasum)
-sqlite3 "$RH/Library/Application Support/leanote-rust/leanote.db" "DROP TABLE IF EXISTS notes; DROP TABLE IF EXISTS notebooks;" >/dev/null 2>&1
-sqlite3 "$RH/Library/Application Support/leanote-rust/leanote.db" "
+sqlite3 "$RH/Library/Application Support/leanote/leanote.db" "DROP TABLE IF EXISTS notes; DROP TABLE IF EXISTS notebooks;" >/dev/null 2>&1
+sqlite3 "$RH/Library/Application Support/leanote/leanote.db" "
 CREATE TABLE IF NOT EXISTS notebooks (NotebookId TEXT PRIMARY KEY, UserId TEXT NOT NULL, Title TEXT NOT NULL, ParentNotebookId TEXT NOT NULL DEFAULT '', Seq INTEGER NOT NULL DEFAULT 0, Usn INTEGER NOT NULL DEFAULT 0, LocalIsNew INTEGER NOT NULL DEFAULT 0, IsDirty INTEGER NOT NULL DEFAULT 0, LocalIsDelete INTEGER NOT NULL DEFAULT 0, ServerNotebookId TEXT DEFAULT NULL);
 CREATE TABLE IF NOT EXISTS notes (NoteId TEXT PRIMARY KEY, UserId TEXT NOT NULL, NotebookId TEXT NOT NULL, Title TEXT NOT NULL DEFAULT '', Content TEXT NOT NULL DEFAULT '', \"Desc\" TEXT NOT NULL DEFAULT '', ImgSrc TEXT NOT NULL DEFAULT '', Tags TEXT NOT NULL DEFAULT '', Abstract TEXT NOT NULL DEFAULT '', IsMarkdown INTEGER NOT NULL DEFAULT 1, IsTrash INTEGER NOT NULL DEFAULT 0, IsDeleted INTEGER NOT NULL DEFAULT 0, IsDirty INTEGER NOT NULL DEFAULT 0, LocalIsNew INTEGER NOT NULL DEFAULT 0, LocalIsDelete INTEGER NOT NULL DEFAULT 0, IsBlog INTEGER NOT NULL DEFAULT 0, Star INTEGER NOT NULL DEFAULT 0, Usn INTEGER NOT NULL DEFAULT 0, CreatedTime INTEGER NOT NULL DEFAULT 0, UpdatedTime INTEGER NOT NULL DEFAULT 0, ServerNoteId TEXT DEFAULT NULL);
 CREATE TABLE IF NOT EXISTS tags (TagId TEXT PRIMARY KEY, UserId TEXT NOT NULL, Tag TEXT NOT NULL, IsDirty INTEGER NOT NULL DEFAULT 0, Count INTEGER NOT NULL DEFAULT 0, LocalIsDelete INTEGER NOT NULL DEFAULT 0, CreatedTime INTEGER NOT NULL DEFAULT 0, UpdatedTime INTEGER NOT NULL DEFAULT 0, UNIQUE(UserId, Tag));
