@@ -34,6 +34,12 @@ pub struct Prefs {
     /// Issue 19 Q13: accent color id, e.g. "blue" (default) … "pink".
     #[serde(default)]
     pub accent: String,
+    /// Issue 23 #5: UI zoom factor (1.0/1.1/1.25/1.5/1.6 → rem size).
+    #[serde(default)]
+    pub zoom: f32,
+    /// Issue 23 #10: markdown insertion toolbar in the editor (default off).
+    #[serde(default)]
+    pub editor_toolbar: bool,
     /// Issue 19 Q14: left-nav selection + fold states, restored on launch.
     #[serde(default)]
     pub nav: NavStatePref,
@@ -49,6 +55,8 @@ impl Default for Prefs {
             recents: Vec::new(),
             pane_widths: PaneWidths::default(),
             accent: String::new(),
+            zoom: 1.0,
+            editor_toolbar: false,
             nav: NavStatePref::default(),
         }
     }
@@ -138,6 +146,8 @@ mod tests {
                 mid: Some(380.),
             },
             accent: "purple".into(),
+            zoom: 1.25,
+            editor_toolbar: true,
             nav: NavStatePref {
                 selection: Some(("notebook".into(), "n1".into())),
                 notebooks_open: false,

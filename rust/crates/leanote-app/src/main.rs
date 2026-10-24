@@ -6,6 +6,7 @@ mod conflict_bar;
 mod export;
 mod i18n;
 mod markdown_input;
+mod pdf;
 mod prefs;
 mod search_overlay;
 mod single_instance;
@@ -261,7 +262,7 @@ fn main() {
                 // Issue 21 需求10: ⌘T / Ctrl+T full-window markdown preview.
                 gpui_kit::KeyBinding::new("cmd-t", search_overlay::ToggleFullPreview, None),
                 gpui_kit::KeyBinding::new("ctrl-t", search_overlay::ToggleFullPreview, None),
-                gpui_kit::KeyBinding::new("ctrl-,", search_overlay::OpenSettings, None),
+                gpui_kit::KeyBinding::new("cmd-,", search_overlay::OpenSettings, None),
             ]);
 
             let prefs = prefs::Prefs::load(&dir);
@@ -289,9 +290,14 @@ fn main() {
                     Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx)
                 }
             }
-            Theme::update(cx, move |theme| apply_wake_theme(theme, &palette_boot));
-            // Issue 19: restore persisted accent color.
+            // Issue 19: restore persisted accent BEFORE the wake overlay —
+            // apply_wake_theme reads theme::accent() into colors/tokens, so
+            // setting it afterwards left kit hover/selection on the old hue.
             theme::set_accent(&prefs.accent);
+            let zoom_boot = prefs.zoom;
+            Theme::update(cx, move |theme| {
+                apply_wake_theme(theme, &palette_boot, zoom_boot)
+            });
 
             let lang = match prefs.lang {
                 prefs::LangPref::Follow => i18n::system_lang(),
@@ -326,7 +332,8 @@ fn main() {
                     appears_transparent: true,
                     traffic_light_position: None,
                 }),
-                window_min_size: Some(gpui_kit::size(px(960.), px(600.))),
+                // Issue 23 #5: min size scales with the saved zoom factor.
+                window_min_size: Some(gpui_kit::size(px(960. * prefs.zoom), px(600. * prefs.zoom))),
                 // Issue 19: frosted window (materials stay translucent).
                 window_background: gpui_kit::WindowBackgroundAppearance::Blurred,
                 ..Default::default()
@@ -339,11 +346,22 @@ fn main() {
                 // Per-window appearance → keep tokens in sync with the OS.
                 // Mode reloads overwrite highlight_theme, so the palette is
                 // re-applied here too.
-                let palette_for_observer = pref_palette.clone();
+                //
+                // Issue 24: Follow-only. On a fixed Light/Dark pick this
+                // observer still fires (AppKit's effectiveAppearance callback
+                // is deferred), and its second replay was the lag users saw
+                // on top of the already-correct same-frame switch. `Follow`
+                // is the only mode where the system can move under us.
+                let dir_for_observer = dir.clone();
                 let _ = window.observe_window_appearance(move |_window, cx| {
+                    let p = crate::prefs::Prefs::load(&dir_for_observer);
+                    if p.appearance != crate::prefs::AppearancePref::Follow {
+                        return;
+                    }
                     Theme::sync_system_appearance(None, cx);
-                    let p = palette_for_observer.clone();
-                    Theme::update(cx, move |theme| apply_wake_theme(theme, &p));
+                    let palette = p.editor_palette.clone();
+                    let zoom = p.zoom;
+                    Theme::update(cx, move |theme| apply_wake_theme(theme, &palette, zoom));
                 });
                 // Persist size/position at close.
                 window.on_window_should_close(cx, move |window, _cx| {
@@ -393,7 +411,7 @@ fn main() {
 /// Wake tokens on top of the kit theme (materials, radii, fonts).
 /// Call AFTER sync_system_appearance, never inside the same update that
 /// changes mode (mode swap reloads and wipes color edits).
-pub(crate) fn apply_wake_theme(theme: &mut Theme, palette_id: &str) {
+pub(crate) fn apply_wake_theme(theme: &mut Theme, palette_id: &str, zoom: f32) {
     use gpui_kit::component::theme::{ThemeColor, ThemeMode};
     let dark = theme.mode == ThemeMode::Dark;
     // ThemeColor is Copy; light()/dark() hand back an Arc of the base table.
@@ -410,6 +428,11 @@ pub(crate) fn apply_wake_theme(theme: &mut Theme, palette_id: &str) {
     colors.foreground = theme::foreground(dark);
     colors.muted_foreground = theme::muted_foreground(dark);
     colors.border = theme::border(dark);
+    // Selection color: kit defaults (light: blue wash 0x1d4ed8@0.3, dark:
+    // 0x55a0fc@0.3) — overriding with solid white made light-mode selection
+    // invisible (white on white). Issue 24 regression: apply_wake_theme runs
+    // on every theme switch AND accent change, so the override leaked into
+    // the reader/preview selection after any accent pick in light mode.
     colors.accent = theme::accent();
     colors.primary = theme::accent();
     theme.colors = colors;
@@ -417,10 +440,48 @@ pub(crate) fn apply_wake_theme(theme: &mut Theme, palette_id: &str) {
     theme.radius_lg = px(theme::RADIUS_PANEL);
     theme.font_family = theme::SANS.into();
     theme.mono_font_family = theme::MONO.into();
-    theme.font_size = px(14.);
+    // Issue 24: rem size must come from theme.font_size — the kit Root
+    // plugin re-stamps window rem from it every frame, so any window-level
+    // set_rem_size was dead on arrival. Zoom drives the font size instead.
+    theme.font_size = px(14. * zoom);
     theme.shadow = false; // ADR-0003: zero shadow on persistent UI
                           // Issue 17: editor palette ("" = keep the kit default highlight theme).
     if !palette_id.is_empty() {
         theme.highlight_theme = theme::editor_palette(palette_id, dark);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    /// Issue 24 regression: the white selection override made light-mode
+    /// text selection invisible (white on white). apply_wake_theme runs on
+    /// boot, every appearance change AND every accent change, so the token
+    /// must stay a translucent kit default in BOTH modes.
+    #[test]
+    fn selection_stays_translucent_in_both_modes() {
+        for mode in [
+            gpui_kit::component::ThemeMode::Light,
+            gpui_kit::component::ThemeMode::Dark,
+        ] {
+            let mut theme = gpui_kit::component::Theme::default();
+            theme.mode = mode;
+            apply_wake_theme(&mut theme, "", 1.0);
+            let sel = theme.colors.selection;
+            assert!(
+                sel.a < 1.,
+                "{mode:?}: selection must be a translucent wash, got {sel:?}"
+            );
+            // Light mode: a wash must not be white — white on white is
+            // invisible on the light materials.
+            if mode == gpui_kit::component::ThemeMode::Light {
+                let white = gpui_kit::white();
+                assert!(
+                    (sel.l - white.l).abs() > 0.1 || sel.a < 0.9,
+                    "{mode:?}: selection is effectively white — invisible in light mode"
+                );
+            }
+        }
     }
 }

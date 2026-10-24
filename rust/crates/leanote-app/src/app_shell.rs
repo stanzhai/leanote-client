@@ -16,8 +16,10 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
+use gpui_kit::component::progress::Progress;
 use gpui_kit::component::resizable_panel;
 use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, InteractiveElementExt, Sizable, WindowExt as _,
@@ -32,23 +34,29 @@ use std::sync::{Arc, Mutex};
 
 /// Default pane widths (ADR-0003). Issue 18: user-resizable, persisted;
 /// these are the first-run and reset values.
-const LEFT_W: f32 = 224.;
-const MID_W: f32 = 336.;
+const LEFT_W: f32 = 180.;
+const MID_W: f32 = 240.;
 /// Issue 18: drag ranges for the left/middle panes.
 const LEFT_RANGE: (f32, f32) = (180., 400.);
 const MID_RANGE: (f32, f32) = (240., 600.);
 /// Issue 18: uniform note-row height — py 4 + title 19 + meta 20 + excerpt
 /// 20 + 2× 1px gaps = 65px.
 const NOTE_ROW_H: f32 = 65.;
+/// Issue 23 #11: 1px divider under each note row (except the last) —
+/// `theme::border(dark)`, auto-adapting to light/dark.
+const NOTE_ROW_DIVIDER_H: f32 = 1.;
 /// macOS transparent titlebar height, same material as the sidebar.
 const TITLEBAR_H: f32 = 44.;
 
 pub enum Phase {
     Login,
     SigningIn,
-    /// Progress lines from full_sync, newest last.
+    /// Progress lines from full_sync, newest last. `done/total` carry the
+    /// deterministic content stage (None until it starts or when total=0).
     Syncing {
         lines: Vec<SharedString>,
+        done: usize,
+        total: usize,
     },
     /// Sync done → three-pane shell.
     Shell,
@@ -197,6 +205,9 @@ pub struct AppShell {
     vim: crate::vim::VimState,
     /// Vim enabled (toolbar toggle; persisted as prefs.vim_default).
     vim_enabled: bool,
+    /// Issue 23 #10: markdown insertion toolbar shown in the editor
+    /// (persisted as prefs.editor_toolbar; default off).
+    editor_toolbar: bool,
 }
 
 /// Right-pane edit mode (issues 10+17): title + source editor with syntax
@@ -215,15 +226,27 @@ struct EditState {
     preview: bool,
     /// Set for one frame after a save, to flash "Saved".
     saved_flash: bool,
+    /// Issue 23 #6: working copy of tags (status bar chips); Some(≠ store
+    /// value) marks dirty so the next autosave flushes them too.
+    tags: Vec<String>,
+    /// Issue 23 #6: last persisted UpdatedTime (ms epoch), status bar right.
+    updated_time: i64,
+    /// Issue 23 #6: tag-add input in the status bar (empty text).
+    tag_input: gpui_kit::Entity<InputState>,
 }
 
 /// Progress sink that forwards full_sync lines into a channel the UI drains.
+/// Ticks travel as `@done/total` — note() and tick() share one channel so
+/// ordering with the text lines is preserved.
 struct ChannelProgress(Arc<Mutex<smol::channel::Sender<String>>>);
 
 impl SyncProgress for ChannelProgress {
     fn note(&self, msg: String) {
         // ponytail: try_send, dropped lines only cost progress granularity
         let _ = self.0.lock().unwrap().try_send(msg);
+    }
+    fn tick(&self, done: usize, total: usize) {
+        let _ = self.0.lock().unwrap().try_send(format!("@{done}/{total}"));
     }
 }
 
@@ -284,6 +307,7 @@ impl AppShell {
             user_id: user_id.unwrap_or_else(|| "user1".to_string()),
             sync_status: None,
             vim_enabled: prefs.vim_default,
+            editor_toolbar: prefs.editor_toolbar,
             data_dir,
             host,
             email,
@@ -404,21 +428,42 @@ impl AppShell {
         // recv() ends exactly when the work does — one drain, no extra spawn.
         self._task = Some(cx.spawn(async move |this, cx| {
             let mut lines: Vec<SharedString> = Vec::new();
+            let mut done_total: Option<(usize, usize)> = None;
             let result = loop {
                 // Poll the channel to completion; the sender dies with `work`.
                 match rx.recv().await {
                     Ok(msg) => {
-                        lines.push(msg.into());
-                        if lines.len() > 200 {
-                            lines.remove(0); // keep the tail
+                        // `@d/t` = deterministic tick; anything else is a
+                        // text line for the log view.
+                        let tick = msg.strip_prefix('@').and_then(|s| {
+                            let (d, t) = s.split_once('/')?;
+                            Some((d.parse::<usize>().ok()?, t.parse::<usize>().ok()?))
+                        });
+                        match tick {
+                            Some((done, total)) => done_total = Some((done, total)),
+                            None => {
+                                lines.push(msg.into());
+                                if lines.len() > 200 {
+                                    lines.remove(0); // keep the tail
+                                }
+                            }
                         }
                         let snapshot = lines.clone();
+                        let progress = done_total;
                         let _ = this.update(cx, |shell, cx| {
                             if matches!(shell.phase, Phase::SigningIn) {
-                                shell.phase = Phase::Syncing { lines: snapshot };
+                                shell.phase = Phase::Syncing {
+                                    lines: snapshot,
+                                    done: progress.map_or(0, |p| p.0),
+                                    total: progress.map_or(0, |p| p.1),
+                                };
                                 cx.notify();
-                            } else if let Phase::Syncing { lines } = &mut shell.phase {
+                            } else if let Phase::Syncing { lines, done, total } = &mut shell.phase {
                                 *lines = snapshot;
+                                if let Some((d, t)) = progress {
+                                    *done = d;
+                                    *total = t;
+                                }
                                 cx.notify();
                             }
                         });
@@ -508,9 +553,13 @@ impl AppShell {
         cx.notify();
     }
 
-    pub(crate) fn dark(&self, window: &Window) -> bool {
-        window.appearance() == gpui_kit::WindowAppearance::Dark
-            || window.appearance() == gpui_kit::WindowAppearance::VibrantDark
+    /// Issue 24: read the kit Theme mode, not `window.appearance()`. The
+    /// window field only updates on AppKit's *deferred* effective-appearance
+    /// callback, so pane backgrounds lagged a tick behind kit controls on
+    /// every Light/Dark switch (the reported "theme switch is slow").
+    /// Theme.mode flips inside `Theme::update`, same frame.
+    pub(crate) fn dark(&self, cx: &gpui_kit::App) -> bool {
+        cx.theme().mode.is_dark()
     }
 
     pub(crate) fn lang(&self) -> i18n::Lang {
@@ -713,6 +762,17 @@ impl AppShell {
         // Body owns focus: vim grammar and typing land in the content, not
         // the title input.
         content.update(cx, |state, cx| state.focus(window, cx));
+        let tag_input = cx.new(|cx| {
+            let ph: SharedString = i18n::t(self.lang, i18n::Key::AddTagPlaceholder).into();
+            InputState::new(window, cx).placeholder(ph)
+        });
+        // Issue 23 #6: Enter in the tag field commits the chip.
+        cx.subscribe(&tag_input, |this, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. }) {
+                this.add_tag(cx);
+            }
+        })
+        .detach();
         self.editing = Some(EditState {
             note_id: id,
             title,
@@ -721,6 +781,9 @@ impl AppShell {
             dirty: false,
             preview: false,
             saved_flash: false,
+            tags: note.tags,
+            updated_time: note.updated_time,
+            tag_input,
         });
         // Issue 17 Q12: every session starts in normal mode.
         self.vim = crate::vim::VimState::new();
@@ -775,16 +838,31 @@ impl AppShell {
         let content = ed.content.read(cx).value().to_string();
         let id = ed.note_id.clone();
         let changed = content != ed.saved_content;
-        if changed {
-            if let Some(store) = self.store() {
-                let _ = store.save_note_with_history(
+        // Issue 23 #6: tags edited from the status bar dirty the note too.
+        if let Some(store) = self.store() {
+            let saved_tags = store
+                .get_note_any(&id)
+                .ok()
+                .flatten()
+                .map(|n| n.tags)
+                .unwrap_or_default();
+            let tags_changed = saved_tags != ed.tags;
+            if changed || tags_changed {
+                let saved = store.save_note_with_history(
                     &id,
                     leanote_core::NoteUpdate {
                         title: Some(title),
                         content: Some(content.clone()),
+                        tags: Some(ed.tags.clone()),
                         ..Default::default()
                     },
                 );
+                // Returned row carries the new UpdatedTime (issue 23 #6).
+                if let Some(note) = saved.ok().flatten() {
+                    if let Some(ed) = &mut self.editing {
+                        ed.updated_time = note.updated_time;
+                    }
+                }
             }
         }
         if let Some(ed) = &mut self.editing {
@@ -794,6 +872,31 @@ impl AppShell {
         }
         self.invalidate_lists();
         cx.notify();
+    }
+
+    /// Issue 23 #6: commit the tag-add input (Enter), then flush. Empty or
+    /// duplicate tags are ignored.
+    fn add_tag(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        let Some(ed) = &mut self.editing else { return };
+        let raw = ed.tag_input.read(cx).value().to_string();
+        let name = raw.trim().to_string();
+        if name.is_empty() || ed.tags.iter().any(|t| t == &name) {
+            return;
+        }
+        ed.tags.push(name);
+        ed.dirty = true;
+        self.save_editor(cx);
+    }
+
+    /// Issue 23 #6: drop a status-bar tag chip.
+    fn remove_tag(&mut self, tag: String, cx: &mut gpui_kit::Context<Self>) {
+        let Some(ed) = &mut self.editing else { return };
+        let before = ed.tags.len();
+        ed.tags.retain(|t| *t != tag);
+        if ed.tags.len() != before {
+            ed.dirty = true;
+            self.save_editor(cx);
+        }
     }
 
     /// Leave edit mode without saving.
@@ -815,33 +918,49 @@ impl AppShell {
     fn set_appearance(&mut self, ix: usize, cx: &mut gpui_kit::Context<Self>) {
         let dir = self.data_dir.clone();
         let mut p = crate::prefs::Prefs::load(&dir);
-        p.appearance = match ix {
+        let target = match ix {
             0 => crate::prefs::AppearancePref::Follow,
             1 => crate::prefs::AppearancePref::Light,
             _ => crate::prefs::AppearancePref::Dark,
         };
+        // Issue 23 #2: picking the already-active mode still reloaded the
+        // theme tables and repainted — a no-op click stays free now.
+        if p.appearance == target {
+            return;
+        }
+        p.appearance = target;
         p.save(&dir);
         // Panes read window.appearance(); drive it from the theme choice so
-        // Light/Dark repaint the whole app (issue 19 #26).
+        // Light/Dark repaint the whole app (issue 19 #26). Applied BEFORE the
+        // kit update below so the window's own appearance change (which fires
+        // the observer → a second wake replay) lands after ours, not racing it.
         cx.set_window_appearance(match p.appearance {
             crate::prefs::AppearancePref::Follow => None,
             crate::prefs::AppearancePref::Light => Some(gpui_kit::WindowAppearance::Light),
             crate::prefs::AppearancePref::Dark => Some(gpui_kit::WindowAppearance::Dark),
         });
-        match p.appearance {
-            crate::prefs::AppearancePref::Follow => {
-                gpui_kit::component::Theme::sync_system_appearance(None, cx)
-            }
-            crate::prefs::AppearancePref::Light => {
-                gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Light, None, cx);
-            }
-            crate::prefs::AppearancePref::Dark => {
-                gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
-            }
-        }
+        // Single-frame switch: one update() does mode load + wake overlay.
+        // change() would refresh_windows with bare kit colors first (visible
+        // flash), then a second update repaints with the Wake palette.
         let palette = p.editor_palette.clone();
+        let zoom = p.zoom;
+        let appearance = p.appearance;
+        let sys_mode = gpui_kit::component::ThemeMode::from(cx.window_appearance());
         gpui_kit::component::Theme::update(cx, move |theme| {
-            crate::apply_wake_theme(theme, &palette)
+            // Pick the target mode's registered config; Follow resolves the
+            // system appearance (read before the closure — cx moves in).
+            let mode = match appearance {
+                crate::prefs::AppearancePref::Follow => sys_mode,
+                crate::prefs::AppearancePref::Light => gpui_kit::component::ThemeMode::Light,
+                crate::prefs::AppearancePref::Dark => gpui_kit::component::ThemeMode::Dark,
+            };
+            let config = if mode.is_dark() {
+                theme.dark_theme.clone()
+            } else {
+                theme.light_theme.clone()
+            };
+            theme.apply_config(&config);
+            crate::apply_wake_theme(theme, &palette, zoom);
         });
         cx.notify();
     }
@@ -856,9 +975,9 @@ impl AppShell {
             _ => String::new(),
         };
         p.save(&dir);
-        let palette = p.editor_palette.clone();
+        let (palette, zoom) = (p.editor_palette.clone(), p.zoom);
         gpui_kit::component::Theme::update(cx, move |theme| {
-            crate::apply_wake_theme(theme, &palette)
+            crate::apply_wake_theme(theme, &palette, zoom)
         });
         cx.notify();
     }
@@ -870,6 +989,13 @@ impl AppShell {
         p.accent = id.to_string();
         p.save(&dir);
         theme::set_accent(id);
+        // Live swap must reach kit-owned surfaces (context-menu hover,
+        // ghost-button hover read tokens.accent), not just theme::accent()
+        // call sites — replay the wake overlay.
+        let (palette, zoom) = (p.editor_palette.clone(), p.zoom);
+        gpui_kit::component::Theme::update(cx, move |theme| {
+            crate::apply_wake_theme(theme, &palette, zoom)
+        });
         cx.notify();
     }
 
@@ -888,6 +1014,49 @@ impl AppShell {
             crate::prefs::LangPref::Zh => Lang::Zh,
             crate::prefs::LangPref::En => Lang::En,
         };
+        cx.notify();
+    }
+
+    /// Issue 23 #5 / Issue 24: zoom pref → disk + live scale. The kit Root
+    /// plugin re-stamps the window's rem size from `theme.font_size` every
+    /// frame, so zoom is applied by scaling that font size (one Theme::update
+    /// → sync_base + refresh_windows, same frame). `window.set_rem_size` was
+    /// dead on arrival — overwritten before the next layout.
+    fn set_zoom(&mut self, factor: f32, _window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        let dir = self.data_dir.clone();
+        let mut p = crate::prefs::Prefs::load(&dir);
+        p.zoom = factor;
+        p.save(&dir);
+        let palette = p.editor_palette.clone();
+        gpui_kit::component::Theme::update(cx, move |theme| {
+            crate::apply_wake_theme(theme, &palette, factor)
+        });
+    }
+
+    /// Issue 23 #10: editor toolbar pref → disk + live toggle.
+    fn set_editor_toolbar(&mut self, on: bool, cx: &mut gpui_kit::Context<Self>) {
+        let dir = self.data_dir.clone();
+        let mut p = crate::prefs::Prefs::load(&dir);
+        p.editor_toolbar = on;
+        p.save(&dir);
+        self.editor_toolbar = on;
+        cx.notify();
+    }
+
+    /// Issue 23 #9: vim pref row (⌘K quick toggle stays).
+    fn set_vim_setting(&mut self, on: bool, cx: &mut gpui_kit::Context<Self>) {
+        self.vim_enabled = on;
+        // Same-session effect: drop mode/pending when off, and sync the
+        // open editor's caret shape (ADR-0005) — issue 24: without this the
+        // current note kept the old caret/keys until the next note switch.
+        if !self.vim_enabled {
+            self.vim.reset();
+        }
+        if let Some(ed) = &self.editing {
+            let content = ed.content.clone();
+            content.update(cx, |state, cx| state.set_block_cursor(self.vim_enabled, cx));
+        }
+        self.save_vim_pref(cx);
         cx.notify();
     }
 
@@ -1297,9 +1466,9 @@ impl AppShell {
         });
     }
 
-    /// One note (`id`) → PDF via the server's exportPdf endpoint (src/api.js
-    /// authority). Any failure — not synced, no account, transport, server
-    /// error — falls back to a local HTML export with the reason shown.
+    /// One note (`id`) → PDF rendered locally with typst. The server's
+    /// exportPdf path is gone (it needs wkhtmltopdf the user's server lacks);
+    /// rich-text notes are converted to markdown first.
     fn export_note_pdf(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
         let Some(n) = self
             .store()
@@ -1307,35 +1476,12 @@ impl AppShell {
         else {
             return;
         };
-        let (server_id, account) = match self.store() {
-            Some(store) => (
-                store.note_server_id(&n.note_id.to_string()).ok().flatten(),
-                store.active_account().ok().flatten(),
-            ),
-            None => (None, None),
-        };
-        let not_synced = i18n::t(self.lang, i18n::Key::NotSynced).to_string();
-        let fell_back = i18n::t(self.lang, i18n::Key::PdfFellBack).to_string();
         let name = format!("{}.pdf", crate::export::safe_filename(&n.title));
+        let title = n.title.clone();
+        let src = crate::browse::reader_markdown_src(&n.title, &n.content, n.is_markdown);
         self.export_with_panel(name, cx, move |path| {
-            let pdf = match (&server_id, &account) {
-                (Some(sid), Some(acc)) => Some(Api::for_account(acc).export_pdf(sid)),
-                _ => None,
-            };
-            match pdf {
-                Some(Ok(bytes)) => std::fs::write(&path, bytes).map_err(|e| e.to_string()),
-                _ => {
-                    // Fallback: HTML at the .pdf path with extension swapped.
-                    let reason = if server_id.is_none() {
-                        not_synced.clone()
-                    } else {
-                        fell_back.clone()
-                    };
-                    std::fs::write(path.with_extension("html"), crate::export::note_to_html(&n))
-                        .map_err(|e| e.to_string())?;
-                    Err(reason)
-                }
-            }
+            let bytes = crate::pdf::note_to_pdf_title(&title, &src)?;
+            std::fs::write(&path, bytes).map_err(|e| e.to_string())
         });
     }
 
@@ -1518,6 +1664,8 @@ fn note_list_row(
     meta: SharedString,
     desc: SharedString,
     is_sel: bool,
+    divided: bool,
+    dark: bool,
     fg: gpui_kit::Hsla,
     sel_fg: gpui_kit::Hsla,
     muted: gpui_kit::Hsla,
@@ -1593,6 +1741,16 @@ fn note_list_row(
                 .flex_shrink_0()
                 .child(small_label(desc, row_muted)),
         )
+        .when(divided && !is_sel, |el| {
+            // Issue 23 #11: 1px separator under the row — last row and the
+            // selected accent band stay clean.
+            el.child(
+                gpui_kit::div()
+                    .h(px(NOTE_ROW_DIVIDER_H))
+                    .w_full()
+                    .bg(theme::border(dark)),
+            )
+        })
 }
 
 /// Issue 18/21: right-click menu on a note row — star toggle + exports
@@ -1679,7 +1837,7 @@ impl Render for AppShell {
         window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) -> impl IntoElement {
-        let dark = self.dark(window);
+        let dark = self.dark(cx);
         let lang = self.lang;
         let t = move |k: i18n::Key| i18n::t(lang, k);
         let base_bg = theme::material(Material::Base, dark);
@@ -1845,7 +2003,7 @@ impl Render for AppShell {
                         &self.password,
                     )));
             }
-            Phase::Syncing { lines } => {
+            Phase::Syncing { lines, done, total } => {
                 body = body
                     .child(
                         resizable_panel()
@@ -1859,7 +2017,7 @@ impl Render for AppShell {
                             .size_range(px(MID_RANGE.0)..px(MID_RANGE.1))
                             .child(gpui_kit::base::v_flex().h_full().w_full().bg(list_bg)),
                     )
-                    .child(resizable_panel().child(render_syncing(dark, lines, &t)));
+                    .child(resizable_panel().child(render_syncing(dark, lines, *done, *total, &t)));
             }
             Phase::Shell { .. } if self.full_preview => {
                 // Issue 21 需求10: ⌘T full-window preview — the selected
@@ -2125,11 +2283,6 @@ fn render_login(
         .child(small_label(t(i18n::Key::Password), muted))
         .child(Input::new(password).appearance(true).bordered(true));
 
-    let register = gpui_kit::component::link::Link::new("register")
-        .href("https://leanote.com/register")
-        .child(small_label(t(i18n::Key::Register), muted))
-        .on_click(|_ev, _window, cx| cx.open_url("https://leanote.com/register"));
-
     let mut form = gpui_kit::base::v_flex()
         .gap_3()
         .w(px(360.))
@@ -2138,8 +2291,7 @@ fn render_login(
         .child(host_field)
         .child(email_field)
         .child(password_field)
-        .child(sign_in)
-        .child(register);
+        .child(sign_in);
     if let Some(err) = error {
         form = form.child(
             Label::new(format!(
@@ -2167,6 +2319,8 @@ fn render_login(
 fn render_syncing(
     dark: bool,
     lines: &[SharedString],
+    done: usize,
+    total: usize,
     t: &dyn Fn(i18n::Key) -> &'static str,
 ) -> impl IntoElement {
     let muted = theme::muted_foreground(dark);
@@ -2176,6 +2330,23 @@ fn render_syncing(
         .take(8)
         .map(|l| small_label(l.clone(), muted))
         .collect::<Vec<_>>();
+    // Progress bar: indeterminate while chunking indexes (no server-side
+    // total), deterministic once the content stage reports done/total.
+    let bar = if total > 0 {
+        Progress::new("sync-progress").value(done as f32 / total as f32 * 100.)
+    } else {
+        Progress::new("sync-progress").loading(true)
+    };
+    let caption = if total > 0 {
+        SharedString::from(format!(
+            "{}/{} · {}",
+            done,
+            total,
+            t(i18n::Key::SyncingContents)
+        ))
+    } else {
+        SharedString::from(t(i18n::Key::SyncingSubtitle))
+    };
     gpui_kit::base::v_flex()
         .flex_1()
         .h_full()
@@ -2196,14 +2367,8 @@ fn render_syncing(
                                 .text_color(theme::foreground(dark)),
                         ),
                 )
-                .child(small_label(
-                    if lines.is_empty() {
-                        t(i18n::Key::SyncingSubtitle)
-                    } else {
-                        t(i18n::Key::SyncDone)
-                    },
-                    muted,
-                ))
+                .child(bar)
+                .child(small_label(caption, muted))
                 .child(gpui_kit::base::v_flex().gap_1().children(rows)),
         )
         .into_element()
@@ -2214,7 +2379,9 @@ fn nav_row(
     dark: bool,
     node: &NavNode,
     kind: &str,
-    icon: Option<IconName>,
+    // Issue 23 #3: AssetIcon carries the full Lucide catalog (Trash);
+    // the component IconName subset lacks it.
+    icon: Option<AssetIcon>,
     selected: bool,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
     let fg = theme::foreground(dark);
@@ -2375,7 +2542,7 @@ impl AppShell {
             dark,
             &all,
             "fixed",
-            Some(IconName::BookOpen),
+            Some(AssetIcon::BookOpen),
             self.nav == NavSelection::Recent,
         );
         let starred_row = nav_row(
@@ -2383,7 +2550,7 @@ impl AppShell {
             dark,
             &starred,
             "starred",
-            Some(IconName::Star),
+            Some(AssetIcon::Star),
             self.nav == NavSelection::Starred,
         );
         let trash_row = nav_row(
@@ -2391,7 +2558,7 @@ impl AppShell {
             dark,
             &trash,
             "trash",
-            Some(IconName::Delete),
+            Some(AssetIcon::Trash), // issue 23 #3: trash-can glyph
             self.nav == NavSelection::Trash,
         );
 
@@ -2487,7 +2654,7 @@ impl AppShell {
                                         dark,
                                         node,
                                         "notebook",
-                                        Some(IconName::FolderClosed),
+                                        Some(AssetIcon::FolderClosed),
                                         is_sel,
                                     )
                                     .context_menu({
@@ -2672,8 +2839,12 @@ impl AppShell {
         }
 
         // Issue 19: trash lives after the tags group, before the footer.
-        // Issue 20: no spacer — exactly one group is open, and its vlist
-        // (flex_1) pushes trash + footer to natural height at the bottom.
+        // Issue 24: spacer only when BOTH groups are collapsed — the open
+        // group's vlist owns the leftover height (flex_1), and a permanent
+        // spacer split it half/half, pinning trash+footer mid-pane.
+        if !notebooks_open && !tags_open {
+            nav = nav.child(gpui_kit::div().id("nav-spacer").flex_1().min_h_0());
+        }
         nav = nav.child(trash_row);
 
         // "Move to…" picker replaces the notebook list while choosing
@@ -2837,7 +3008,7 @@ impl AppShell {
         let shell = cx.entity();
         let lang = self.lang;
         let t = move |k: i18n::Key| i18n::t(lang, k);
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_dialog(cx, move |dialog, _window, cx| {
             let shell_c = shell.clone();
             let t = t;
             let prefs = crate::prefs::Prefs::load(&shell.read(cx).data_dir);
@@ -2845,7 +3016,7 @@ impl AppShell {
                 .read(cx)
                 .store()
                 .and_then(|s| s.active_account().ok().flatten());
-            let dark = shell.read(cx).dark(window);
+            let dark = shell.read(cx).dark(cx);
             let muted = theme::muted_foreground(dark);
 
             // Row builders.
@@ -2887,6 +3058,55 @@ impl AppShell {
                             }
                         },
                     ),
+                ))
+                // Interface zoom (issue 23 #5): 5 steps, rem-based scale.
+                .child(row(t(i18n::Key::InterfaceZoom).into(), {
+                    let mut zooms = gpui_kit::base::h_flex().gap_1();
+                    for factor in [1.0f32, 1.1, 1.25, 1.5, 1.6] {
+                        let shell = shell_c.clone();
+                        let label = format!("{}%", (factor * 100.).round() as u32);
+                        let active = (prefs.zoom - factor).abs() < 0.01;
+                        zooms = zooms.child(
+                            Button::new(SharedString::from(format!("set-zoom-{factor}")))
+                                .label(label)
+                                .when(active, |b| b.primary())
+                                .when(!active, |b| b.ghost())
+                                .xsmall()
+                                .on_click(move |_, window, cx| {
+                                    let _ = shell
+                                        .update(cx, |this, cx| this.set_zoom(factor, window, cx));
+                                }),
+                        );
+                    }
+                    zooms.into_any_element()
+                }))
+                // Vim toggle (issue 23 #9)
+                .child(row(
+                    t(i18n::Key::VimMode).into(),
+                    Switch::new("set-vim")
+                        .checked(prefs.vim_default)
+                        .on_click({
+                            let shell = shell_c.clone();
+                            move |checked, _window, cx| {
+                                let _ =
+                                    shell.update(cx, |this, cx| this.set_vim_setting(*checked, cx));
+                            }
+                        })
+                        .into_any_element(),
+                ))
+                // Editor toolbar toggle (issue 23 #10)
+                .child(row(
+                    t(i18n::Key::EditorToolbar).into(),
+                    Switch::new("set-editor-toolbar")
+                        .checked(prefs.editor_toolbar)
+                        .on_click({
+                            let shell = shell_c.clone();
+                            move |checked, _window, cx| {
+                                let _ = shell
+                                    .update(cx, |this, cx| this.set_editor_toolbar(*checked, cx));
+                            }
+                        })
+                        .into_any_element(),
                 ))
                 // Editor palette
                 .child(row(
@@ -3036,9 +3256,9 @@ impl AppShell {
             .flatten()
             .unwrap_or_default();
         let t = move |k: i18n::Key| i18n::t(lang, k);
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_dialog(cx, move |dialog, _window, cx| {
             let shell_c = shell.clone();
-            let dark = shell.read(cx).dark(window);
+            let dark = shell.read(cx).dark(cx);
             let muted = theme::muted_foreground(dark);
             let mut rows = gpui_kit::base::v_flex().gap_1();
             if history.is_empty() {
@@ -3141,7 +3361,7 @@ impl AppShell {
             .map(|ed| ed.content.read(cx).value().to_string())
             .unwrap_or_default();
         let mut ids: Vec<String> = Vec::new();
-        let mut rest = content.as_str();
+        let rest = content.as_str();
         while let Some(pos) = rest.find("getAttach?fileId=") {
             let after = &rest[pos + "getAttach?fileId=".len()..];
             let id: String = after
@@ -3151,11 +3371,10 @@ impl AppShell {
             if !id.is_empty() && !ids.contains(&id) {
                 ids.push(id);
             }
-            rest = after;
         }
         let t = move |k: i18n::Key| i18n::t(lang, k);
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let dark = shell.read(cx).dark(window);
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let dark = shell.read(cx).dark(cx);
             let muted = theme::muted_foreground(dark);
             let mut list = gpui_kit::base::v_flex().gap_1();
             if ids.is_empty() {
@@ -3529,7 +3748,7 @@ impl AppShell {
         let icon = match &self.nav {
             NavSelection::Recent => Some(AssetIcon::BookOpen),
             NavSelection::Starred => Some(AssetIcon::Star),
-            NavSelection::Trash => Some(AssetIcon::Delete),
+            NavSelection::Trash => Some(AssetIcon::Trash),
             NavSelection::Notebook(_) => Some(AssetIcon::FolderClosed),
             NavSelection::Tag(_) => Some(AssetIcon::Tag),
         };
@@ -3597,12 +3816,15 @@ impl AppShell {
                                     // desc), single truncated line.
                                     let desc: SharedString = n.desc.clone().into();
                                     let is_sel = sel_id.as_ref() == Some(&n.note_id);
+                                    let divided = ix + 1 < notes_for_list.len();
                                     note_list_row(
                                         &shell,
                                         n,
                                         meta.into(),
                                         desc,
                                         is_sel,
+                                        divided,
+                                        dark,
                                         fg,
                                         sel_fg,
                                         muted,
@@ -3899,6 +4121,7 @@ impl AppShell {
         let title_entity = ed.title.clone();
         let content_entity = ed.content.clone();
         let preview = ed.preview;
+        let toolbar_on = self.editor_toolbar; // issue 23 #10
         let saved_flash = ed.saved_flash;
 
         // Issue 19: title row = title input + ghost icon buttons; save runs
@@ -3926,12 +4149,13 @@ impl AppShell {
             .child(
                 // Issue 21: title 20px (fixed) — Styled .text_size flows
                 // into the state's text element (its prepaint reads
-                // window.text_style()).
+                // window.text_style()). 36px row: 20px text + descender
+                // room; 32px clipped the glyph tops (issue 23 #8).
                 Input::new(&title_entity)
                     .appearance(false)
                     .bordered(false)
                     .text_size(px(20.))
-                    .h(px(32.))
+                    .h(px(36.))
                     .flex_1()
                     .min_w_0(),
             )
@@ -4046,6 +4270,9 @@ impl AppShell {
             gpui_kit::base::v_flex()
                 .min_h_0()
                 .flex_1()
+                // Issue 23 #7: 10px side margins (editor-internal preview;
+                // the ⌘T full-window preview keeps its 32px frame).
+                .px(px(10.))
                 .child(
                     TextView::markdown(
                         "editor-preview",
@@ -4076,10 +4303,86 @@ impl AppShell {
             .px(px(5.))
             .gap_2()
             .min_h_0()
+            .pb_0()
             .h_full()
             .child(title_row)
-            .when(!preview, |el| el.child(md_toolbar))
+            .when(!preview && toolbar_on, |el| el.child(md_toolbar))
             .child(body)
+            .when(!preview, |el| {
+                // Issue 23 #6: editor status bar — tag chips + add field
+                // (left), vim mode + line:col (middle), local updated time
+                // (right). Edit mode only; preview keeps the clean look.
+                let ed = self.editing.as_ref().unwrap();
+                let pos = content_entity.read(cx).cursor_position();
+                let mode = if self.vim_enabled {
+                    match self.vim.mode {
+                        crate::vim::VimMode::Normal => "-- NORMAL --".to_string(),
+                        crate::vim::VimMode::Insert => "-- INSERT --".to_string(),
+                        crate::vim::VimMode::Visual => "-- VISUAL --".to_string(),
+                    }
+                } else {
+                    format!("-- {} --", t(i18n::Key::ModeNormal))
+                };
+                el.child(
+                    gpui_kit::base::h_flex()
+                        .w_full()
+                        .h_7()
+                        .gap_2()
+                        .px_2()
+                        .mb_0()
+                        .border_t_1()
+                        .border_color(theme::border(dark))
+                        .child(
+                            gpui_kit::base::h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1()
+                                .child(Label::new(t(i18n::Key::TagsLabel)).text_size(px(12.)))
+                                .children(ed.tags.iter().cloned().map(|tag| {
+                                    let shell_t = cx.entity().downgrade();
+                                    let tag_id: SharedString = format!("tag-x-{tag}").into();
+                                    gpui_kit::base::h_flex()
+                                        .gap_1()
+                                        .px_2()
+                                        .rounded(px(theme::RADIUS_SELECTION))
+                                        .bg(theme::material(Material::List, dark))
+                                        .child(small_label(SharedString::from(tag.clone()), muted))
+                                        .child(
+                                            Button::new(tag_id.clone())
+                                                .icon(AssetIcon::X)
+                                                .ghost()
+                                                .xsmall()
+                                                .on_click(move |_, _window, cx| {
+                                                    let _ = shell_t.update(cx, |this, cx| {
+                                                        this.remove_tag(tag.clone(), cx)
+                                                    });
+                                                }),
+                                        )
+                                }))
+                                .child(
+                                    Input::new(&ed.tag_input)
+                                        .xsmall()
+                                        .w(px(120.))
+                                        .cleanable(false),
+                                ),
+                        )
+                        .child(
+                            small_label(
+                                SharedString::from(format!(
+                                    "{mode}  {}:{}",
+                                    pos.line + 1,
+                                    pos.character + 1
+                                )),
+                                muted,
+                            )
+                            .text_size(px(12.)),
+                        )
+                        .child(
+                            small_label(SharedString::from(fmt_time(ed.updated_time)), muted)
+                                .text_size(px(12.)),
+                        ),
+                )
+            })
             .on_drop::<gpui_kit::ExternalPaths>(cx.listener(
                 |this, paths: &gpui_kit::ExternalPaths, window, cx| {
                     // Issue 21 需求9: dropped image files attach to the note.

@@ -14,7 +14,6 @@
 //! | GET  `/api/tag/getSyncTags`        | `token, afterUsn, maxEntry`              | –                          | JSON array; `sync.js` uses `Usn`, `TagId`, `Tag`, `IsDeleted` |
 //! | POST `/api/notebook/addNotebook`   | `token`                                  | form: `title, seq, parentNotebookId` | `{Ok:true, NotebookId, Usn, ...}` (echo full row; `sync.js` needs `NotebookId` + `Usn`) |
 //! | POST `/api/notebook/updateNotebook`| `token`                                  | form: `notebookId, title, usn, seq, parentNotebookId` | `{Ok:true, NotebookId, Usn}`; injected: `{Ok:false, Msg:"conflict"/"notExists"}` |
-//! | GET  `/api/note/exportPdf`         | `token, noteId`                          | –                          | ok: raw PDF bytes (`application/pdf`); fail: `{Ok:false, Msg:"exportPdfFailed"}` |
 //! | POST `/api/notebook/deleteNotebook`| `token`                                  | form: `notebookId, usn`    | `{Ok:true, Usn}`; injected: `{Ok:false, Msg:"conflict"}` |
 //! | POST `/api/note/addNote`           | `token`                                  | form/json                  | `{Ok:true, NoteId, Usn}` (`sync.js` copies `NoteId`→`ServerNoteId`, calls `checkNeedIncSyncAgain(Usn)`) |
 //! | POST `/api/note/updateNote`        | `token`                                  | form/json `NoteId, Usn, ...` | `{Ok:true, NoteId, Usn}`; injected: `{Ok:false, Msg:"conflict"/"notExists"}` |
@@ -66,10 +65,6 @@ struct Inner {
     conflicts: VecDeque<Map<String, Value>>,
     /// Every push request received, in arrival order.
     pushes: Vec<RecordedPush>,
-    /// Bytes served by `note/exportPdf` (must start with `%PDF`).
-    pdf_bytes: Option<Vec<u8>>,
-    /// When set, `note/exportPdf` answers `{Ok:false, Msg:"exportPdfFailed"}`.
-    pdf_fail: bool,
     /// Issue 19: `fileId -> (filename, bytes)` served by `file/getAttach`.
     attaches: std::collections::HashMap<String, (String, Vec<u8>)>,
     /// Issue 21: `fileId -> (filename, mime, bytes)` served by
@@ -145,16 +140,6 @@ impl FakeServer {
         self.inner.lock().unwrap().pushes.clone()
     }
 
-    /// Bytes `note/exportPdf` returns (prefix `%PDF` to count as success).
-    pub fn set_pdf_bytes(&self, bytes: Vec<u8>) {
-        self.inner.lock().unwrap().pdf_bytes = Some(bytes);
-    }
-
-    /// Make `note/exportPdf` fail with `{Ok:false, Msg:"exportPdfFailed"}`.
-    pub fn set_pdf_fail(&self) {
-        self.inner.lock().unwrap().pdf_fail = true;
-    }
-
     /// Issue 19: `fileId -> (filename, bytes)` for `file/getAttach`.
     pub fn set_attaches(&self, attaches: std::collections::HashMap<String, (String, Vec<u8>)>) {
         self.inner.lock().unwrap().attaches = attaches;
@@ -228,7 +213,6 @@ pub async fn start() -> FakeServer {
         .route("/api/note/addNote", post(push("note/addNote")))
         .route("/api/note/updateNote", post(push("note/updateNote")))
         .route("/api/note/deleteTrash", post(push("note/deleteTrash")))
-        .route("/api/note/exportPdf", get(export_pdf))
         .route("/api/file/getAttach", get(get_attach))
         .route("/api/file/getImage", get(get_image))
         .route("/api/tag/addTag", post(push("tag/addTag")))
@@ -482,31 +466,6 @@ async fn get_note_content(
     let note_id = query.get("noteId").and_then(|v| v.as_str()).unwrap_or("");
     match i.contents.get(note_id) {
         Some(content) => json_response(json!({"Ok": true, "NoteId": note_id, "Content": content})),
-        None => json_response(json!({"Ok": false, "Msg": "notExists"})),
-    }
-}
-
-/// `note/exportPdf`: on success the body is raw PDF bytes with an
-/// `application/pdf` content-type; failure is the usual `{Ok:false, Msg}`
-/// JSON (src/api.js exportPdf contract).
-async fn export_pdf(
-    State(inner): State<Arc<Mutex<Inner>>>,
-    Query(query): Query<Map<String, Value>>,
-) -> Response {
-    let i = inner.lock().unwrap();
-    if let Some(r) = require_token(&query, &i) {
-        return r;
-    }
-    if i.pdf_fail {
-        return json_response(json!({"Ok": false, "Msg": "exportPdfFailed"}));
-    }
-    match &i.pdf_bytes {
-        Some(bytes) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/pdf")],
-            bytes.clone(),
-        )
-            .into_response(),
         None => json_response(json!({"Ok": false, "Msg": "notExists"})),
     }
 }

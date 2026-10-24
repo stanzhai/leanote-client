@@ -46,7 +46,7 @@ keys! {
     Password => ("密码", "Password"),
     SignIn => ("登录", "Sign In"),
     SigningIn => ("登录中…", "Signing in…"),
-    Register => ("注册 leanote.com 账户", "Create a leanote.com account"),
+    SyncingContents => ("正在拉取笔记内容", "Downloading note contents"),
     LoginFailed => ("登录失败", "Login failed"),
     // Sync progress.
     SyncingTitle => ("正在全量同步", "Full sync in progress"),
@@ -110,7 +110,6 @@ keys! {
     // Issue 21: row context-menu items.
     StarNote => ("星标", "Star"),
     UnstarNote => ("取消星标", "Unstar"),
-    PdfFellBack => ("服务器导出 PDF 失败，已导出 HTML", "Server PDF export failed, exported HTML instead"),
     NotSynced => ("笔记尚未同步到服务器", "Note is not synced to the server"),
     // Review item 2: sync-now/logout controls.
     SyncNow => ("立即同步", "Sync now"),
@@ -139,7 +138,13 @@ keys! {
     DownloadFailed => ("下载失败", "Download failed"),
     MarkdownHelpTitle => ("Markdown 语法", "Markdown syntax"),
     AccentColor => ("强调色", "Accent color"),
-    // MarkdownHelpBody: see `markdown_help_body` (multi-line raw strings).
+    // Issue 23: settings + editor status bar.
+    InterfaceZoom => ("界面缩放", "Interface zoom"),
+    EditorToolbar => ("编辑器工具栏", "Editor toolbar"),
+    VimMode => ("Vim 模式", "Vim mode"),
+    ModeNormal => ("普通", "Normal"),
+    TagsLabel => ("标签", "Tags"),
+    AddTagPlaceholder => ("添加标签…", "Add tag…"),
     // Issue 17: logout confirmation.
     LogoutConfirmTitle => ("退出登录？", "Log out?"),
     LogoutConfirmBody => (
@@ -212,7 +217,7 @@ mod tests {
         Key::Password,
         Key::SignIn,
         Key::SigningIn,
-        Key::Register,
+        Key::SyncingContents,
         Key::LoginFailed,
         Key::SyncingTitle,
         Key::SyncingSubtitle,
@@ -243,7 +248,6 @@ mod tests {
         Key::ExportPdf,
         Key::StarNote,
         Key::UnstarNote,
-        Key::PdfFellBack,
         Key::NotSynced,
         Key::ConflictTitle,
         Key::ConflictLocal,
@@ -289,6 +293,13 @@ mod tests {
         Key::DownloadFailed,
         Key::MarkdownHelpTitle,
         Key::AccentColor,
+        Key::InterfaceZoom,
+        Key::EditorToolbar,
+        Key::VimMode,
+        Key::ModeNormal,
+        Key::TagsLabel,
+        Key::AddTagPlaceholder,
+        Key::PaletteSolarized,
         Key::LogoutConfirmTitle,
         Key::LogoutConfirmBody,
     ];

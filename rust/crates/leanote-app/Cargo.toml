@@ -27,6 +27,12 @@ ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] 
 smol = "2"
 sys-locale = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread"] }
+typst = "0.15.1"
+typst-pdf = "0.15.1"
+typst-layout = "0.15.1"
+# Local PDF export: system fonts first (CJK via OS font dirs), embedded
+# Libertinus/DejaVu as guaranteed fallback.
+typst-kit = { version = "0.15.1", features = ["scan-fonts", "embedded-fonts"] }
 
 [dev-dependencies]
 gpui-pre = { version = "=0.3.9", package = "gpui-pre", features = [

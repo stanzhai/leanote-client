@@ -146,16 +146,28 @@ pub fn editor_palettes() -> &'static [PaletteDef] {
 }
 
 /// Parse the palette for `id`; unknown or malformed → kit default.
+/// Issue 23 #2: parsed once per (id, dark) — theme switches replay this on
+/// every appearance change and the JSON is tens of KB each time.
 pub fn editor_palette(id: &str, dark: bool) -> std::sync::Arc<HighlightTheme> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+    static CACHE: LazyLock<Mutex<HashMap<(&'static str, bool), Arc<HighlightTheme>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
     let def = editor_palettes().iter().find(|p| p.id == id);
-    match def {
+    let key = (def.map(|d| d.id).unwrap_or(""), dark);
+    if let Some(hit) = CACHE.lock().unwrap().get(&key) {
+        return hit.clone();
+    }
+    let parsed = match def {
         Some(d) => {
             serde_json::from_str::<HighlightTheme>(if dark { (d.dark)() } else { (d.light)() })
-                .map(std::sync::Arc::new)
+                .map(Arc::new)
                 .unwrap_or_else(|_| fallback(dark))
         }
         None => fallback(dark),
-    }
+    };
+    CACHE.lock().unwrap().insert(key, parsed.clone());
+    parsed
 }
 
 fn fallback(dark: bool) -> std::sync::Arc<HighlightTheme> {

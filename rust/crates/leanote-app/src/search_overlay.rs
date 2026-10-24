@@ -152,13 +152,13 @@ impl SearchOverlay {
 /// recents; a typed query shows core search results.
 fn render_dialog(
     dialog: Dialog,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut App,
     state: &Entity<CommandState>,
     shell: &Entity<AppShell>,
 ) -> Dialog {
     let lang = shell.read(cx).lang();
-    let dark = shell.read(cx).dark(window);
+    let dark = shell.read(cx).dark(cx);
     let muted = theme::muted_foreground(dark);
     let t_footnote = i18n::t(lang, i18n::Key::SearchFootnote);
 

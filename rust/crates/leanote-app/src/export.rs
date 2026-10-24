@@ -526,43 +526,4 @@ mod tests {
         let _ = n;
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    /// Ticket 15 smoke: server PDF success + JSON-failure paths through the
-    /// real ureq client and fakeserver (checkbox 3 evidence).
-    #[test]
-    fn pdf_api_success_and_failure_against_fakeserver() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let fs = leanote_fakeserver::start().await;
-            let dir = std::env::temp_dir().join(format!("leanote-pdf-smoke-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            let store = leanote_core::Store::open(dir.clone(), "user1".into()).unwrap();
-            let account = leanote_core::sync::Api::login(
-                &fs.url(),
-                leanote_fakeserver::EMAIL,
-                leanote_fakeserver::PWD,
-                &store,
-            )
-            .unwrap();
-            let api = leanote_core::sync::Api::for_account(&account);
-
-            // Success: real %PDF body.
-            fs.set_pdf_bytes(b"%PDF-1.4 fake pdf bytes".to_vec());
-            let bytes = api.export_pdf("n1").unwrap();
-            assert!(bytes.starts_with(b"%PDF"), "expected PDF body, got {:?}", &bytes[..8.min(bytes.len())]);
-
-            // Failure: JSON {Ok:false,Msg} → SyncError::Api with the server Msg.
-            fs.set_pdf_fail();
-            let err = api.export_pdf("n1").unwrap_err();
-            assert!(
-                matches!(&err, leanote_core::sync::SyncError::Api(m) if m.contains("exportPdfFailed")),
-                "expected Api(exportPdfFailed), got {err:?}"
-            );
-            let _ = std::fs::remove_dir_all(&dir);
-        });
-    }
 }

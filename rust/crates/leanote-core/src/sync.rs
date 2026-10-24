@@ -227,43 +227,10 @@ impl Api {
         }
     }
 
-    /// GET note/exportPdf → raw PDF bytes (src/api.js `exportPdf`: the body
-    /// is the file, NOT JSON; the server signals failure with a JSON
-    /// `{Ok:false, Msg}` object, which JS detects via `typeof body == 'object'`).
-    pub fn export_pdf(&self, server_note_id: &str) -> Result<Vec<u8>, SyncError> {
-        use std::io::Read;
-        let mut resp = self
-            .agent
-            .get(&self.url("note/exportPdf", &[("noteId", server_note_id.to_string())]))
-            .call()
-            .map_err(|e| SyncError::Unconnected(e.to_string()))?;
-        let is_json = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.starts_with("application/json"));
-        let mut body = Vec::new();
-        resp.body_mut()
-            .with_config()
-            .reader()
-            .read_to_end(&mut body)
-            .map_err(|e| SyncError::Unconnected(e.to_string()))?;
-        if is_json {
-            // `{"Ok":false,"Msg":...}` → surface the server's own Msg.
-            let v: Value =
-                serde_json::from_slice(&body).map_err(|e| SyncError::Unconnected(e.to_string()))?;
-            Self::ok_or_api(v).map(|_| body)
-        } else if body.starts_with(b"%PDF") {
-            Ok(body)
-        } else {
-            Err(SyncError::Unconnected("response is not a PDF".into()))
-        }
-    }
-
     /// GET file/getAttach → raw attachment bytes + filename (issue 19,
-    /// readonly view/download; upload is issue 20). Like `exportPdf` the
-    /// body is the file; the filename comes from the Content-Disposition
-    /// header (Electron api.js `getAttach`).
+    /// readonly view/download; upload is issue 20). The body is the file;
+    /// the filename comes from the Content-Disposition header (Electron
+    /// api.js `getAttach`).
     pub fn get_attach(&self, file_id: &str) -> Result<(String, Vec<u8>), SyncError> {
         use std::io::Read;
         let mut resp = self
@@ -677,6 +644,12 @@ pub trait SyncProgress {
     fn note(&self, msg: String) {
         let _ = msg;
     }
+    /// Deterministic progress for the slow stage (per-note content
+    /// fetches): `done` items of `total`. Default no-op keeps CLI/tests
+    /// untouched.
+    fn tick(&self, done: usize, total: usize) {
+        let _ = (done, total);
+    }
 }
 
 /// Silent default.
@@ -782,7 +755,9 @@ pub fn full_sync(
     let server_ids = store
         .note_server_ids_needing_content()
         .map_err(|e| SyncError::Unconnected(e.to_string()))?;
-    for sid in server_ids {
+    let total = server_ids.len();
+    for (done, sid) in server_ids.into_iter().enumerate() {
+        progress.tick(done, total);
         let content = api.get_note_content(&sid)?;
         store
             .set_note_content_by_server_id(&sid, &content)
@@ -790,6 +765,7 @@ pub fn full_sync(
         stats.contents += 1;
         progress.note(format!("content: {sid}"));
     }
+    progress.tick(total, total);
 
     // Issue 21 需求9: download bytes for images referenced by pulled notes.
     let _ = pull_missing_images(api, store);
