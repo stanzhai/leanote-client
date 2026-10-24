@@ -485,6 +485,7 @@ pub fn mac_addr() -> String {
     const FALLBACK: &str = "00:00:00:00:00:00";
     // SAFETY: getifaddrs returns a NULL-terminated list owned by the caller;
     // we only read it and hand it back to freeifaddrs.
+    #[cfg(unix)]
     unsafe {
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut ifap) != 0 {
@@ -515,8 +516,6 @@ pub fn mac_addr() -> String {
                 let sll = &*(ifa.ifa_addr as *const libc::sockaddr_ll);
                 (sll.sll_halen as usize >= 6).then(|| sll.sll_addr[..6].to_vec())
             });
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-            let bytes: Option<Vec<u8>> = None;
             let Some(b) = bytes.flatten() else { continue };
             mac = b
                 .iter()
@@ -530,6 +529,10 @@ pub fn mac_addr() -> String {
         } else {
             mac
         }
+    }
+    #[cfg(not(unix))]
+    {
+        FALLBACK.to_string()
     }
 }
 

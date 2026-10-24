@@ -21,7 +21,7 @@ pub struct Id(pub String);
 impl Id {
     pub fn new() -> Self {
         let mut b = [0u8; 12];
-        getrandom_bytes(&mut b);
+        getrandom::fill(&mut b).expect("os entropy");
         Id(hex(&b))
     }
 }
@@ -45,19 +45,8 @@ impl std::ops::Deref for Id {
     }
 }
 
-fn getrandom_bytes(buf: &mut [u8]) {
-    // std-only: read from the OS entropy file. One syscall, no new dependency.
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        let mut f = std::fs::File::open("/dev/urandom").expect("open /dev/urandom");
-        f.read_exact(buf).expect("read /dev/urandom");
-    }
-    #[cfg(not(unix))]
-    {
-        unimplemented!("non-unix id generation");
-    }
-}
+// (removed: hand-rolled /dev/urandom reader; getrandom is already a
+// workspace-compiled dep and covers Windows, where the old stub panicked.)
 
 fn hex(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);

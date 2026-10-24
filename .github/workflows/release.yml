@@ -66,8 +66,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libx11-dev libwayland-dev \
-            libfontconfig-dev libfreetype-dev patchelf
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libx11-dev \
+            libwayland-dev libfontconfig-dev libfreetype-dev patchelf
 
       - name: Build and package
         shell: bash
