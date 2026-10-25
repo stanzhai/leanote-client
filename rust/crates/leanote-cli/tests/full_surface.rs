@@ -50,6 +50,7 @@ fn run(home_dir: &PathBuf, args: &[&str], stdin: Option<&str>) -> (String, Strin
         .env("HOME", home_dir)
         .env("LEANOTE_DATA", home_dir.join("data"))
         .env("LEANOTE_PORT", "8913")
+        .env("TZ", "Asia/Shanghai")
         .env_remove("LEANOTE_NO_SHIM_SWITCH")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -58,7 +59,12 @@ fn run(home_dir: &PathBuf, args: &[&str], stdin: Option<&str>) -> (String, Strin
     }
     let mut child = cmd.spawn().unwrap();
     if let Some(s) = stdin {
-        child.stdin.as_mut().unwrap().write_all(s.as_bytes()).unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(s.as_bytes())
+            .unwrap();
     }
     let out = child.wait_with_output().unwrap();
     (
@@ -75,6 +81,7 @@ fn quiet(home_dir: &PathBuf, args: &[&str], stdin: Option<&str>) -> (String, Str
         .env("LEANOTE_DATA", home_dir.join("data"))
         .env("LEANOTE_NO_SHIM_SWITCH", "1")
         .env("LEANOTE_PORT", "8913")
+        .env("TZ", "Asia/Shanghai")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if stdin.is_some() {
@@ -82,7 +89,12 @@ fn quiet(home_dir: &PathBuf, args: &[&str], stdin: Option<&str>) -> (String, Str
     }
     let mut child = cmd.spawn().unwrap();
     if let Some(s) = stdin {
-        child.stdin.as_mut().unwrap().write_all(s.as_bytes()).unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(s.as_bytes())
+            .unwrap();
     }
     let out = child.wait_with_output().unwrap();
     (
@@ -96,7 +108,9 @@ fn quiet(home_dir: &PathBuf, args: &[&str], stdin: Option<&str>) -> (String, Str
 fn spawn_server(home_dir: &PathBuf) -> std::process::Child {
     // A leaked `serve` from an earlier failed test would shadow ours
     // (bind -> AddrInUse -> silent exit). Clear the port first.
-    let _ = Command::new("bash").args(["-c", "pkill -f leanote\\ serve || true"]).status();
+    let _ = Command::new("bash")
+        .args(["-c", "pkill -f leanote\\ serve || true"])
+        .status();
     std::thread::sleep(std::time::Duration::from_millis(200));
     let child = Command::new(bin())
         .args(["serve", "-p", "8913"])
@@ -121,7 +135,13 @@ fn seed(home_dir: &PathBuf) -> String {
     // two notes with deterministic ids via sqlite surgery
     quiet(
         home_dir,
-        &["add", "-t", "Meeting notes", "-c", "# Agenda\nline two with keyword"],
+        &[
+            "add",
+            "-t",
+            "Meeting notes",
+            "-c",
+            "# Agenda\nline two with keyword",
+        ],
         None,
     );
     quiet(home_dir, &["add", "-t", "Other", "-c", "zzz body"], None);
@@ -166,7 +186,10 @@ fn search_output_matches_js_format() {
 
     // no match
     let (out, _, code) = quiet(&h, &["search", "nomatch"], None);
-    assert_eq!((code, out.as_str()), (0, "No notes matching \"nomatch\".\n"));
+    assert_eq!(
+        (code, out.as_str()),
+        (0, "No notes matching \"nomatch\".\n")
+    );
 
     // keyword required
     let (out, err, code) = quiet(&h, &["search"], None);
@@ -176,7 +199,11 @@ fn search_output_matches_js_format() {
     // help parity
     let (out, _, code) = quiet(&h, &["search", "--help"], None);
     assert_eq!(code, 0);
-    assert!(out.starts_with("Usage: leanote search <keyword> [options]\n"), "{}", out);
+    assert!(
+        out.starts_with("Usage: leanote search <keyword> [options]\n"),
+        "{}",
+        out
+    );
 }
 
 #[test]
@@ -186,7 +213,12 @@ fn search_limit_matches_js_more_message() {
     seed(&h);
     let (out, _, _) = quiet(&h, &["search", "e", "-N", "1"], None);
     // "e" matches both titles + one content; -N 1 shows one + more-message
-    assert!(out.ends_with("\n... (1 more, use -N to show more)\n") || out.ends_with("\n... (0 more, use -N to show more)\n"), "{}", out);
+    assert!(
+        out.ends_with("\n... (1 more, use -N to show more)\n")
+            || out.ends_with("\n... (0 more, use -N to show more)\n"),
+        "{}",
+        out
+    );
 }
 
 // --- edit parity ---
@@ -210,7 +242,10 @@ fn edit_flags_and_errors_match_js() {
 
     // no fields
     let (out, err, code) = quiet(&h, &["edit", &id], None);
-    assert_eq!((code, out.as_str(), err.as_str()), (1, "", "Error: No fields to update.\n"));
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (1, "", "Error: No fields to update.\n")
+    );
 
     // missing id
     let (out, err, code) = quiet(&h, &["edit"], None);
@@ -218,16 +253,26 @@ fn edit_flags_and_errors_match_js() {
 
     // unknown note
     let (out, err, code) = quiet(&h, &["edit", "zzzz", "-t", "x"], None);
-    assert_eq!((code, err.as_str()), (1, "Error: Note \"zzzz\" not found.\n"));
+    assert_eq!(
+        (code, err.as_str()),
+        (1, "Error: Note \"zzzz\" not found.\n")
+    );
 
     // unknown notebook
     let (out, err, code) = quiet(&h, &["edit", "aaaa1", "-n", "Nope"], None);
-    assert_eq!((code, err.as_str()), (1, "Error: Notebook \"Nope\" not found.\n"));
+    assert_eq!(
+        (code, err.as_str()),
+        (1, "Error: Notebook \"Nope\" not found.\n")
+    );
 
     // help parity
     let (out, _, code) = quiet(&h, &["edit", "--help"], None);
     assert_eq!(code, 0);
-    assert!(out.starts_with("Usage: leanote edit <note-id> [options]\n"), "{}", out);
+    assert!(
+        out.starts_with("Usage: leanote edit <note-id> [options]\n"),
+        "{}",
+        out
+    );
     let (out, _, _) = quiet(&h, &["help", "edit"], None);
     assert_eq!(out, quiet(&h, &["edit", "-h"], None).0);
 }
@@ -237,7 +282,11 @@ fn edit_offline_marks_dirty_and_recomputes_desc() {
     let h = home("edit-dirty");
     let _guard = PortGuard::take();
     let id = seed(&h);
-    quiet(&h, &["edit", "aaaa1", "-c", "# Fresh\nbody with hash"], None);
+    quiet(
+        &h,
+        &["edit", "aaaa1", "-c", "# Fresh\nbody with hash"],
+        None,
+    );
     let db = h.join("data").join("leanote.db");
     let c = rusqlite::Connection::open(&db).unwrap();
     let (dirty, desc, abstract_, content): (i64, String, String, String) = c
@@ -250,16 +299,27 @@ fn edit_offline_marks_dirty_and_recomputes_desc() {
     drop(c);
     assert_eq!(dirty, 1, "offline edit must set IsDirty for later push");
     assert_eq!(content, "# Fresh\nbody with hash");
-    assert_eq!(desc, "Fresh body with hash", "JS: newlines->space, # stripped, [:50] trim");
+    assert_eq!(
+        desc, "Fresh body with hash",
+        "JS: newlines->space, # stripped, [:50] trim"
+    );
     assert_eq!(abstract_, "# Fresh\nbody with hash");
 
     // -n moves the note (JS persists NotebookId)
     let c = rusqlite::Connection::open(&db).unwrap();
-    c.execute("INSERT INTO notebooks VALUES('nbw1','user1','Work','',1,0,0,0,0,0,0,NULL)", []).unwrap();
+    c.execute(
+        "INSERT INTO notebooks VALUES('nbw1','user1','Work','',1,0,0,0,0,0,0,NULL)",
+        [],
+    )
+    .unwrap();
     drop(c);
     quiet(&h, &["edit", "aaaa1", "-n", "Work"], None);
     let c = rusqlite::Connection::open(&db).unwrap();
-    let nb: String = c.query_row("SELECT NotebookId FROM notes WHERE NoteId=?1", [&id], |r| r.get(0)).unwrap();
+    let nb: String = c
+        .query_row("SELECT NotebookId FROM notes WHERE NoteId=?1", [&id], |r| {
+            r.get(0)
+        })
+        .unwrap();
     drop(c);
     assert_eq!(nb, "nbw1");
 }
@@ -273,7 +333,6 @@ fn dual_mode_output_is_mode_invisible() {
     let h_online = home("dual-on");
     seed(&h_offline);
     seed(&h_online);
-
 
     let cases: Vec<(&[&str], Option<&str>)> = vec![
         (&["list", "-v"], None),
@@ -325,14 +384,22 @@ fn dual_mode_output_is_mode_invisible() {
         out
     };
     // Phase 1 — server DOWN: run every case against the offline store.
-    let off: Vec<_> = cases.iter().map(|(a, s)| quiet(&h_offline, a, *s)).collect();
+    let off: Vec<_> = cases
+        .iter()
+        .map(|(a, s)| quiet(&h_offline, a, *s))
+        .collect();
 
     // Phase 2 — server UP: same sequence on a fresh identical store.
     let mut server = spawn_server(&h_online);
     for ((args, stdin), off) in cases.iter().zip(&off) {
         let on = quiet(&h_online, args, *stdin);
         eprintln!("CASE {:?} OFF: {:?} ON: {:?}", args, off, on);
-        assert_eq!(norm(off.0.clone()), norm(on.0.clone()), "stdout differs for {:?}", args);
+        assert_eq!(
+            norm(off.0.clone()),
+            norm(on.0.clone()),
+            "stdout differs for {:?}",
+            args
+        );
         assert_eq!(off.2, on.2, "exit code differs for {:?}", args);
     }
 
@@ -340,7 +407,11 @@ fn dual_mode_output_is_mode_invisible() {
     let db = h_online.join("data").join("leanote.db");
     let c = rusqlite::Connection::open(&db).unwrap();
     let (title, dirty): (String, i64) = c
-        .query_row("SELECT Title, IsDirty FROM notes WHERE NoteId='aaaa11111111111111111111'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row(
+            "SELECT Title, IsDirty FROM notes WHERE NoteId='aaaa11111111111111111111'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .unwrap();
     drop(c);
     assert_eq!(title, "Renamed");
@@ -350,7 +421,11 @@ fn dual_mode_output_is_mode_invisible() {
     let db = h_offline.join("data").join("leanote.db");
     let c = rusqlite::Connection::open(&db).unwrap();
     let dirty: i64 = c
-        .query_row("SELECT IsDirty FROM notes WHERE NoteId='aaaa11111111111111111111'", [], |r| r.get(0))
+        .query_row(
+            "SELECT IsDirty FROM notes WHERE NoteId='aaaa11111111111111111111'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     drop(c);
     assert_eq!(dirty, 1);
@@ -378,7 +453,10 @@ fn http_mode_error_paths_match_js() {
 
     // Same input offline takes the file path: Note not found.
     let (_, err, code) = quiet(&h, &["edit", "zzzz9", "-t", "x"], None);
-    assert_eq!((code, err.as_str()), (1, "Error: Note \"zzzz9\" not found.\n"));
+    assert_eq!(
+        (code, err.as_str()),
+        (1, "Error: Note \"zzzz9\" not found.\n")
+    );
 }
 
 // --- shim switch ---
@@ -406,13 +484,19 @@ fn shim_switch_rewrites_known_electron_shim_and_creates_when_absent() {
         .output()
         .unwrap();
     assert!(out.status.success(), "shim must exec the Rust binary");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("Meeting notes") || String::from_utf8_lossy(&out.stdout).contains("No notes"));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Meeting notes")
+            || String::from_utf8_lossy(&out.stdout).contains("No notes")
+    );
 
     // one-shot: a second run does not touch it again
     let before = std::fs::read_to_string(&shim).unwrap();
     run(&h, &["list"], None);
     assert_eq!(before, std::fs::read_to_string(&shim).unwrap());
-    assert!(h.join("data").join("shim-switched").exists(), "marker written");
+    assert!(
+        h.join("data").join("shim-switched").exists(),
+        "marker written"
+    );
 
     // known Electron form -> replaced
     let h2 = home("shim-known");
@@ -432,13 +516,20 @@ fn shim_switch_rewrites_known_electron_shim_and_creates_when_absent() {
     std::fs::write(h3.join("data").join("shim-switched"), b"").unwrap();
     std::fs::write(h3.join("bin").join("leanote"), "#!/bin/sh\nexec custom\n").unwrap();
     run(&h3, &["list"], None);
-    assert_eq!(std::fs::read_to_string(h3.join("bin").join("leanote")).unwrap(), "#!/bin/sh\nexec custom\n");
+    assert_eq!(
+        std::fs::read_to_string(h3.join("bin").join("leanote")).unwrap(),
+        "#!/bin/sh\nexec custom\n"
+    );
 }
 
 #[test]
 fn shim_switch_refuses_unknown_shim_form() {
     let h = home("shim-unknown");
-    std::fs::write(h.join("bin").join("leanote"), "#!/bin/sh\nexec my-own-wrapper \"$@\"\n").unwrap();
+    std::fs::write(
+        h.join("bin").join("leanote"),
+        "#!/bin/sh\nexec my-own-wrapper \"$@\"\n",
+    )
+    .unwrap();
     let (_, err, _) = run(&h, &["list"], None);
     assert!(err.contains("not the known Electron shim"), "{}", err);
     assert_eq!(

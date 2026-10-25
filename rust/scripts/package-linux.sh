@@ -90,9 +90,12 @@ case "$ARCH" in
   aarch64) DEB_ARCH=arm64 ;;
   *)       echo "unknown arch $ARCH" >&2; exit 1 ;;
 esac
+# dpkg-deb rejects a Version that does not start with a digit; the tag's
+# leading `v` stays in the artifact filename only.
+DEB_VERSION="${VERSION#v}"
 cat > "$DEBROOT/DEBIAN/control" <<EOF
 Package: leanote
-Version: $VERSION
+Version: $DEB_VERSION
 Section: office
 Priority: optional
 Architecture: $DEB_ARCH

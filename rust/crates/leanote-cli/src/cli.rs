@@ -6,10 +6,11 @@ use std::io::{Read, Write};
 
 pub fn run(argv: Vec<String>) -> i32 {
     shim_switch(); // first-run PATH switch to this binary (no-op afterwards)
-    // JS: first arg that is a known subcommand wins; default "add".
-    // `serve` is Rust-only (dev helper to run the local HTTP server).
-    const SUBCOMMANDS: [&str; 8] =
-        ["add", "list", "show", "search", "edit", "sync", "help", "serve"];
+                   // JS: first arg that is a known subcommand wins; default "add".
+                   // `serve` is Rust-only (dev helper to run the local HTTP server).
+    const SUBCOMMANDS: [&str; 8] = [
+        "add", "list", "show", "search", "edit", "sync", "help", "serve",
+    ];
     let mut cmd = "add";
     let mut cmd_index: Option<usize> = None;
     for (i, a) in argv.iter().enumerate() {
@@ -73,7 +74,6 @@ pub fn run(argv: Vec<String>) -> i32 {
     }
 }
 
-
 /// One-shot `GET /api/ping` against the local app (300ms) — invisible: the
 /// mode only routes writes; stdout is identical either way.
 enum Api {
@@ -84,23 +84,42 @@ enum Api {
 fn api_port() -> u16 {
     // LEANOTE_PORT moves the local API off the default 8912 — the user's real
     // Electron app legitimately owns 8912; tests use this for isolation.
-    std::env::var("LEANOTE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(leanote_http::DEFAULT_PORT)
+    std::env::var("LEANOTE_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(leanote_http::DEFAULT_PORT)
 }
 
 fn probe_api() -> Api {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_millis(300))
         .build();
-    match agent.get(&format!("http://{}:{}/api/ping", leanote_http::HOST, api_port())).call() {
+    match agent
+        .get(&format!(
+            "http://{}:{}/api/ping",
+            leanote_http::HOST,
+            api_port()
+        ))
+        .call()
+    {
         Ok(_) => Api::Online(agent),
         Err(_) => Api::Offline,
     }
 }
 
 /// POST JSON like the JS callAPI; returns the parsed body.
-fn api_post(agent: &ureq::Agent, path: &str, body: &serde_json::Value) -> Option<serde_json::Value> {
+fn api_post(
+    agent: &ureq::Agent,
+    path: &str,
+    body: &serde_json::Value,
+) -> Option<serde_json::Value> {
     let resp = match agent
-        .post(&format!("http://{}:{}{}", leanote_http::HOST, api_port(), path))
+        .post(&format!(
+            "http://{}:{}{}",
+            leanote_http::HOST,
+            api_port(),
+            path
+        ))
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())
     {
@@ -185,7 +204,11 @@ fn parse_add_args(argv: &[String]) -> AddOpts {
 
 /// JS: str.split(",").map(trim).filter(Boolean)
 fn parse_tags(s: &str) -> Vec<String> {
-    s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).map(String::from).collect()
+    s.split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 fn cmd_add(args: &[String], piped: &str, api: Api) -> i32 {
@@ -218,7 +241,11 @@ fn cmd_add(args: &[String], piped: &str, api: Api) -> i32 {
             return 1;
         }
     };
-    let target_notebook = if opts.notebook.is_empty() { "AI札".to_string() } else { opts.notebook.clone() };
+    let target_notebook = if opts.notebook.is_empty() {
+        "AI札".to_string()
+    } else {
+        opts.notebook.clone()
+    };
     let tags_str = if !opts.tags.is_empty() {
         format!(" [{}]", opts.tags.join(", "))
     } else {
@@ -237,11 +264,21 @@ fn cmd_add(args: &[String], piped: &str, api: Api) -> i32 {
             payload["notebook"] = serde_json::Value::String(opts.notebook.clone());
         }
         if let Some(res) = api_post(agent, "/api/note/addNote", &payload) {
-            if res.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
-                println!("Added: \"{}\" -> {}{}", opts.title, target_notebook, tags_str);
+            if res
+                .get("success")
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false)
+            {
+                println!(
+                    "Added: \"{}\" -> {}{}",
+                    opts.title, target_notebook, tags_str
+                );
                 return 0;
             }
-            eprintln!("API error: {}", res.get("error").and_then(|e| e.as_str()).unwrap_or(""));
+            eprintln!(
+                "API error: {}",
+                res.get("error").and_then(|e| e.as_str()).unwrap_or("")
+            );
             return 1;
         }
     }
@@ -254,7 +291,10 @@ fn cmd_add(args: &[String], piped: &str, api: Api) -> i32 {
         is_markdown: true,
     }) {
         Ok(_) => {
-            println!("Added: \"{}\" -> {}{}", opts.title, target_notebook, tags_str);
+            println!(
+                "Added: \"{}\" -> {}{}",
+                opts.title, target_notebook, tags_str
+            );
             0
         }
         Err(e) => {
@@ -265,9 +305,8 @@ fn cmd_add(args: &[String], piped: &str, api: Api) -> i32 {
 }
 
 fn open_store() -> Result<Store, String> {
-    let dir = std::env::var("LEANOTE_DATA").unwrap_or_else(|_| {
-        leanote_core::app_data_dir().to_string_lossy().into_owned()
-    });
+    let dir = std::env::var("LEANOTE_DATA")
+        .unwrap_or_else(|_| leanote_core::app_data_dir().to_string_lossy().into_owned());
     Store::open(std::path::PathBuf::from(dir), "user1".to_string()).map_err(|e| e.to_string())
 }
 
@@ -338,7 +377,10 @@ fn cmd_sync(args: &[String]) -> i32 {
         Ok(stats) => {
             println!(
                 "Synced {} notebooks, {} notes, {} tags; {} contents fetched; LastSyncUsn={}",
-                stats.notebooks, stats.notes, stats.tags, stats.contents,
+                stats.notebooks,
+                stats.notes,
+                stats.tags,
+                stats.contents,
                 store.last_sync_usn().unwrap_or(-1)
             );
             0
@@ -477,7 +519,11 @@ fn cmd_list(args: &[String]) -> i32 {
     let all = store.list_notes().unwrap_or_default();
     let notes: Vec<_> = all
         .into_iter()
-        .filter(|n| nb_id.as_ref().map_or(true, |id| &n.notebook_id.to_string() == id))
+        .filter(|n| {
+            nb_id
+                .as_ref()
+                .map_or(true, |id| &n.notebook_id.to_string() == id)
+        })
         .filter(|n| opts.tag.is_empty() || n.tags.iter().any(|t| t == &opts.tag))
         .collect();
 
@@ -485,13 +531,19 @@ fn cmd_list(args: &[String]) -> i32 {
     let mut count = 0;
     for n in notes.iter().take(limit as usize) {
         count += 1;
-        let notebook = store.notebook_title(&n.notebook_id).unwrap_or_else(|_| n.notebook_id.to_string());
+        let notebook = store
+            .notebook_title(&n.notebook_id)
+            .unwrap_or_else(|_| n.notebook_id.to_string());
         let tags = if !n.tags.is_empty() {
             format!(" [{}]", n.tags.join(", "))
         } else {
             String::new()
         };
-        let mut title = if n.title.is_empty() { "(untitled)".to_string() } else { n.title.clone() };
+        let mut title = if n.title.is_empty() {
+            "(untitled)".to_string()
+        } else {
+            n.title.clone()
+        };
         // JS: substring by UTF-16 units — titles are typically short CJK/latin.
         let t16: String = title.chars().take(50).collect();
         if chars_len(&title) > 50 {
@@ -511,7 +563,10 @@ fn cmd_list(args: &[String]) -> i32 {
     if count == 0 {
         println!("No notes found.");
     } else if notes.len() as i64 > limit {
-        println!("... ({} more, use -N to show more)", notes.len() as i64 - limit);
+        println!(
+            "... ({} more, use -N to show more)",
+            notes.len() as i64 - limit
+        );
     }
     0
 }
@@ -528,7 +583,10 @@ struct ShowOpts {
 }
 
 fn parse_show_args(argv: &[String]) -> ShowOpts {
-    let mut o = ShowOpts { note_id: String::new(), help: false };
+    let mut o = ShowOpts {
+        note_id: String::new(),
+        help: false,
+    };
     for a in argv {
         if a == "--help" || a == "-h" {
             o.help = true;
@@ -567,7 +625,10 @@ fn cmd_show(args: &[String]) -> i32 {
         Ok(Err(PrefixError::Ambiguous(_))) => {
             // JS show() takes the FIRST prefix match; no ambiguity error in show.
             let notes = store.list_notes().unwrap_or_default();
-            match notes.iter().find(|n| n.note_id.starts_with(opts.note_id.as_str())) {
+            match notes
+                .iter()
+                .find(|n| n.note_id.starts_with(opts.note_id.as_str()))
+            {
                 Some(n) => n.clone(),
                 None => {
                     eprintln!("Error: Note \"{}\" not found.", opts.note_id);
@@ -581,11 +642,24 @@ fn cmd_show(args: &[String]) -> i32 {
         }
     };
 
-    let notebook = store.notebook_title(&resolved.notebook_id).unwrap_or_else(|_| resolved.notebook_id.to_string());
-    let tags = if resolved.tags.is_empty() { "(none)".to_string() } else { resolved.tags.join(", ") };
+    let notebook = store
+        .notebook_title(&resolved.notebook_id)
+        .unwrap_or_else(|_| resolved.notebook_id.to_string());
+    let tags = if resolved.tags.is_empty() {
+        "(none)".to_string()
+    } else {
+        resolved.tags.join(", ")
+    };
 
     println!("ID:       {}", resolved.note_id);
-    println!("Title:    {}", if resolved.title.is_empty() { "(untitled)".to_string() } else { resolved.title.clone() });
+    println!(
+        "Title:    {}",
+        if resolved.title.is_empty() {
+            "(untitled)".to_string()
+        } else {
+            resolved.title.clone()
+        }
+    );
     println!("Notebook: {}", notebook);
     println!("Tags:     {}", tags);
     println!("Created:  {}", format_time(resolved.created_time));
@@ -610,7 +684,11 @@ struct SearchOpts {
 }
 
 fn parse_search_args(argv: &[String]) -> SearchOpts {
-    let mut o = SearchOpts { keyword: String::new(), limit: 20, help: false };
+    let mut o = SearchOpts {
+        keyword: String::new(),
+        limit: 20,
+        help: false,
+    };
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -654,7 +732,11 @@ fn cmd_search(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let limit = if opts.limit > 0 { opts.limit as usize } else { 20 };
+    let limit = if opts.limit > 0 {
+        opts.limit as usize
+    } else {
+        20
+    };
     let mut count = 0;
     for h in hits.iter().take(limit) {
         count += 1;
@@ -662,8 +744,16 @@ fn cmd_search(args: &[String]) -> i32 {
         let notebook = store
             .notebook_title(&n.notebook_id)
             .unwrap_or_else(|_| n.notebook_id.to_string());
-        let tags = if !n.tags.is_empty() { format!(" [{}]", n.tags.join(", ")) } else { String::new() };
-        let title = if n.title.is_empty() { "(untitled)".to_string() } else { n.title.clone() };
+        let tags = if !n.tags.is_empty() {
+            format!(" [{}]", n.tags.join(", "))
+        } else {
+            String::new()
+        };
+        let title = if n.title.is_empty() {
+            "(untitled)".to_string()
+        } else {
+            n.title.clone()
+        };
         println!("{}  {}  {}", n.note_id, format_time(n.updated_time), title);
         println!("       {}", h.excerpt);
         println!("       {}{}", notebook, tags);
@@ -753,7 +843,12 @@ fn cmd_edit(args: &[String], piped: &str, api: Api) -> i32 {
                     return 1;
                 }
             };
-            match store.notebooks().unwrap_or_default().into_iter().find(|n| n.title == nb) {
+            match store
+                .notebooks()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|n| n.title == nb)
+            {
                 Some(found) => Some(found.notebook_id.to_string()),
                 None => {
                     eprintln!("Error: Notebook \"{}\" not found.", nb);
@@ -790,11 +885,18 @@ fn cmd_edit(args: &[String], piped: &str, api: Api) -> i32 {
             payload["notebook"] = serde_json::Value::String(nb.clone());
         }
         if let Some(res) = api_post(agent, "/api/note/updateNote", &payload) {
-            if res.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
+            if res
+                .get("success")
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false)
+            {
                 println!("Updated: {}...", prefix8(&opts.note_id));
                 return 0;
             }
-            eprintln!("API error: {}", res.get("error").and_then(|e| e.as_str()).unwrap_or(""));
+            eprintln!(
+                "API error: {}",
+                res.get("error").and_then(|e| e.as_str()).unwrap_or("")
+            );
             return 1;
         }
         // transport failure -> fall through to direct store write
@@ -825,7 +927,6 @@ fn cmd_edit(args: &[String], piped: &str, api: Api) -> i32 {
         eprintln!("Error: Note \"{}\" not found.", opts.note_id);
         return 1;
     };
-
     match store.update_note(
         &leanote_core::Id(target.to_string()),
         leanote_core::NoteUpdate {
@@ -866,7 +967,9 @@ fn shim_switch() {
     if std::env::var_os("LEANOTE_NO_SHIM_SWITCH").is_some() {
         return;
     }
-    let Ok(home) = std::env::var("HOME") else { return };
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
     if home.is_empty() {
         return;
     }
@@ -877,7 +980,9 @@ fn shim_switch() {
     if marker.exists() {
         return;
     }
-    let Ok(bin) = std::env::current_exe() else { return };
+    let Ok(bin) = std::env::current_exe() else {
+        return;
+    };
     let shim = std::path::Path::new(&home).join("bin").join("leanote");
 
     if let Ok(current) = std::fs::read_to_string(&shim) {
@@ -900,7 +1005,11 @@ fn shim_switch() {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755));
             }
-            eprintln!("[leanote] Shim updated: {} -> {}", shim.display(), bin.display());
+            eprintln!(
+                "[leanote] Shim updated: {} -> {}",
+                shim.display(),
+                bin.display()
+            );
         }
         Err(e) => eprintln!("[leanote] Could not update shim {}: {}", shim.display(), e),
     }
@@ -908,61 +1017,21 @@ fn shim_switch() {
     let _ = std::fs::write(&marker, b"");
 }
 
-
 // --- formatting (mirrors JS formatTime: local time, ms timestamps) ---
 
 fn format_time(ts: i64) -> String {
     if ts == 0 {
         return "----".to_string();
     }
-    // Local-time conversion without chrono: use libc localtime via date cmd?
-    // ponytail: shells out — no. Implement via TZ from /etc/localtime is heavy.
-    // Use the platform `date` binary is fragile; instead do the arithmetic
-    // against the local offset obtained from std (not available). So: call
-    // libc::localtime through the `libc` crate? Avoid new dep — use
-    // the C library via extern "C" declarations (no crate needed on unix).
-    unsafe {
-        let t: LibcTimeT = ts as LibcTimeT / 1000;
-        let tm = libc_localtime(&t);
-        if tm.is_null() {
-            return "----".to_string();
-        }
-        let tm = &*tm;
-        format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}",
-            tm.tm_year as i64 + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min
-        )
+    // Local time, ms timestamps — mirrors JS formatTime. chrono's
+    // Local replaces the old unix-only libc localtime extern (which had
+    // cfg-gaps that broke the windows build); TZ env is respected.
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_millis_opt(ts).single() {
+        Some(t) => t.format("%Y-%m-%d %H:%M").to_string(),
+        None => "----".to_string(),
     }
 }
-
-#[cfg(unix)]
-extern "C" {
-    #[link_name = "localtime"]
-    fn libc_localtime(t: *const i64) -> *mut Tm;
-}
-
-#[cfg(unix)]
-#[repr(C)]
-struct Tm {
-    tm_sec: i32,
-    tm_min: i32,
-    tm_hour: i32,
-    tm_mday: i32,
-    tm_mon: i32,
-    tm_year: i32,
-    tm_wday: i32,
-    tm_yday: i32,
-    tm_isdst: i32,
-    tm_gmtoff: i64,
-    tm_zone: *const u8,
-}
-
-#[cfg(unix)]
-type LibcTimeT = i64;
 
 // --- help (verbatim from printHelp/printGlobalHelp) ---
 
@@ -1033,7 +1102,9 @@ fn print_help(cmd: &str) {
             println!();
             println!("Options:");
             println!("  -t, --title <title>       New title");
-            println!("  -c, --content <content>   New markdown content (use -c or pipe from stdin)");
+            println!(
+                "  -c, --content <content>   New markdown content (use -c or pipe from stdin)"
+            );
             println!("  -g, --tags <tags>         New comma-separated tags (replaces existing)");
             println!("  -n, --notebook <name>     Move to notebook");
             println!("  -h, --help                Show this help");
