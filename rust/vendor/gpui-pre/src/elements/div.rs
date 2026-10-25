@@ -881,7 +881,11 @@ pub trait InteractiveElement: Sized {
     /// Selectors are only recorded in debug builds with the `test-support`
     /// feature. Elsewhere this is a no-op, so `test-support` can stay enabled
     /// in release builds without the per-frame cost.
-    #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
+    /// leanote: also record when only `test-support` is on (no debug_assertions)
+    /// — release-profile `cargo test` needs selectors; the debug_assertions
+    /// gate made debug_bounds silently return None. Re-vendor on gpui-pre
+    /// upgrade (see workspace [patch.crates-io] note).
+    #[cfg(any(test, feature = "test-support"))]
     fn debug_selector(mut self, f: impl FnOnce() -> String) -> Self {
         self.interactivity().debug_selector = Some(f());
         self
@@ -893,7 +897,7 @@ pub trait InteractiveElement: Sized {
     /// Selectors are only recorded in debug builds with the `test-support`
     /// feature. Elsewhere this is a no-op, so `test-support` can stay enabled
     /// in release builds without the per-frame cost.
-    #[cfg(not(any(test, all(debug_assertions, feature = "test-support"))))]
+    #[cfg(not(any(test, feature = "test-support")))]
     #[inline]
     fn debug_selector(self, _: impl FnOnce() -> String) -> Self {
         self
@@ -2200,7 +2204,7 @@ pub struct Interactivity {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) source_location: Option<&'static core::panic::Location<'static>>,
 
-    #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_selector: Option<String>,
 }
 
@@ -2523,7 +2527,7 @@ impl Interactivity {
 
                 let style = self.compute_style_internal(hitbox, element_state.as_mut(), window, cx);
 
-                #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some(debug_selector) = &self.debug_selector {
                     window
                         .next_frame
