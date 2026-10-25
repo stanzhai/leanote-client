@@ -30,6 +30,14 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/Leanote"     "$APP/Contents/MacOS/$APP_NAME"
 cp "$BIN_DIR/leanote-cli" "$APP/Contents/MacOS/leanote-cli"
+
+# CI macOS runners have ~14GB free; the cargo target dir can exceed that,
+# starving hdiutil (which needs scratch for the UDZO image). The binaries
+# are already copied into the .app, so drop target/ before imaging. Locally
+# the var is unset and nothing is deleted.
+if [ -n "${LEANOTE_CI_CLEAN:-}" ]; then
+  rm -rf "$ROOT/rust/target"
+fi
 cp "$ROOT/rust/packaging/icon.icns" "$APP/Contents/Resources/app.icns"
 
 cat > "$APP/Contents/Info.plist" <<EOF

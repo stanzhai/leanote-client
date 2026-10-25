@@ -73,6 +73,9 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ github.ref_name }}
+          # macOS runners: free disk before hdiutil (package-macos.sh drops
+          # target/ once the binaries are in the .app).
+          LEANOTE_CI_CLEAN: "1"
         run: |
           cd rust
           rustup target add ${{ matrix.target }}

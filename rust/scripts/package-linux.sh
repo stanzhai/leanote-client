@@ -32,8 +32,8 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/metainfo" "$APPDIR/usr/share/icons
 cp "$BIN_DIR/Leanote" "$APPDIR/usr/bin/Leanote"
 cp "$BIN_DIR/leanote-cli" "$APPDIR/usr/bin/leanote"
 patchelf --set-rpath '$ORIGIN/../lib' "$APPDIR/usr/bin/Leanote" 2>/dev/null || true
+cp "$PKG/icons/512x512.png" "$APPDIR/leanote.png"
 cp "$PKG/icons/512x512.png" "$APPDIR/Leanote.png"
-cp "$PKG/icons/512x512.png" "$APPDIR/usr/share/icons/hicolor/512x512/apps/leanote.png"
 
 cat > "$APPDIR/leanote.desktop" <<EOF
 [Desktop Entry]

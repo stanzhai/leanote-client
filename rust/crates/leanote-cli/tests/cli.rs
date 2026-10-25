@@ -186,7 +186,11 @@ fn store_dir_is_leanote_never_nedb() {
         .env("PATH", "/usr/bin:/bin")
         .output()
         .unwrap();
-    let appsupport = home.join("Library/Application Support/leanote");
+    let appsupport = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/leanote")
+    } else {
+        home.join(".config/leanote")
+    };
     assert!(
         appsupport.join("leanote.db").exists(),
         "expected leanote.db"
