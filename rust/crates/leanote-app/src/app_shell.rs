@@ -2,7 +2,7 @@
 //! three-pane shell (ADR-0003). Ticket 09: selectable nav + filtered list +
 //! read-only Markdown reader, star toggle, trash actions.
 
-use crate::browse::{self, NavNode};
+use crate::browse::{self, DropTarget, NavNode};
 use crate::conflict_bar;
 use crate::i18n::{self, Lang};
 use crate::theme::{self, Material};
@@ -10,6 +10,7 @@ use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::base::Scrollbar;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
 use gpui_kit::component::input::{
     Backspace, Delete, Editor, EditorState, Enter, Escape, IndentInline, Input, InputEvent,
     InputState, OutdentInline,
@@ -82,17 +83,8 @@ enum ConflictChoice {
 
 #[derive(Clone)]
 enum NavEdit {
-    /// Create a notebook under this parent ("" = root).
-    NewNotebook {
-        parent: String,
-        name: gpui_kit::Entity<InputState>,
-    },
-    /// Rename this notebook.
-    RenameNotebook {
-        id: leanote_core::Id,
-        name: gpui_kit::Entity<InputState>,
-    },
-    /// Move this notebook: picking the target parent.
+    /// Move this notebook: picking the target parent (New/Rename moved to
+    /// a modal dialog, see `notebook_name_dialog`).
     MoveNotebook { id: leanote_core::Id },
     /// Issue 18: move this note to another notebook — the middle list
     /// swaps to a target picker.
@@ -208,6 +200,11 @@ pub struct AppShell {
     /// Issue 23 #10: markdown insertion toolbar shown in the editor
     /// (persisted as prefs.editor_toolbar; default off).
     editor_toolbar: bool,
+    // --- Notebook sidebar drag-reorder (ticket 11 follow-up) ---
+    /// Drop target under the pointer while a notebook row is dragged.
+    /// None = no valid target. Lives on the shell: rows are rebuilt every
+    /// frame, so nothing can live in the row closures.
+    notebook_drag_target: Option<crate::browse::DropTarget>,
 }
 
 /// Right-pane edit mode (issues 10+17): title + source editor with syntax
@@ -308,6 +305,7 @@ impl AppShell {
             sync_status: None,
             vim_enabled: prefs.vim_default,
             editor_toolbar: prefs.editor_toolbar,
+            notebook_drag_target: None,
             data_dir,
             host,
             email,
@@ -1529,15 +1527,84 @@ impl AppShell {
 impl AppShell {
     // ---- Ticket 11: nav management actions (context menus + inline input) ----
 
+    /// Modal notebook-name dialog shared by New and Rename (ticket 11
+    /// follow-up: popup instead of the old inline row). `apply` runs on
+    /// OK / Enter; Esc and Cancel just close.
+    fn notebook_name_dialog(
+        &mut self,
+        title: i18n::Key,
+        initial: Option<String>,
+        apply: impl Fn(&mut Self, String, &mut gpui_kit::Context<Self>) + Clone + 'static,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        let shell = cx.entity();
+        let lang = self.lang;
+        let name = cx.new(|cx| {
+            let mut s = InputState::new(window, cx)
+                .placeholder(i18n::t(lang, i18n::Key::NotebookNamePlaceholder));
+            if let Some(v) = &initial {
+                s = s.default_value(v.clone());
+            }
+            s
+        });
+        let first_focus = std::cell::Cell::new(true);
+        let t = move |k: i18n::Key| i18n::t(lang, k);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if first_focus.replace(false) {
+                name.update(cx, |s, cx| s.focus(window, cx));
+            }
+            let apply = apply.clone();
+            let ok = {
+                let shell = shell.clone();
+                let name = name.clone();
+                move |_ev: &gpui_kit::ClickEvent, _window: &mut Window, cx: &mut gpui_kit::App| {
+                    let value = name.read(cx).value().to_string();
+                    let value = value.trim().to_string();
+                    if !value.is_empty() {
+                        shell.update(cx, |this, cx| apply(this, value, cx));
+                    }
+                    true
+                }
+            };
+            dialog
+                .w(px(360.))
+                .title(t(title))
+                .child(Input::new(&name).appearance(true).bordered(true).h_8())
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().trigger(|b| b.label(t(i18n::Key::Cancel))))
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("notebook-name-ok")
+                                    .label(t(i18n::Key::Confirm))
+                                    .primary(),
+                            ),
+                        ),
+                )
+                .on_ok(ok)
+        });
+    }
+
     fn begin_new_notebook(
         &mut self,
         parent: String,
         window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) {
-        let name = cx.new(|cx| InputState::new(window, cx));
-        self.nav_edit = Some(NavEdit::NewNotebook { parent, name });
-        cx.notify();
+        self.notebook_name_dialog(
+            i18n::Key::NewNotebook,
+            None,
+            move |this, title, cx| {
+                if let Some(store) = this.store() {
+                    let _ = store.create_notebook(&title, &parent);
+                }
+                this.invalidate_lists();
+                cx.notify();
+            },
+            window,
+            cx,
+        );
     }
 
     fn begin_rename_notebook(
@@ -1546,9 +1613,23 @@ impl AppShell {
         window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) {
-        let name = cx.new(|cx| InputState::new(window, cx));
-        self.nav_edit = Some(NavEdit::RenameNotebook { id, name });
-        cx.notify();
+        let current = self
+            .store()
+            .and_then(|s| s.notebook_title(&id).ok())
+            .unwrap_or_default();
+        self.notebook_name_dialog(
+            i18n::Key::RenameNotebook,
+            Some(current),
+            move |this, title, cx| {
+                if let Some(store) = this.store() {
+                    let _ = store.rename_notebook(&id, &title);
+                }
+                this.invalidate_lists();
+                cx.notify();
+            },
+            window,
+            cx,
+        );
     }
 
     fn begin_move_notebook(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
@@ -1571,24 +1652,6 @@ impl AppShell {
     fn apply_nav_edit(&mut self, cx: &mut gpui_kit::Context<Self>) {
         let edit = self.nav_edit.take();
         match edit {
-            Some(NavEdit::NewNotebook { parent, name }) => {
-                let title = name.read(cx).value().to_string();
-                let title = title.trim();
-                if !title.is_empty() {
-                    if let Some(store) = self.store() {
-                        let _ = store.create_notebook(title, &parent);
-                    }
-                }
-            }
-            Some(NavEdit::RenameNotebook { id, name }) => {
-                let title = name.read(cx).value().to_string();
-                let title = title.trim();
-                if !title.is_empty() {
-                    if let Some(store) = self.store() {
-                        let _ = store.rename_notebook(&id, title);
-                    }
-                }
-            }
             Some(NavEdit::RenameTag { old, name }) => {
                 let new = name.read(cx).value().to_string();
                 let new = new.trim();
@@ -1625,16 +1688,79 @@ impl AppShell {
         cx.notify();
     }
 
-    fn delete_notebook_nav(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
-        if let Some(store) = self.store() {
-            let _ = store.delete_notebook(&id);
+    /// Delete after an AlertDialog confirm. The body warns when the subtree
+    /// holds live notes (they go to trash, per ticket 11).
+    fn delete_notebook_nav(
+        &mut self,
+        id: leanote_core::Id,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        let shell = cx.entity();
+        let lang = self.lang;
+        let store = self.store();
+        // JS delete guards run in this order: sub-notebooks first, then
+        // notes — only an empty notebook can be deleted.
+        let has_subs = store
+            .as_ref()
+            .and_then(|s| s.has_sub_notebooks(&id).ok())
+            .unwrap_or(false);
+        let count = store
+            .as_ref()
+            .and_then(|s| s.notebook_subtree_note_count(&id).ok())
+            .unwrap_or(0);
+        let id_str = id.to_string();
+        // Guard: sub-notebooks must be deleted first (JS Notebook.getSubNotebooks check).
+        if has_subs {
+            window.open_alert_dialog(cx, move |alert, _window, _cx| {
+                alert
+                    .title(i18n::t(lang, i18n::Key::DeleteNotebookTitle))
+                    .description(i18n::t(lang, i18n::Key::DeleteNotebookHasSubNotebooks))
+                    .ok_text(i18n::t(lang, i18n::Key::Confirm))
+            });
+            return;
         }
-        if self.nav == NavSelection::Notebook(id.to_string()) {
-            self.nav = NavSelection::Recent;
-            self.selected = None;
+        // Guard: notes must be deleted first (JS NotebookService.deleteNotebook check).
+        if count > 0 {
+            let body = SharedString::from(
+                i18n::t(lang, i18n::Key::DeleteNotebookHasNotesBody)
+                    .replace("{n}", &count.to_string()),
+            );
+            window.open_alert_dialog(cx, move |alert, _window, _cx| {
+                alert
+                    .title(i18n::t(lang, i18n::Key::DeleteNotebookTitle))
+                    .description(body.clone())
+                    .ok_text(i18n::t(lang, i18n::Key::Confirm))
+            });
+            return;
         }
-        self.invalidate_lists();
-        cx.notify();
+        // Empty: confirm and delete.
+        let body = SharedString::from(i18n::t(lang, i18n::Key::DeleteNotebookEmptyBody));
+        window.open_alert_dialog(cx, move |alert, _window, _cx| {
+            let shell_ok = shell.clone();
+            let id_ok = id_str.clone();
+            alert
+                .title(i18n::t(lang, i18n::Key::DeleteNotebookTitle))
+                .description(body.clone())
+                .show_cancel(true)
+                .ok_text(i18n::t(lang, i18n::Key::DeleteNotebook))
+                .cancel_text(i18n::t(lang, i18n::Key::Cancel))
+                .on_ok(move |_ev, _window, cx| {
+                    let _ = shell_ok.update(cx, |this, cx| {
+                        let id = leanote_core::Id(id_ok.clone());
+                        if let Some(store) = this.store() {
+                            let _ = store.delete_notebook(&id);
+                        }
+                        if this.nav == NavSelection::Notebook(id.to_string()) {
+                            this.nav = NavSelection::Recent;
+                            this.selected = None;
+                        }
+                        this.invalidate_lists();
+                        cx.notify();
+                    });
+                    true
+                })
+        });
     }
 
     fn delete_tag_nav(&mut self, tag: String, cx: &mut gpui_kit::Context<Self>) {
@@ -2151,6 +2277,41 @@ fn small_label(text: impl Into<SharedString>, color: gpui_kit::Hsla) -> Label {
     Label::new(text).text_size(px(13.)).text_color(color)
 }
 
+// --- Notebook sidebar drag-reorder (ticket 11 follow-up) ---
+
+/// Drag payload: id + title so the ghost renders without store access.
+#[derive(Clone, Debug)]
+struct NotebookDrag {
+    id: String,
+    title: String,
+}
+
+/// Ghost shown under the pointer while dragging (`on_drag` render view).
+struct NotebookDragGhost(SharedString);
+
+impl Render for NotebookDragGhost {
+    fn render(&mut self, _: &mut Window, _: &mut gpui_kit::Context<Self>) -> impl IntoElement {
+        gpui_kit::base::h_flex()
+            .id("notebook-drag-ghost")
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded(px(6.))
+            .bg(theme::accent())
+            .shadow_md()
+            .child(
+                Icon::new(AssetIcon::FolderClosed)
+                    .small()
+                    .text_color(theme::accent_foreground()),
+            )
+            .child(
+                Label::new(self.0.clone())
+                    .text_size(px(13.))
+                    .text_color(theme::accent_foreground()),
+            )
+    }
+}
+
 /// State for the manual window-drag region (mirrors kit TitleBar's TODO
 /// workaround for GPUI pre-0.2.3).
 struct DragHeaderState {
@@ -2571,7 +2732,6 @@ impl AppShell {
             .debug_selector(|| "nav-pane".into())
             // Issue 17: 44px header below is the window-drag region (see
             // the header child below); no global titlebar strip anymore.
-            .px_3()
             .gap_1()
             .child(drag_header(window, cx))
             // Issue 17 Q7: identity moved to the bottom trio (see the nav
@@ -2608,24 +2768,8 @@ impl AppShell {
 
         if notebooks_open {
             let notebook_nodes = self.notebook_nav_nodes().clone();
-            // Ticket 11: inline editor row when creating/renaming.
-            if let Some(NavEdit::NewNotebook { parent, .. }) = &self.nav_edit {
-                // render at the parent's nesting depth; root edit on top
-                let depth = if parent.is_empty() {
-                    0
-                } else {
-                    notebook_nodes
-                        .iter()
-                        .find(|n| n.id == *parent)
-                        .map(|n| n.depth + 1)
-                        .unwrap_or(0)
-                };
-                let _ = depth;
-                // row itself is drawn in the loop below via nav_edit_row
-            }
-            let edit_row = self.nav_edit_row(dark, t, "notebook", window, cx);
-            let n = notebook_nodes.len() + usize::from(edit_row.is_some());
-            let edit_row = std::rc::Rc::new(std::cell::RefCell::new(edit_row));
+            // New/Rename go through the modal dialog now — no inline row.
+            let n = notebook_nodes.len();
             let nav_sel = self.nav.clone();
             let shell_ul = shell.clone();
             let scroll = self.notebooks_scroll.clone();
@@ -2635,18 +2779,68 @@ impl AppShell {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .on_drag_move(cx.listener(
+                        |this, ev: &gpui_kit::DragMoveEvent<NotebookDrag>, _window, cx| {
+                            // on_drag_move fires for the WHOLE window during
+                            // the drag (div.rs:354-356, 366-383 — capture
+                            // phase, no hitbox-contains gate), so gate on the
+                            // pointer actually being inside the list here.
+                            // Outside (tags/trash/footer rows): no target —
+                            // the tree must not accept drops from beyond its
+                            // bounds, and the stale indicator must clear.
+                            let b = &ev.bounds;
+                            let inside = ev.event.position.y >= b.origin.y
+                                && ev.event.position.y < b.origin.y + b.size.height
+                                && ev.event.position.x >= b.origin.x
+                                && ev.event.position.x < b.origin.x + b.size.width;
+                            if !inside {
+                                if this.notebook_drag_target.take().is_some() {
+                                    cx.notify();
+                                }
+                                return;
+                            }
+                            // Pointer y in list CONTENT space: viewport y
+                            // plus scroll_top (the helper returns
+                            // scroll_top, positive when scrolled down).
+                            // The vlist is taller than the rows when the
+                            // tree is short — clamp to the last row's
+                            // bottom edge so trailing empty space means
+                            // "after the last notebook" (zTree's empty-area
+                            // tolerance, -.2/1.2 percent, ztree.all-3.5.js
+                            // 2902/2906).
+                            // Rows are `h_8()` = rems(2.0), so their pixel
+                            // height tracks the window's rem size, not a
+                            // constant. The uniform list records the
+                            // measured height in its scroll handle
+                            // (contents = item_h * count, uniform_list.rs
+                            // 359-377) — use that, else ix = y/32 drifts
+                            // by a fraction of a row per row and lands
+                            // rows early near the bottom.
+                            let nodes_n = this.notebook_nav_nodes().len();
+                            let n = nodes_n as f32;
+                            let row_h = notebooks_row_height(this, nodes_n);
+                            let rows_h = n * row_h;
+                            let y: f32 = (ev.event.position.y - b.origin.y).into();
+                            let scrolled = notebooks_scroll_offset(this);
+                            let content_y = (y + scrolled).clamp(0., rows_h - 0.01);
+                            this.notebook_drag_target =
+                                this.notebook_drop_at(&ev.drag(cx).id, content_y, row_h);
+                            cx.notify();
+                        },
+                    ))
+                    .on_drop::<NotebookDrag>(cx.listener(
+                        |this, drag: &NotebookDrag, _window, cx| {
+                            if let Some(target) = this.notebook_drag_target.clone() {
+                                this.drop_notebook(drag, target, cx);
+                            }
+                        },
+                    ))
                     .child(
                         gpui_kit::uniform_list("notebooks-ul", n, move |range, _window, _cx| {
-                            // Rows are rebuilt per call: measure_item fires
-                            // twice per frame (layout + prepaint), so a
-                            // take-once buffer would leave later renders empty.
                             range
                                 .map(|ix| {
                                     let Some(node) = notebook_nodes.get(ix) else {
-                                        return edit_row
-                                            .borrow_mut()
-                                            .take()
-                                            .unwrap_or_else(|| gpui_kit::div().into_any_element());
+                                        return gpui_kit::div().into_any_element();
                                     };
                                     let is_sel = nav_sel == NavSelection::Notebook(node.id.clone());
                                     nav_row(
@@ -2656,6 +2850,15 @@ impl AppShell {
                                         "notebook",
                                         Some(AssetIcon::FolderClosed),
                                         is_sel,
+                                    )
+                                    .on_drag(
+                                        NotebookDrag {
+                                            id: node.id.clone(),
+                                            title: node.title.clone(),
+                                        },
+                                        |drag, _pos, _window, cx| {
+                                            cx.new(|_| NotebookDragGhost(drag.title.clone().into()))
+                                        },
                                     )
                                     .context_menu({
                                         let shell = shell_ul.clone();
@@ -2715,9 +2918,13 @@ impl AppShell {
                                                     lang,
                                                     i18n::Key::DeleteNotebook,
                                                 ))
-                                                .on_click(move |_ev, _window, cx| {
+                                                .on_click(move |_ev, window, cx| {
                                                     let _ = shell_del.update(cx, |this, cx| {
-                                                        this.delete_notebook_nav(id_del.clone(), cx)
+                                                        this.delete_notebook_nav(
+                                                            id_del.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
                                                     });
                                                 }),
                                             )
@@ -2731,6 +2938,39 @@ impl AppShell {
                         .w_full()
                         .track_scroll(&scroll),
                     )
+                    .when_some(self.notebook_drag_target.as_ref(), |this, target| {
+                        // Overlay is a sibling of the scrolling list, so
+                        // it lives in VIEWPORT space: content y minus
+                        // scroll_top. The `inner` band highlights the
+                        // hovered row instead of drawing the line.
+                        let y = target.indicator_y - notebooks_scroll_offset(self);
+                        if target.inner {
+                            this.child(
+                                gpui_kit::div()
+                                    .absolute()
+                                    .top(px(y))
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(notebooks_row_height(
+                                        self,
+                                        self.cached_notebook_nodes.as_ref().map_or(0, Vec::len),
+                                    )))
+                                    .bg(theme::accent().opacity(0.15)),
+                            )
+                        } else {
+                            // 2px line CENTERED on the boundary pixel so it
+                            // visually spans "between" the two rows.
+                            this.child(
+                                gpui_kit::div()
+                                    .absolute()
+                                    .top(px(y - 1.))
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(2.))
+                                    .bg(theme::accent()),
+                            )
+                        }
+                    })
                     .child(
                         gpui_kit::div()
                             .absolute()
@@ -3616,31 +3856,7 @@ impl AppShell {
     /// Flat (id, title, depth) of every valid move target: root + all
     /// notebooks except the moved one and its descendants (no cycles).
     fn notebook_move_targets(&mut self, moved: &leanote_core::Id) -> Vec<(String, String, usize)> {
-        let Some(store) = self.store() else {
-            return Vec::new();
-        };
-        let Ok(nbs) = store.notebooks() else {
-            return Vec::new();
-        };
-        let by_id: std::collections::HashMap<String, String> = nbs
-            .iter()
-            .map(|nb| (nb.notebook_id.to_string(), nb.parent_notebook_id.clone()))
-            .collect();
-        // descendants of `moved` are invalid targets
-        let mut banned = std::collections::HashSet::new();
-        banned.insert(moved.to_string());
-        loop {
-            let mut grew = false;
-            for (id, parent) in &by_id {
-                if banned.contains(parent) && !banned.contains(id) {
-                    banned.insert(id.clone());
-                    grew = true;
-                }
-            }
-            if !grew {
-                break;
-            }
-        }
+        let banned = self.notebook_banned_set(&moved.to_string());
         let mut out = vec![(
             String::new(),
             i18n::t(self.lang, i18n::Key::RootLevel).to_string(),
@@ -3655,9 +3871,80 @@ impl AppShell {
         out
     }
 
-    /// Input + OK/Cancel row for the in-flight New/Rename edit.
-    /// `group` filters: "notebook" renders NewNotebook/RenameNotebook,
-    /// "tag" renders RenameTag.
+    /// Sidebar drag: drop target for the pointer position over the notebook
+    /// list (content-relative y). Bands and sibling-index derivation live in
+    /// [`crate::browse::drop_target`]. None when the pointer is off the
+    /// rows or the target is the dragged notebook or one of its descendants
+    /// (cycle guard).
+    fn notebook_drop_at(&mut self, dragged: &str, y: f32, row_h: f32) -> Option<DropTarget> {
+        let nodes = self.notebook_nav_nodes().clone();
+        let ix = (y / row_h).floor() as isize;
+        if ix < 0 || ix as usize >= nodes.len() {
+            return None;
+        }
+        let target =
+            browse::drop_target(&nodes, ix as usize, y - row_h * ix as f32, row_h, dragged)?;
+        // Cycle guard: never drop into the dragged notebook or any of its
+        // descendants (banned set). For the inner band `target.parent` IS
+        // the hovered row, so one check covers both.
+        let banned = self.notebook_banned_set(dragged);
+        if banned.contains(&target.parent) {
+            return None;
+        }
+        Some(target)
+    }
+
+    /// The dragged notebook plus all its descendants (invalid drop-inside
+    /// targets — no cycles). Same walk as [`Self::notebook_move_targets`].
+    fn notebook_banned_set(&self, dragged: &str) -> std::collections::HashSet<String> {
+        let mut banned = std::collections::HashSet::new();
+        banned.insert(dragged.to_string());
+        if let Some(store) = self.store() {
+            if let Ok(nbs) = store.notebooks() {
+                let by_id: std::collections::HashMap<String, String> = nbs
+                    .iter()
+                    .map(|nb| (nb.notebook_id.to_string(), nb.parent_notebook_id.clone()))
+                    .collect();
+                loop {
+                    let mut grew = false;
+                    for (id, parent) in &by_id {
+                        if banned.contains(parent) && !banned.contains(id) {
+                            banned.insert(id.clone());
+                            grew = true;
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
+            }
+        }
+        banned
+    }
+
+    /// Commit a sidebar drag: rewrite the whole target sibling group (and
+    /// the old one), JS dragNotebooks semantics, via `move_notebook`.
+    fn drop_notebook(
+        &mut self,
+        drag: &NotebookDrag,
+        target: DropTarget,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if let Some(store) = self.store() {
+            let _ = store.move_notebook(
+                &leanote_core::Id(drag.id.clone()),
+                &target.parent,
+                target.index,
+                &[],
+            );
+        }
+        self.notebook_drag_target = None;
+        self.invalidate_lists();
+        cx.notify();
+    }
+
+    /// Input + OK/Cancel row for the in-flight tag rename (notebook
+    /// New/Rename use the modal dialog now).
     fn nav_edit_row(
         &mut self,
         _dark: bool,
@@ -3668,23 +3955,11 @@ impl AppShell {
     ) -> Option<AnyElement> {
         // borrow dance: take the input entity handle out temporarily
         let edit = self.nav_edit.clone()?;
-        let (input, indent) = match &edit {
-            NavEdit::NewNotebook { parent, name } if group == "notebook" => {
-                let depth = if parent.is_empty() {
-                    0
-                } else {
-                    self.notebook_nav_nodes()
-                        .iter()
-                        .find(|n| n.id == *parent)
-                        .map(|n| n.depth as usize + 1)
-                        .unwrap_or(0)
-                };
-                (name.clone(), depth)
-            }
-            NavEdit::RenameNotebook { name, .. } if group == "notebook" => (name.clone(), 1),
-            NavEdit::RenameTag { name, .. } if group == "tag" => (name.clone(), 1),
+        let input = match &edit {
+            NavEdit::RenameTag { name, .. } => name.clone(),
             _ => return None,
         };
+        let indent = 1;
         let shell = cx.weak_entity();
         let ok = Button::new(SharedString::from(format!("nav-edit-ok-{group}")))
             .label(t(i18n::Key::Confirm).to_string())
@@ -4512,6 +4787,37 @@ impl AppShell {
     }
 }
 
+/// Measured pixel height of one notebook row: the uniform list records
+/// `contents = item_h * count` in its scroll handle at layout time
+/// (uniform_list.rs 359-377). Rows are `h_8()` = rems(2.0), so this is
+/// 32px only when the rem size is exactly 16 — trust the measurement, not
+/// the constant.
+fn notebooks_row_height(shell: &AppShell, node_count: usize) -> f32 {
+    let state = shell.notebooks_scroll.0.borrow();
+    match &state.last_item_size {
+        Some(s) => {
+            let n = node_count as f32;
+            let h: f32 = s.contents.height.into();
+            let measured = h / n;
+            // Layout may lag a frame behind a list change; fall back
+            // rather than divide garbage into the drop math.
+            if n > 0. && (1.0..1000.0).contains(&measured) {
+                return measured;
+            }
+            32.
+        }
+        None => 32.,
+    }
+}
+
+/// Notebooks list scroll offset in px, positive when scrolled down. Rows
+/// live in content space, so pointer y must lose this.
+fn notebooks_scroll_offset(shell: &AppShell) -> f32 {
+    let state = shell.notebooks_scroll.0.borrow();
+    let off: f32 = state.base_handle.offset().y.into();
+    -off
+}
+
 /// epoch ms → "YYYY-MM-DD" (display only; store keeps epoch ms).
 pub(crate) fn fmt_time(ms: i64) -> String {
     let (y, m, d) = crate::export::civil_from_days(ms.div_euclid(86_400_000));
@@ -5174,6 +5480,67 @@ mod tests {
             .size
             .width;
         assert_eq!(nav_before, nav_after, "nav pane width must survive ⌘T");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ticket 11 follow-up: New Notebook opens a modal dialog; Enter
+    /// confirms; the new notebook lands FIRST in its sibling group.
+    #[gpui_kit::test]
+    fn notebook_dialog_creates_prepended(cx: &mut gpui_kit::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("leanote-nbdialog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let store = leanote_core::Store::open(dir.clone(), "user1".to_string()).unwrap();
+            let _ = store.create_notebook("Existing", "").unwrap();
+        }
+        cx.update(gpui_kit::init);
+        let (window, shell_entity) = cx
+            .update(|cx| {
+                gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true,
+                            Some("user1".into()),
+                            None,
+                        )
+                    })
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.background_executor.allow_parking();
+        let mut cx = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // open the dialog (root-level "New Notebook" action)
+        cx.update(|window, cx| {
+            shell_entity.update(cx, |shell, cx| {
+                shell.begin_new_notebook(String::new(), window, cx)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        // type a name and confirm with Enter
+        cx.simulate_input("Fresh");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        let first = shell_entity
+            .update(&mut cx, |shell, cx| {
+                shell
+                    .store()
+                    .and_then(|s| s.notebooks().ok())
+                    .and_then(|nbs| nbs.first().cloned())
+            })
+            .unwrap();
+        assert_eq!(first.title, "Fresh", "dialog Enter creates the notebook");
+        assert_eq!(first.seq, -1, "new notebook prepends (min sibling Seq - 1)");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

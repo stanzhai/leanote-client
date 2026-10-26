@@ -416,7 +416,7 @@ fn notebook_crud_flags_and_seq() {
         a.is_new && a.is_dirty,
         "create sets LocalIsNew+IsDirty (JS addNotebook)"
     );
-    assert_eq!((a.seq, b.seq), (0, 1), "Seq = max sibling + 1");
+    assert_eq!((a.seq, b.seq), (0, -1), "Seq = min sibling - 1 (prepend)");
     // nested: seq independent per parent group
     let a1 = s.create_notebook("A1", &a.notebook_id).unwrap();
     assert_eq!(a1.seq, 0);
@@ -431,37 +431,46 @@ fn notebook_crud_flags_and_seq() {
         .unwrap();
     assert_eq!((b2.title.as_str(), b2.is_dirty), ("B2", true));
 }
-
 #[test]
-fn delete_notebook_trashes_notes_not_lost() {
+
+fn delete_notebook_guard_semantics() {
     let s = store("t11_delete");
+    // A (no notes) with child B containing one note.
     let a = s.create_notebook("A", "").unwrap();
-    add(&s, "n1", "c", &[], "A");
-    add(&s, "n2", "c", &[], "A");
     let child = s.create_notebook("A-child", &a.notebook_id).unwrap();
     add(&s, "n3", "c", &[], "A-child");
     let before = s.note_count().unwrap();
 
+    // A has a live child → guard fires, nothing deleted.
+    assert!(s.has_sub_notebooks(&a.notebook_id).unwrap());
     s.delete_notebook(&a.notebook_id).unwrap();
-
-    // notes survive in trash, dirty for the deleteTrash push
-    let trash = s.list_trash().unwrap();
-    assert_eq!(trash.len(), 3, "all notes of the subtree land in trash");
-    assert!(trash.iter().all(|n| n.is_trash));
-    assert_eq!(s.note_count().unwrap(), before, "nothing hard-deleted");
-    let dirty: i64 = s
-        .raw_query_row("SELECT COUNT(*) FROM notes WHERE IsTrash=1 AND IsDirty=1")
-        .unwrap();
-    assert_eq!(dirty, 3);
-    // notebook subtree soft-deleted (hidden from nav, dirty for the push)
-    let nbs = s.notebooks().unwrap();
-    assert!(nbs
+    assert!(s
+        .notebooks()
+        .unwrap()
         .iter()
-        .all(|nb| nb.notebook_id != a.notebook_id && nb.notebook_id != child.notebook_id));
-    let deleted_rows: i64 = s
+        .any(|nb| nb.notebook_id == a.notebook_id));
+    assert_eq!(s.note_count().unwrap(), before, "guard deleted nothing");
+
+    // B has live notes → subtree count > 0 (the app's second guard).
+    assert!(!s.has_sub_notebooks(&child.notebook_id).unwrap());
+    assert_eq!(
+        s.notebook_subtree_note_count(&child.notebook_id).unwrap(),
+        1
+    );
+
+    // Empty notebook deletes cleanly (app reaches it only when both guards pass).
+    let e = s.create_notebook("E", "").unwrap();
+    assert_eq!(s.notebook_subtree_note_count(&e.notebook_id).unwrap(), 0);
+    s.delete_notebook(&e.notebook_id).unwrap();
+    assert!(s
+        .notebooks()
+        .unwrap()
+        .iter()
+        .all(|nb| nb.notebook_id != e.notebook_id));
+    let dirty: i64 = s
         .raw_query_row("SELECT COUNT(*) FROM notebooks WHERE LocalIsDelete=1 AND IsDirty=1")
         .unwrap();
-    assert_eq!(deleted_rows, 2, "parent + child notebook rows soft-deleted");
+    assert_eq!(dirty, 1, "empty notebook soft-deleted, dirty for the push");
 }
 
 #[test]
@@ -504,7 +513,8 @@ fn move_notebook_rewrites_both_sibling_groups() {
     );
     assert_eq!(
         group_seq(&s, &b.notebook_id.to_string()),
-        vec![("B1".into(), 0), ("A".into(), 1), ("B2".into(), 2)]
+        vec![("B2".into(), 0), ("A".into(), 1), ("B1".into(), 2)],
+        "B1 prepended under B, so A@1 lands between B2 and B1"
     );
     let a_row = s
         .notebooks()

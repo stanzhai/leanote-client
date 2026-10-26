@@ -941,32 +941,25 @@ impl Store {
     // ---- Ticket 11: notebook & tag management (offline, sync-pushed) ----
 
     /// JS Notebook.addNotebook: new row, LocalIsNew+IsDirty (pushed on the
-    /// next sync). Seq = max sibling + 1 so it lands last in its group —
-    /// the visible order the user expects, unlike the JS tree's Seq:-1.
+    /// next sync). Seq = min sibling - 1 so it lands FIRST in its group
+    /// (JS addNotebook used Seq:-1 for the same prepend effect).
     pub fn create_notebook(&self, title: &str, parent_id: &str) -> rusqlite::Result<Notebook> {
         let tx = self.conn.unchecked_transaction()?;
-        let max_seq: i64 = tx
+        let seq: i64 = tx
             .query_row(
-                "SELECT COALESCE(MAX(Seq), -1) FROM notebooks
+                "SELECT COALESCE(MIN(Seq), 1) - 1 FROM notebooks
                  WHERE UserId=?1 AND ParentNotebookId=?2",
                 params![self.user_id, parent_id],
                 |r| r.get(0),
             )
-            .unwrap_or(-1);
+            .unwrap_or(0);
         let id = Id::new();
         let now = now_ms();
         tx.execute(
             "INSERT INTO notebooks (NotebookId, UserId, Title, ParentNotebookId, Seq, Usn,
                 LocalIsNew, IsDirty, LocalIsDelete, CreatedTime, UpdatedTime)
              VALUES (?1,?2,?3,?4,?5,0,1,1,0,?6,?6)",
-            params![
-                id.to_string(),
-                self.user_id,
-                title,
-                parent_id,
-                max_seq + 1,
-                now
-            ],
+            params![id.to_string(), self.user_id, title, parent_id, seq, now],
         )?;
         tx.commit()?;
         Ok(self
@@ -984,13 +977,16 @@ impl Store {
         )
     }
 
-    /// Ticket 11 (ticket text overrides the JS guard): deleting a notebook
-    /// sends its notes to trash — IsTrash+LocalIsDelete+IsDirty, exactly
-    /// `trash_note`, never a hard delete — so nothing is lost. Child
-    /// notebooks are deleted the same soft way (LocalIsDelete+IsDirty; sync
-    /// pushes notebook/deleteNotebook, or drops them locally when they were
-    /// never pushed).
+    /// JS delete guard: refuse to delete a notebook that still has live
+    /// sub-notebooks or live notes. The caller must surface "delete them
+    /// first". Returns Ok(0) without touching anything when guarded.
     pub fn delete_notebook(&self, id: &Id) -> rusqlite::Result<usize> {
+        if self.has_sub_notebooks(id)? {
+            return Ok(0);
+        }
+        if self.notebook_subtree_note_count(id)? > 0 {
+            return Ok(0);
+        }
         let tx = self.conn.unchecked_transaction()?;
         let now = now_ms();
         // this notebook + every descendant.
@@ -1026,6 +1022,50 @@ impl Store {
         }
         tx.commit()?;
         Ok(all.len())
+    }
+
+    /// Live (non-trash) note count across a notebook and all its
+    /// descendants — what the delete confirm dialog warns about.
+    pub fn notebook_subtree_note_count(&self, id: &Id) -> rusqlite::Result<i64> {
+        let mut ids = vec![id.to_string()];
+        let mut frontier = vec![id.to_string()];
+        while let Some(p) = frontier.pop() {
+            let mut stmt = self.conn.prepare(
+                "SELECT NotebookId FROM notebooks
+                 WHERE ParentNotebookId=?1 AND LocalIsDelete=0",
+            )?;
+            for child in stmt.query_map([&p], |r| r.get::<_, String>(0))? {
+                let child = child?;
+                frontier.push(child.clone());
+                ids.push(child);
+            }
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM notes
+                     WHERE IsTrash=0 AND LocalIsDelete=0 AND IsDeleted=0
+                     AND NotebookId IN ({placeholders})"
+                ),
+                params.as_slice(),
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// JS `Notebook.getSubNotebooks` guard: true when the notebook has any
+    /// live child notebook (delete must refuse until they're gone).
+    pub fn has_sub_notebooks(&self, id: &Id) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM notebooks
+             WHERE ParentNotebookId=?1 AND LocalIsDelete=0",
+            [id.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
     }
 
     /// JS Notebook.dragNotebooks: the moved notebook plus EVERY sibling in
@@ -1083,10 +1123,11 @@ impl Store {
             let mut group: Vec<String> = {
                 let mut stmt = tx.prepare(
                     "SELECT NotebookId FROM notebooks
-                     WHERE ParentNotebookId=?1 AND LocalIsDelete=0 ORDER BY Seq, rowid",
+                     WHERE ParentNotebookId=?1 AND NotebookId<>?2 AND LocalIsDelete=0
+                     ORDER BY Seq, rowid",
                 )?;
                 let v = stmt
-                    .query_map([new_parent], |r| r.get(0))?
+                    .query_map(params![new_parent, id.to_string()], |r| r.get(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 v
             };

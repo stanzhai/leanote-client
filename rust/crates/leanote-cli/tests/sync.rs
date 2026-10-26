@@ -996,7 +996,7 @@ async fn notebook_ops_push_add_update_delete_with_seq() {
 
     // offline: create (root) + create (child) + rename + move
     let work = s.create_notebook("Work", "").unwrap();
-    assert_eq!(work.seq, 4, "root max seq was 3 (nb1,nb3 roots) + 1");
+    assert_eq!(work.seq, 0, "prepend: min root seq (nb1=1,nb3=3) - 1 → 0");
     let sub = s.create_notebook("Work-sub", &work.notebook_id).unwrap();
     assert_eq!(sub.seq, 0);
     s.rename_notebook(&work.notebook_id, "Work2").unwrap();
@@ -1055,9 +1055,11 @@ async fn notebook_ops_push_add_update_delete_with_seq() {
         "nb1 moved to front → Seq 0"
     );
 
-    // delete: notes to trash + notebook soft-deleted → deleteNotebook + updateNote(IsTrash) pushes
+    // delete: guard refuses while the child exists, then both delete
     srv.clear_pushes();
-    s.delete_notebook(&work.notebook_id).unwrap();
+    assert_eq!(s.delete_notebook(&work.notebook_id).unwrap(), 0, "has sub");
+    assert_eq!(s.delete_notebook(&sub.notebook_id).unwrap(), 1);
+    assert_eq!(s.delete_notebook(&work.notebook_id).unwrap(), 1);
     incr_sync(&api, &s, &NoProgress).unwrap();
     let pushes = srv.pushes();
     assert!(
@@ -1074,7 +1076,7 @@ async fn notebook_ops_push_add_update_delete_with_seq() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn delete_notebook_pushes_trashed_notes_and_notebook_delete() {
+async fn delete_notebook_refuses_nonempty_pushes_empty_delete() {
     let (srv, _dir, s, api) = synced("t11_nb_delete").await;
     let nb2 = s
         .notebooks()
@@ -1087,16 +1089,30 @@ async fn delete_notebook_pushes_trashed_notes_and_notebook_delete() {
         .unwrap();
     assert_eq!(live, 150, "dataset: 450 notes cycled over 3 notebooks");
 
-    s.delete_notebook(&nb2.notebook_id).unwrap();
-    let trash = s.list_trash().unwrap();
-    assert_eq!(trash.len(), 150, "notes trashed, not lost");
-    assert!(
-        s.raw_query_row("SELECT COUNT(*) FROM notes WHERE NotebookId='nb2'")
-            .unwrap()
-            >= 150
+    // Guard: nb2 has 150 live notes (and is a child of nb1, so nb1 also
+    // refuses) → store deletes nothing.
+    assert_eq!(s.delete_notebook(&nb2.notebook_id).unwrap(), 0);
+    let nb1 = s
+        .notebooks()
+        .unwrap()
+        .into_iter()
+        .find(|nb| nb.title == "Notebook 1")
+        .unwrap();
+    assert_eq!(s.delete_notebook(&nb1.notebook_id).unwrap(), 0);
+    assert_eq!(
+        s.raw_query_row("SELECT COUNT(*) FROM notes WHERE NotebookId='nb2' AND IsTrash=0")
+            .unwrap(),
+        150,
+        "notes untouched"
     );
 
+    // Empty notebook: local-only create, then delete → the delete pushes.
+    let fresh = s.create_notebook("Fresh", "").unwrap();
+    // push the add first so the row is not is_new (is_new+deleted is a
+    // local-only drop, never a server delete).
+    incr_sync(&api, &s, &NoProgress).unwrap();
     srv.clear_pushes();
+    assert_eq!(s.delete_notebook(&fresh.notebook_id).unwrap(), 1);
     incr_sync(&api, &s, &NoProgress).unwrap();
     let pushes = srv.pushes();
     assert!(
@@ -1105,15 +1121,9 @@ async fn delete_notebook_pushes_trashed_notes_and_notebook_delete() {
             .any(|p| p.endpoint == "notebook/deleteNotebook"),
         "notebook delete pushed"
     );
-    // trashing is the existing trash_note semantics → note/deleteTrash push
-    let trashed_pushes: Vec<&leanote_fakeserver::RecordedPush> = pushes
-        .iter()
-        .filter(|p| p.endpoint == "note/deleteTrash")
-        .collect();
-    assert_eq!(
-        trashed_pushes.len(),
-        150,
-        "every trashed note pushed deleteTrash"
+    assert!(
+        !pushes.iter().any(|p| p.endpoint == "note/deleteTrash"),
+        "notebook delete never auto-trashes notes"
     );
 }
 

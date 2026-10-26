@@ -94,7 +94,18 @@ keys! {
     NewNotebook => ("新建笔记本", "New Notebook"),
     RenameNotebook => ("重命名笔记本", "Rename Notebook"),
     DeleteNotebook => ("删除笔记本", "Delete Notebook"),
+    DeleteNotebookTitle => ("删除笔记本？", "Delete notebook?"),
+    DeleteNotebookEmptyBody => ("删除后不可恢复。", "This cannot be undone."),
+    DeleteNotebookHasSubNotebooks => (
+        "该笔记本下有子笔记本，请先删除子笔记本。",
+        "This notebook has sub-notebooks. Delete them first."
+    ),
+    DeleteNotebookHasNotesBody => (
+        "该笔记本下有 {n} 篇笔记，请先删除笔记。",
+        "This notebook has {n} notes. Delete them first."
+    ),
     MoveNotebookTo => ("移动到…", "Move to…"),
+    NotebookNamePlaceholder => ("请输入笔记本名称", "Enter notebook name"),
     RootLevel => ("顶层", "Top level"),
     RenameTag => ("重命名标签", "Rename Tag"),
     DeleteTag => ("删除标签", "Delete Tag"),
@@ -258,7 +269,12 @@ mod tests {
         Key::NewNotebook,
         Key::RenameNotebook,
         Key::DeleteNotebook,
+        Key::DeleteNotebookTitle,
+        Key::DeleteNotebookEmptyBody,
+        Key::DeleteNotebookHasSubNotebooks,
+        Key::DeleteNotebookHasNotesBody,
         Key::MoveNotebookTo,
+        Key::NotebookNamePlaceholder,
         Key::RootLevel,
         Key::RenameTag,
         Key::DeleteTag,
