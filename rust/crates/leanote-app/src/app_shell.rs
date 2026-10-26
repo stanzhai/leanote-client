@@ -34,11 +34,12 @@ use leanote_core::sync::{Api, NoProgress, SyncProgress, SyncStats};
 use std::sync::{Arc, Mutex};
 
 /// Default pane widths (ADR-0003). Issue 18: user-resizable, persisted;
-/// these are the first-run and reset values.
-const LEFT_W: f32 = 180.;
+/// these are the first-run and reset values. Left starts at its drag
+/// minimum — the sidebar only needs icon + title + count.
+const LEFT_W: f32 = 150.;
 const MID_W: f32 = 240.;
 /// Issue 18: drag ranges for the left/middle panes.
-const LEFT_RANGE: (f32, f32) = (180., 400.);
+const LEFT_RANGE: (f32, f32) = (150., 400.);
 const MID_RANGE: (f32, f32) = (240., 600.);
 /// Issue 18: uniform note-row height — py 4 + title 19 + meta 20 + excerpt
 /// 20 + 2× 1px gaps = 65px.
@@ -46,6 +47,9 @@ const NOTE_ROW_H: f32 = 65.;
 /// Issue 23 #11: 1px divider under each note row (except the last) —
 /// `theme::border(dark)`, auto-adapting to light/dark.
 const NOTE_ROW_DIVIDER_H: f32 = 1.;
+/// Recent list cap — one source of truth for the list query AND the nav
+/// badge count (issue: badge must equal what Recent actually shows).
+const RECENT_LIMIT: usize = 20;
 /// macOS transparent titlebar height, same material as the sidebar.
 const TITLEBAR_H: f32 = 44.;
 
@@ -586,7 +590,7 @@ impl AppShell {
                 .store()
                 .map(|store| {
                     let res = match &self.nav {
-                        NavSelection::Recent => store.list_notes_meta_recent(20),
+                        NavSelection::Recent => store.list_notes_meta_recent(RECENT_LIMIT),
                         NavSelection::Starred => store.list_notes_filtered_meta(None, true),
                         NavSelection::Trash => store.list_trash_meta(),
                         NavSelection::Notebook(id) => store
@@ -738,7 +742,12 @@ impl AppShell {
         if !note.is_markdown || note.is_trash || note.is_deleted {
             return;
         }
-        let title = cx.new(|cx| InputState::new(window, cx).default_value(note.title.clone()));
+        let title_ph: SharedString = i18n::t(self.lang, i18n::Key::TitlePlaceholder).into();
+        let title = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(note.title.clone())
+                .placeholder(title_ph)
+        });
         let content = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language("markdown")
@@ -757,9 +766,15 @@ impl AppShell {
             }
         })
         .detach();
-        // Body owns focus: vim grammar and typing land in the content, not
-        // the title input.
-        content.update(cx, |state, cx| state.focus(window, cx));
+        // Empty title = freshly created note: focus lands on the title so
+        // the first keystroke names it; existing notes keep focus in the
+        // body (vim grammar + typing land in the content).
+        let focus_title = note.title.is_empty();
+        if focus_title {
+            title.update(cx, |state, cx| state.focus(window, cx));
+        } else {
+            content.update(cx, |state, cx| state.focus(window, cx));
+        }
         let tag_input = cx.new(|cx| {
             let ph: SharedString = i18n::t(self.lang, i18n::Key::AddTagPlaceholder).into();
             InputState::new(window, cx).placeholder(ph)
@@ -937,9 +952,12 @@ impl AppShell {
             crate::prefs::AppearancePref::Light => Some(gpui_kit::WindowAppearance::Light),
             crate::prefs::AppearancePref::Dark => Some(gpui_kit::WindowAppearance::Dark),
         });
-        // Single-frame switch: one update() does mode load + wake overlay.
-        // change() would refresh_windows with bare kit colors first (visible
-        // flash), then a second update repaints with the Wake palette.
+        // Mode switch, then wake overlay — TWO updates. One combined
+        // update cannot work: Theme::edit re-applies the mode's registered
+        // config AFTER the user closure (to reload mode-scoped tables), so
+        // any color edits made inside are wiped. set_accent/main.rs use the
+        // same stacked shape. Cost: one frame of kit-default colors before
+        // the second update repaints.
         let palette = p.editor_palette.clone();
         let zoom = p.zoom;
         let appearance = p.appearance;
@@ -958,7 +976,9 @@ impl AppShell {
                 theme.light_theme.clone()
             };
             theme.apply_config(&config);
-            crate::apply_wake_theme(theme, &palette, zoom);
+        });
+        gpui_kit::component::Theme::update(cx, move |theme| {
+            crate::apply_wake_theme(theme, &palette, zoom)
         });
         cx.notify();
     }
@@ -1407,6 +1427,26 @@ impl AppShell {
         self.selected = None;
         self.invalidate_lists();
         cx.notify();
+    }
+
+    /// Empty-trash button behind an AlertDialog: empty_trash soft-deletes
+    /// every trashed note and flags them dirty — irreversible after sync.
+    fn confirm_empty_trash(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        let shell = cx.entity();
+        let lang = self.lang;
+        window.open_alert_dialog(cx, move |alert, _window, _cx| {
+            let shell_ok = shell.clone();
+            alert
+                .title(i18n::t(lang, i18n::Key::EmptyTrash))
+                .description(i18n::t(lang, i18n::Key::EmptyTrashConfirmBody))
+                .show_cancel(true)
+                .ok_text(i18n::t(lang, i18n::Key::Confirm))
+                .cancel_text(i18n::t(lang, i18n::Key::Cancel))
+                .on_ok(move |_ev, _window, cx| {
+                    let _ = shell_ok.update(cx, |this, cx| this.empty_trash(cx));
+                    true
+                })
+        });
     }
 
     // --- Ticket 15: export HTML / Markdown / PDF / .leanote backup ---
@@ -2664,8 +2704,10 @@ impl AppShell {
         };
         let mut all_count = 0i64;
         if let Some(store) = self.store() {
+            // Badge mirrors the Recent LIST (UpdatedTime desc, capped) —
+            // not the raw live-note total.
             all_count = store
-                .list_notes_filtered(None, false)
+                .list_notes_meta_recent(RECENT_LIMIT)
                 .map(|n| n.len() as i64)
                 .unwrap_or(0);
         }
@@ -4028,7 +4070,9 @@ impl AppShell {
             NavSelection::Tag(_) => Some(AssetIcon::Tag),
         };
 
-        // Trash view has no new-note; every other context does (ticket 10).
+        // Issue: new-note only in a notebook context; Recent/Starred/Tag
+        // have no add button (⌘K quick action still works anywhere, falling
+        // back to the first notebook).
         let mut header = gpui_kit::base::h_flex()
             .gap_2()
             .pl(px(4.))
@@ -4037,13 +4081,28 @@ impl AppShell {
             })
             .child(Label::new(title.clone()).text_size(px(14.)).text_color(fg))
             .child(gpui_kit::base::h_flex().flex_1());
-        if self.nav != NavSelection::Trash {
-            header = header.child(
-                Button::new("new-note")
-                    .icon(IconName::Plus)
-                    .ghost()
-                    .on_click(cx.listener(|this, _ev, window, cx| this.new_note(window, cx))),
-            );
+        match &self.nav {
+            NavSelection::Notebook(_) => {
+                header = header.child(
+                    Button::new("new-note")
+                        .icon(IconName::Plus)
+                        .ghost()
+                        .on_click(cx.listener(|this, _ev, window, cx| this.new_note(window, cx))),
+                );
+            }
+            // Trash gets a destructive "empty" action instead (confirmed
+            // via AlertDialog — empty_trash is irreversible after sync).
+            NavSelection::Trash => {
+                header = header.child(
+                    Button::new("empty-trash")
+                        .icon(AssetIcon::Trash)
+                        .ghost()
+                        .on_click(cx.listener(|this, _ev, window, cx| {
+                            this.confirm_empty_trash(window, cx)
+                        })),
+                );
+            }
+            NavSelection::Recent | NavSelection::Starred | NavSelection::Tag(_) => {}
         }
 
         let mut list = gpui_kit::base::v_flex()
@@ -4194,7 +4253,6 @@ impl AppShell {
         window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) -> gpui_kit::Div {
-        let fg = theme::foreground(dark);
         let muted = theme::muted_foreground(dark);
         let notebook_names = self.notebook_names().clone();
 
@@ -4253,21 +4311,28 @@ impl AppShell {
         }
 
         let Some(n) = note else {
-            let mut empty = gpui_kit::base::v_flex().gap_2();
+            let mut empty = gpui_kit::base::v_flex();
             if let Some(bar) = bar {
                 empty = empty.child(bar);
             }
+            // Centered icon + one-line hint; wording flips when the
+            // current list itself is empty (no note to select).
+            let list_empty = self.visible_notes().is_empty();
+            let hint = if list_empty {
+                i18n::t(self.lang, i18n::Key::EmptyReaderHint)
+            } else {
+                i18n::t(self.lang, i18n::Key::NoSelection)
+            };
             return pane.child(
-                empty
-                    .child(small_label(
-                        i18n::t(self.lang, i18n::Key::NoSelection),
-                        muted,
-                    ))
-                    .child(
-                        Label::new(t(i18n::Key::NoSelection))
-                            .text_size(px(16.))
-                            .text_color(fg),
-                    ),
+                empty.flex_1().child(
+                    gpui_kit::base::v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(Icon::new(AssetIcon::FileText).large().text_color(muted))
+                        .child(Label::new(hint).text_size(px(14.)).text_color(muted)),
+                ),
             );
         };
 
@@ -4572,92 +4637,82 @@ impl AppShell {
                 .into_any_element()
         };
 
+        // Status bar (tags left w/ icon, updated time right w/ icon) sits
+        // directly under the title row — issue: move out of the bottom.
+        // Edit mode only; preview keeps the clean look.
+        let status_bar = if !preview {
+            let ed = self.editing.as_ref().unwrap();
+            Some(
+                gpui_kit::base::h_flex()
+                    .w_full()
+                    .h_7()
+                    .gap_2()
+                    .px_2()
+                    .mb_0()
+                    .border_b_1()
+                    .border_color(theme::border(dark))
+                    .child(
+                        gpui_kit::base::h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(Icon::new(AssetIcon::Tag).xsmall().text_color(muted))
+                            .children(ed.tags.iter().cloned().map(|tag| {
+                                let shell_t = cx.entity().downgrade();
+                                let tag_id: SharedString = format!("tag-x-{tag}").into();
+                                gpui_kit::base::h_flex()
+                                    .gap_1()
+                                    .px_2()
+                                    .rounded(px(theme::RADIUS_SELECTION))
+                                    .bg(theme::material(Material::List, dark))
+                                    .child(small_label(SharedString::from(tag.clone()), muted))
+                                    .child(
+                                        Button::new(tag_id.clone())
+                                            .icon(AssetIcon::X)
+                                            .ghost()
+                                            .xsmall()
+                                            .on_click(move |_, _window, cx| {
+                                                let _ = shell_t.update(cx, |this, cx| {
+                                                    this.remove_tag(tag.clone(), cx)
+                                                });
+                                            }),
+                                    )
+                            }))
+                            .child(
+                                Input::new(&ed.tag_input)
+                                    .xsmall()
+                                    .w(px(120.))
+                                    .cleanable(false),
+                            ),
+                    )
+                    .child(
+                        gpui_kit::base::h_flex()
+                            .gap_1()
+                            .flex_none()
+                            .child(Icon::new(AssetIcon::Clock).xsmall().text_color(muted))
+                            .child(
+                                small_label(SharedString::from(fmt_time(ed.updated_time)), muted)
+                                    .text_size(px(12.)),
+                            ),
+                    ),
+            )
+        } else {
+            None
+        };
+
         let col = gpui_kit::base::v_flex()
             .flex_1()
             .min_w_0()
             .px(px(5.))
             .gap_2()
             .min_h_0()
-            .pb_0()
+            // Editor column ends 5px above the window bottom (issue #2).
+            .pb(px(5.))
             .h_full()
             .child(title_row)
+            .when_some(status_bar, |el, bar| el.child(bar))
             .when(!preview && toolbar_on, |el| el.child(md_toolbar))
             .child(body)
-            .when(!preview, |el| {
-                // Issue 23 #6: editor status bar — tag chips + add field
-                // (left), vim mode + line:col (middle), local updated time
-                // (right). Edit mode only; preview keeps the clean look.
-                let ed = self.editing.as_ref().unwrap();
-                let pos = content_entity.read(cx).cursor_position();
-                let mode = if self.vim_enabled {
-                    match self.vim.mode {
-                        crate::vim::VimMode::Normal => "-- NORMAL --".to_string(),
-                        crate::vim::VimMode::Insert => "-- INSERT --".to_string(),
-                        crate::vim::VimMode::Visual => "-- VISUAL --".to_string(),
-                    }
-                } else {
-                    format!("-- {} --", t(i18n::Key::ModeNormal))
-                };
-                el.child(
-                    gpui_kit::base::h_flex()
-                        .w_full()
-                        .h_7()
-                        .gap_2()
-                        .px_2()
-                        .mb_0()
-                        .border_t_1()
-                        .border_color(theme::border(dark))
-                        .child(
-                            gpui_kit::base::h_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_1()
-                                .child(Label::new(t(i18n::Key::TagsLabel)).text_size(px(12.)))
-                                .children(ed.tags.iter().cloned().map(|tag| {
-                                    let shell_t = cx.entity().downgrade();
-                                    let tag_id: SharedString = format!("tag-x-{tag}").into();
-                                    gpui_kit::base::h_flex()
-                                        .gap_1()
-                                        .px_2()
-                                        .rounded(px(theme::RADIUS_SELECTION))
-                                        .bg(theme::material(Material::List, dark))
-                                        .child(small_label(SharedString::from(tag.clone()), muted))
-                                        .child(
-                                            Button::new(tag_id.clone())
-                                                .icon(AssetIcon::X)
-                                                .ghost()
-                                                .xsmall()
-                                                .on_click(move |_, _window, cx| {
-                                                    let _ = shell_t.update(cx, |this, cx| {
-                                                        this.remove_tag(tag.clone(), cx)
-                                                    });
-                                                }),
-                                        )
-                                }))
-                                .child(
-                                    Input::new(&ed.tag_input)
-                                        .xsmall()
-                                        .w(px(120.))
-                                        .cleanable(false),
-                                ),
-                        )
-                        .child(
-                            small_label(
-                                SharedString::from(format!(
-                                    "{mode}  {}:{}",
-                                    pos.line + 1,
-                                    pos.character + 1
-                                )),
-                                muted,
-                            )
-                            .text_size(px(12.)),
-                        )
-                        .child(
-                            small_label(SharedString::from(fmt_time(ed.updated_time)), muted)
-                                .text_size(px(12.)),
-                        ),
-                )
-            })
             .on_drop::<gpui_kit::ExternalPaths>(cx.listener(
                 |this, paths: &gpui_kit::ExternalPaths, window, cx| {
                     // Issue 21 需求9: dropped image files attach to the note.
@@ -4694,6 +4749,21 @@ impl AppShell {
                     this.save_editor(cx);
                     cx.stop_propagation();
                     return;
+                }
+                // Tab in the title input → focus the markdown body (issue
+                // #3). Intercepted before the input's own IndentInline.
+                if ev.keystroke.key == "tab" && !m.platform && !m.control && !m.alt {
+                    let in_title = this
+                        .editing
+                        .as_ref()
+                        .is_some_and(|ed| ed.title.read(cx).has_selection_focus(window, cx));
+                    if in_title {
+                        if let Some(ed) = &this.editing {
+                            ed.content.update(cx, |state, cx| state.focus(window, cx));
+                        }
+                        cx.stop_propagation();
+                        return;
+                    }
                 }
                 // Vim grammar: bare keys carry no kit bindings, so this
                 // capture listener is the first hook that sees them —

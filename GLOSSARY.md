@@ -17,7 +17,7 @@
 - **笔记本 (Notebook)** — 服务器上的笔记容器，可嵌套（子笔记本），有 `Seq` 排序。见“运行形态”节：GUI 中笔记本与标签共同构成左栏导航分组。
 - **笔记 (Note)** — 一条笔记，含 `Title`、`Content`（HTML 或 Markdown）、`IsMarkdown` 标志、`Usn`、所属 NotebookId、Tags。
 - **标签 (Tag)** — 跨笔记本的笔记横向组织；一篇笔记可有多个标签。本地 `notes.Tags` 列为 **CSV 格式**（`rust,gpui`）；个别服务端会把标签数组序列化成 JSON 字符串（`["rust"]`）下发，同步层在写入前解析为 CSV，`user_version` 迁移也会把存量 JSON 行归一化。标签导航列表**纯从 notes.Tags 聚合**（去重+计数），不读 tags 表（其 Count 经同步后失真）。
-- **收藏 (Starred)** — 笔记的收藏标志，字段名 `Star`，**纯本地字段，从不上服务器**（服务端无对应 API；现版置 Star 不置 IsDirty）。是笔记列表平级的入口（Starred 视图）。
+- **收藏 (Starred)** — 笔记的收藏标志，字段名 `Star`，**纯本地字段，从不上服务器**（服务端无对应 API；置 Star 不置 IsDirty，也不更新 UpdatedTime——第九轮起与内容编辑解耦，收藏不改变笔记的新鲜度）。是笔记列表平级的入口（Starred 视图）。
 - **回收站 (Trash)** — 已删除笔记的停留区；从 Trash 恢复或彻底删除（`deleteTrash`）。
 - **IsMarkdown** — 笔记内容格式标志。`true` = Markdown 文本；`false` = TinyMCE 富文本 HTML。见 ADR-0001 关于富文本在 Rust 版中的降级。
 
@@ -36,7 +36,7 @@
 ## 布局与界面（Rust 版）
 
 - **三栏布局 (Three-pane layout)** — Wake 式信息架构：左栏导航（搜索入口 + 固定导航 + 可折叠分组）+ 中栏笔记列表 + 右栏编辑/阅读面。无顶部通栏；窗口用系统透明标题栏，仅左栏顶部让位红绿灯（44px），中/右栏内容直通窗口顶边（ADR-0003，UI 优化轮修正）。
-- **最近 (Recent)** — 左栏固定导航首项：最近编辑的 20 条笔记（UpdatedTime 倒序）。第五轮起取代「全部笔记」入口；浏览全部走笔记本/标签分组（ADR-0003 第 6 条）。
+- **最近 (Recent)** — 左栏固定导航首项：最近编辑的 `RECENT_LIMIT=20` 条笔记（UpdatedTime 倒序）；导航徽章计数与列表共用同一上限常量（`min(20, live)`），不是全库存量。第五轮起取代「全部笔记」入口；浏览全部走笔记本/标签分组（ADR-0003 第 6 条）。
 - **视觉语言 (Visual language)** — 取自 Wake 的“现代 macOS”风格：材质分层（titlebar/sidebar/list/background/popover 四层色）、无窗格边框线、持久 UI 零阴影、SF Pro 系统字、8 级字号、4px 间距栅格、分级圆角。与现 Electron 版的多主题体系是替代关系（ADR-0003）。**编辑器配色**是独立概念：仅作用于源码着色的 2–3 套配色（默认跟随系统明暗），不等于全局多主题。**主题色 (accent)** 是视觉语言的参数：6 色板本地偏好，用于选中态与动作色（ADR-0005）。
 - **⌘K 面板 (⌘K palette)** — 顶部悬浮式全局面板（宽 680px），三段式：快捷动作（新建笔记/立即同步/导出备份…）+ 最近打开（本地记录 top6）+ 即输即搜（统一搜索核心），⌘K / ⌘⇧P 触发，空输入显示最近打开（Wake 同款交互；语义 = Electron 版 command palette 的复刻超集，旧词条「⌘K 搜索」已并入）。应用内搜索仅此入口。
 - **编辑器 (Editor)** — 右栏源码编辑面：kit `Editor` 组件 + tree-sitter 语法着色（全部 kit 语言 feature，含 markdown 内嵌代码块注入着色）+ 编辑器配色；第一行 = 标题 + 工具按钮（预览/附件/历史，仅 icon），第二行 = markdown 格式工具栏（含插入图片）+ 帮助。选中 Markdown 笔记**默认即编辑态**，源码为默认模式、预览为开关；改动防抖自动保存，⌘S 保留；标题行兼作窗口拖拽区（ADR-0004）。
@@ -46,4 +46,4 @@
 - **笔记图片 (Note image)** — 拖放/选择/工具栏插入图片 → 字节存本地 images 表（`LocalId`/`ServerId`/`Bytes`），笔记内容引用 `leanote://file/getImage?fileId=<24hex>`（保持 local id，不改写内容）；渲染前替换为 data URL。脏图片（无 ServerId）随笔记以 multipart 推送（`note/addNote`/`updateNote`），服务器 `Files` 回写 ServerId；同步拉取时 `pull_missing_images` 下载缺失字节（复刻 Electron `src/file.js` 语义，ADR-0006）。
 - **历史版本 (History)** — 笔记的服务端历史快照（每账户最近 20 条）；在居中大弹窗中列出+预览+恢复（ADR-0005）。区别于本地撤销。
 - **设置 (Settings)** — 左栏底部工具栏唤起的居中弹窗：外观（跟随系统/强制浅/深）、界面缩放（100–160% 五档，rem 级整体缩放）、Vim 开关、编辑器工具栏开关（默认关）、编辑器配色、主题色、语言（中/英）、账户信息与登出。仅本地 UI 偏好，不涉及服务器概念。
-- **编辑器状态栏 (Editor status bar)** — 编辑态（非预览）右栏底部一行：左侧标签胶囊（✕ 删除 + 输入回车添加，改动置脏走同一保存管线）；中部 Vim 模式段 + `行:列`（1-based，实时取光标位置）；右侧本地更新日期（保存后刷新）。仅 Markdown 编辑态显示；预览与阅读态无此栏。
+- **编辑器状态栏 (Editor status bar)** — 编辑态（非预览）右栏标题行下方一行（下边框分隔）：左侧 Tag icon + 标签胶囊（✕ 删除 + 输入回车添加，改动置脏走同一保存管线）；右侧 Clock icon + 本地更新日期。仅 Markdown 编辑态显示；预览与阅读态无此栏。第九轮起 Vim 模式段与 `行:列` 已移除（模式反馈仅剩光标形状）。

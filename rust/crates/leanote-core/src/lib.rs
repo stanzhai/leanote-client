@@ -441,12 +441,14 @@ impl Store {
         rows.collect()
     }
 
-    /// Toggle Star. JS Note.star: sets Star + UpdatedTime ONLY — IsDirty
-    /// stays untouched so the change never reaches the server.
+    /// Toggle Star. JS Note.star touches Star ONLY — IsDirty stays
+    /// untouched so the change never reaches the server, and UpdatedTime
+    /// stays put so starring never reorders "Recent" (issue: star must not
+    /// count as a content change).
     pub fn toggle_star(&self, id: &Id) -> rusqlite::Result<Option<bool>> {
         let n = self.conn.execute(
-            "UPDATE notes SET Star = 1-Star, UpdatedTime=?2 WHERE NoteId=?1",
-            params![id.to_string(), now_ms()],
+            "UPDATE notes SET Star = 1-Star WHERE NoteId=?1",
+            params![id.to_string()],
         )?;
         if n == 0 {
             return Ok(None);

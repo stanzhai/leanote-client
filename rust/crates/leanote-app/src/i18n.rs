@@ -62,6 +62,16 @@ keys! {
     // Shell: middle list + right pane.
     NoSelection => ("选择一条笔记", "Select a note"),
     EmptyNotes => ("没有笔记", "No notes yet"),
+    // Title placeholder + empty-reader hint + empty-trash confirm.
+    TitlePlaceholder => ("请输入笔记名称", "Enter note title"),
+    EmptyReaderHint => (
+        "还没有笔记，选择左侧笔记本开始创作",
+        "No notes yet — pick a notebook to start writing"
+    ),
+    EmptyTrashConfirmBody => (
+        "废纸篓中的所有笔记将被彻底删除，同步后不可恢复。",
+        "All notes in trash will be permanently deleted. This cannot be undone after sync."
+    ),
     // Ticket 09: reader toolbar + trash actions.
     Restore => ("恢复", "Restore"),
     HardDelete => ("彻底删除", "Delete forever"),
@@ -153,8 +163,6 @@ keys! {
     InterfaceZoom => ("界面缩放", "Interface zoom"),
     EditorToolbar => ("编辑器工具栏", "Editor toolbar"),
     VimMode => ("Vim 模式", "Vim mode"),
-    ModeNormal => ("普通", "Normal"),
-    TagsLabel => ("标签", "Tags"),
     AddTagPlaceholder => ("添加标签…", "Add tag…"),
     // Issue 17: logout confirmation.
     LogoutConfirmTitle => ("退出登录？", "Log out?"),
@@ -241,6 +249,9 @@ mod tests {
         Key::NavTags,
         Key::NoSelection,
         Key::EmptyNotes,
+        Key::TitlePlaceholder,
+        Key::EmptyReaderHint,
+        Key::EmptyTrashConfirmBody,
         Key::Restore,
         Key::HardDelete,
         Key::EmptyTrash,
@@ -312,8 +323,6 @@ mod tests {
         Key::InterfaceZoom,
         Key::EditorToolbar,
         Key::VimMode,
-        Key::ModeNormal,
-        Key::TagsLabel,
         Key::AddTagPlaceholder,
         Key::PaletteSolarized,
         Key::LogoutConfirmTitle,

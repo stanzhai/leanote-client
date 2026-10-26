@@ -62,8 +62,8 @@ pub struct ResultRow {
     pub title: String,
     /// Excerpt verbatim from the core (already windowed, `\n` → space).
     pub excerpt: String,
-    /// `{notebook}[{tags}]` — the CLI's third line.
-    pub meta: String,
+    /// Notebook title — first row's right cluster (`{notebook} · {date}`).
+    pub notebook: String,
     /// Updated date `YYYY-MM-DD`, same as the app's list rows.
     pub date: String,
 }
@@ -81,15 +81,7 @@ pub fn format_rows(hits: &[SearchHit], notebook_of: impl Fn(&str) -> String) -> 
                     n.title.clone()
                 },
                 excerpt: h.excerpt.clone(),
-                meta: format!(
-                    "{}{}",
-                    notebook_of(&n.notebook_id.to_string()),
-                    if n.tags.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", n.tags.join(", "))
-                    }
-                ),
+                notebook: notebook_of(&n.notebook_id.to_string()),
                 date: crate::app_shell::fmt_time(n.updated_time),
             }
         })
@@ -211,33 +203,49 @@ fn render_dialog(
     if searching {
         let rows = shell.read(cx).overlay_rows().to_vec();
         let group = CommandGroup::new().items(rows.iter().map(|r| {
-            CommandItem::new().label(r.title.clone()).child({
+            CommandItem::new().child({
                 let r = r.clone();
                 let muted = muted;
                 move |_: &mut Window, _: &mut App| {
+                    // Two aligned lines: title left, notebook · date right
+                    // (flex-none so the time column stays flush), excerpt
+                    // below, single line, ellipsized.
                     v_flex()
                         .gap_0p5()
                         .py_1()
+                        .w_full()
                         .child(
                             h_flex()
-                                .justify_between()
                                 .gap_2()
-                                .child(Label::new(r.title.clone()).text_size(px(14.)))
                                 .child(
-                                    Label::new(r.date.clone())
-                                        .text_size(px(11.))
-                                        .text_color(muted),
+                                    gpui_kit::div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .child(Label::new(r.title.clone()).text_size(px(14.))),
+                                )
+                                .child(
+                                    h_flex()
+                                        .flex_none()
+                                        .gap_1()
+                                        .child(
+                                            Label::new(r.notebook.clone())
+                                                .text_size(px(11.))
+                                                .text_color(muted),
+                                        )
+                                        .child(
+                                            Label::new(format!("· {}", r.date))
+                                                .text_size(px(11.))
+                                                .text_color(muted),
+                                        ),
                                 ),
                         )
                         .child(
-                            Label::new(r.excerpt.clone())
-                                .text_size(px(12.))
-                                .text_color(muted),
-                        )
-                        .child(
-                            Label::new(r.meta.clone())
-                                .text_size(px(11.))
-                                .text_color(muted),
+                            gpui_kit::div().w_full().min_w_0().truncate().child(
+                                Label::new(r.excerpt.clone())
+                                    .text_size(px(12.))
+                                    .text_color(muted),
+                            ),
                         )
                         .into_any_element()
                 }
@@ -327,10 +335,8 @@ mod tests {
 
     #[test]
     fn format_rows_mirrors_cli_layout() {
-        // Rows carry exactly the fields the CLI prints per hit:
-        //   {id}  {time}  {title}
-        //          {excerpt}
-        //          {notebook} [tags]
+        // Row fields for the two-line ⌘K layout: title / excerpt /
+        // notebook / date.
         let hits = leanote_core::search_notes(
             &[note(
                 "000000000000000000000001",
@@ -349,7 +355,7 @@ mod tests {
         assert_eq!(r.note_id, "000000000000000000000001");
         assert_eq!(r.title, "Leanote intro");
         assert_eq!(r.excerpt, "leanote is a note app with markdown support");
-        assert_eq!(r.meta, "Notebook-nb1 [rust, notes]");
+        assert_eq!(r.notebook, "Notebook-nb1");
         assert_eq!(r.date, "2024-12-26"); // UTC days for that epoch ms
     }
 
@@ -369,7 +375,7 @@ mod tests {
         );
         let rows = format_rows(&hits, |_| "Inbox".into());
         assert_eq!(rows[0].title, "(untitled)");
-        assert_eq!(rows[0].meta, "Inbox");
+        assert_eq!(rows[0].notebook, "Inbox");
     }
 
     #[test]

@@ -303,7 +303,11 @@ fn toggle_star_flips_star_without_setting_isdirty() {
     assert!(after.star);
     assert!(
         !after.is_dirty,
-        "JS Note.star sets Star+UpdatedTime only, never IsDirty"
+        "JS Note.star sets Star only, never IsDirty"
+    );
+    assert_eq!(
+        after.updated_time, n.updated_time,
+        "starring must not bump UpdatedTime (Recent order is content-driven)"
     );
     let to2 = s.toggle_star(&n.note_id).unwrap().unwrap();
     assert!(!to2, "second toggle unstars");

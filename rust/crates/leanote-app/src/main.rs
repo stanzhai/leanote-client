@@ -438,6 +438,10 @@ pub(crate) fn apply_wake_theme(theme: &mut Theme, palette_id: &str, zoom: f32) {
     // the reader/preview selection after any accent pick in light mode.
     colors.accent = theme::accent();
     colors.primary = theme::accent();
+    // White on the accent in BOTH modes: kit default (neutral-900/neutral-50)
+    // put dark text on the mid-saturation wake accents — unreadable menu
+    // hover / ⌘K selection / ghost-button hover in light mode.
+    colors.accent_foreground = theme::accent_foreground();
     theme.colors = colors;
     theme.radius = px(theme::RADIUS_PANEL);
     theme.radius_lg = px(theme::RADIUS_PANEL);
