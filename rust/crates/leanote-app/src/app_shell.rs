@@ -2731,7 +2731,7 @@ impl AppShell {
             // survives ⌘T full preview (no-op in release).
             .debug_selector(|| "nav-pane".into())
             // Issue 17: 44px header below is the window-drag region (see
-            // the header child below); no global titlebar strip anymore.
+            .px_3()
             .gap_1()
             .child(drag_header(window, cx))
             // Issue 17 Q7: identity moved to the bottom trio (see the nav
