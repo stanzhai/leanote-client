@@ -151,6 +151,9 @@ pub struct AppShell {
     user_id: String,
     /// Review item 2/3: outcome of the last incr sync (startup + SyncNow).
     sync_status: Option<Result<SharedString, SharedString>>,
+    /// Local edits not yet pushed (notes/notebooks/tags IsDirty=1) —
+    /// recomputed in invalidate_lists(); drives the pending-sync icon.
+    pending_sync: bool,
     data_dir: std::path::PathBuf,
     host: gpui_kit::Entity<InputState>,
     email: gpui_kit::Entity<InputState>,
@@ -276,25 +279,31 @@ impl AppShell {
         // Signed-in account's user id (None → still "user1" placeholder).
         user_id: Option<String>,
         fake_prefill: Option<(&str, &str, &str)>,
+        // Last account (host, email) for login prefill after logout.
+        remembered: Option<(String, String)>,
     ) -> Self {
+        // Fake prefill wins (dev override); else remembered account.
+        let prefill = fake_prefill
+            .map(|(h, e, _)| (h.to_string(), e.to_string()))
+            .or(remembered);
         let host = cx.new(|cx| {
             let mut s = InputState::new(window, cx).placeholder("https://leanote.com");
-            if let Some((h, _, _)) = fake_prefill {
+            if let Some((h, _)) = &prefill {
                 s = s.default_value(h);
             }
             s
         });
         let email = cx.new(|cx| {
             let mut s = InputState::new(window, cx).placeholder("user@example.com");
-            if let Some((_, e, _)) = fake_prefill {
+            if let Some((_, e)) = &prefill {
                 s = s.default_value(e);
             }
             s
         });
         let password = cx.new(|cx| {
-            let mut s = InputState::new(window, cx)
-                .placeholder("••••••••")
-                .masked(true);
+            // No placeholder: host+email are prefilled, password is the
+            // only thing left to type — a masked-bullets hint adds nothing.
+            let mut s = InputState::new(window, cx).masked(true);
             if let Some((_, _, p)) = fake_prefill {
                 s = s.default_value(p);
             }
@@ -321,6 +330,7 @@ impl AppShell {
             lang,
             user_id: user_id.unwrap_or_else(|| "user1".to_string()),
             sync_status: None,
+            pending_sync: false,
             vim_enabled: prefs.vim_default,
             editor_toolbar: prefs.editor_toolbar,
             notebook_drag_target: None,
@@ -384,6 +394,20 @@ impl AppShell {
                 // never appeared after launch.
                 shell.start_editing(window, cx);
             }
+        }
+        // Park focus on the root so app-scope actions (⌘K/⌘S/⌘N/⌘,)
+        // dispatch before the user clicks anything: gpui routes actions
+        // down the focus chain, and an unfocused window falls off it.
+        // A later focus (login input, note click) replaces this cleanly.
+        window.focus(&shell.root_focus, cx);
+        // Prefilled login (logout → relaunch): host+email filled, jump
+        // straight to the password field.
+        if matches!(shell.phase, Phase::Login)
+            && prefill
+                .as_ref()
+                .is_some_and(|(h, e)| !h.is_empty() && !e.is_empty())
+        {
+            shell.password.update(cx, |s, cx| s.focus(window, cx));
         }
         shell
     }
@@ -550,16 +574,24 @@ impl AppShell {
     /// Review item 3: one muted line for the identity area.
     fn sync_status_label(&self) -> SharedString {
         let t = |k: i18n::Key| i18n::t(self.lang, k);
+        // Err > Pending > Ok > None: a failure must stay visible even with
+        // un-pushed edits queued behind it.
+        if let Some(Err(e)) = &self.sync_status {
+            return format!("{}: {}", t(i18n::Key::SyncFailed), e).into();
+        }
+        if self.pending_sync {
+            return t(i18n::Key::PendingSync).into();
+        }
         match &self.sync_status {
-            None => t(i18n::Key::NotSynced).to_string().into(),
-            Some(Ok(_)) => t(i18n::Key::SyncDone).to_string().into(),
-            Some(Err(e)) => format!("{}: {}", t(i18n::Key::SyncFailed), e).into(),
+            Some(Ok(_)) => t(i18n::Key::SyncDone).into(),
+            _ => t(i18n::Key::NotSynced).into(),
         }
     }
 
     /// Review item 2: logout — server-side signout (best effort), local
-    /// account deactivated, back to the login screen.
-    fn logout(&mut self, cx: &mut gpui_kit::Context<Self>) {
+    /// account deactivated, back to the login screen. Bug fix: the settings
+    /// dialog (and any other open dialog) must close with the account.
+    fn logout(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
         if let Some(acct) = self.store().and_then(|s| s.active_account().ok().flatten()) {
             Api::for_account(&acct).logout();
             if let Ok(store) =
@@ -570,9 +602,11 @@ impl AppShell {
         }
         self.user_id = "user1".to_string();
         self.sync_status = None;
+        self.pending_sync = false;
         self.phase = Phase::Login;
         self._task = None;
         self.invalidate_lists();
+        window.close_all_dialogs(cx);
         cx.notify();
     }
 
@@ -601,6 +635,12 @@ impl AppShell {
         self.cached_notebook_names = None;
         self.cached_notebook_nodes = None;
         self.cached_visible_notes = None;
+        // Any local mutation may have dirtied rows — refresh the
+        // pending-sync icon state (3 COUNTs, no row materialization).
+        self.pending_sync = self
+            .store()
+            .and_then(|s| s.has_dirty().ok())
+            .unwrap_or(false);
     }
 
     /// Notes for the current nav selection, in list order (cached).
@@ -1712,8 +1752,11 @@ impl AppShell {
                 .show_cancel(true)
                 .ok_text(i18n::t(lang, i18n::Key::Logout))
                 .cancel_text(i18n::t(lang, i18n::Key::Cancel))
-                .on_ok(move |_ev, _window, cx| {
-                    let _ = shell_ok.update(cx, |this, cx| this.logout(cx));
+                .on_ok(move |_ev, window, cx| {
+                    // Runs while the alert layer is topmost: logout pops
+                    // every dialog itself, then returning true lets kit
+                    // close its (already-empty) layer harmlessly.
+                    let _ = shell_ok.update(cx, |this, cx| this.logout(window, cx));
                     true
                 })
         });
@@ -2325,11 +2368,23 @@ impl Render for AppShell {
                         .unwrap_or(content);
                     let preview_px =
                         px(theme::preview_font_px(&prefs.editor_font_size, prefs.zoom));
+                    // Comfortable reading frame (round 32): a capped,
+                    // centered 1120px column (mx_auto leaves the rest as
+                    // margin — the wider the window, the bigger the gutters)
+                    // plus 48px inner padding. A lone note edge-to-edge on a
+                    // fullscreen window reads as a wall of text. Top stays
+                    // slim (just the close button), bottom gets extra room
+                    // past the scroll end.
                     let preview = gpui_kit::base::v_flex()
                         .id("full-preview")
                         .track_focus(&self.preview_focus)
+                        .debug_selector(|| "full-preview".into())
                         .size_full()
-                        .p(px(32.))
+                        .pt(px(24.))
+                        .pb(px(48.))
+                        .px(px(48.))
+                        .max_w(px(1120.))
+                        .mx_auto()
                         .text_size(preview_px)
                         .child(
                             gpui_kit::base::h_flex().justify_end().child(
@@ -2647,7 +2702,7 @@ fn render_syncing(
         .flex_1()
         .h_full()
         .bg(theme::material(Material::Background, dark))
-        .items_start()
+        .items_center()
         .justify_center()
         .child(
             gpui_kit::base::v_flex()
@@ -2709,7 +2764,7 @@ fn render_sync_done(
         .flex_1()
         .h_full()
         .bg(theme::material(Material::Background, dark))
-        .items_start()
+        .items_center()
         .justify_center()
         .child(
             gpui_kit::base::v_flex()
@@ -3334,11 +3389,14 @@ impl AppShell {
         let mut footer = gpui_kit::base::h_flex().gap_1().pt_1().pb_2();
         if let Some(acct) = acct {
             // Sync: icon carries the last outcome; click = sync now.
-            let (icon, title) = match &self.sync_status {
-                Some(Ok(_)) => (AssetIcon::CircleCheck, self.sync_status_label()),
-                Some(Err(_)) => (AssetIcon::TriangleAlert, self.sync_status_label()),
-                None => (AssetIcon::Cloud, self.sync_status_label()),
+            // Four states, Err > Pending > Ok > None (label shares the order).
+            let icon = match (&self.sync_status, self.pending_sync) {
+                (Some(Err(_)), _) => AssetIcon::TriangleAlert,
+                (_, true) => AssetIcon::RefreshCw,
+                (Some(Ok(_)), _) => AssetIcon::CircleCheck,
+                (None, _) => AssetIcon::Cloud,
             };
+            let title = self.sync_status_label();
             footer = footer.child(
                 Button::new("nav-sync")
                     .icon(icon)
@@ -5004,8 +5062,9 @@ impl AppShell {
                 },
             ))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                // ⌘S / Ctrl+S save first (IME-safe: key_char is None for
-                // cmd combos, so composition is never touched).
+                // ⌘S / Ctrl+S save + push (IME-safe: key_char is None for
+                // cmd combos, so composition is never touched). Save marks
+                // the row IsDirty=1; sync_now pushes it.
                 let m = &ev.keystroke.modifiers;
                 if (m.platform || m.control)
                     && !m.alt
@@ -5013,6 +5072,7 @@ impl AppShell {
                     && ev.keystroke.key.eq_ignore_ascii_case("s")
                 {
                     this.save_editor(cx);
+                    this.sync_now(cx);
                     cx.stop_propagation();
                     return;
                 }
@@ -5222,6 +5282,7 @@ mod tests {
                             true,
                             Some("user1".into()),
                             None,
+                            None,
                         )
                     });
                     shell_entity = Some(shell.clone());
@@ -5357,6 +5418,7 @@ mod tests {
                             crate::i18n::Lang::En,
                             true,
                             Some("user1".into()),
+                            None,
                             None,
                         )
                     });
@@ -5595,6 +5657,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Round 34: `V` linewise visual — select whole lines, j/k extend by
+    /// line, `d` eats lines (no blank residue), `y`+`p` pastes lines.
+    #[gpui_kit::test]
+    fn vim_visual_line_selects_edits(cx: &mut gpui_kit::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("leanote-vline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = leanote_core::Store::open(dir.clone(), "user1".to_string()).unwrap();
+        let note = store
+            .add_note(leanote_core::NewNote {
+                title: "t".into(),
+                content: "one\ntwo\nthree\nfour".into(),
+                tags: vec![],
+                notebook_title: "nb".into(),
+                is_markdown: true,
+            })
+            .unwrap();
+
+        cx.update(gpui_kit::init);
+        let mut shell_entity: Option<gpui_kit::Entity<AppShell>> = None;
+        let window = cx
+            .update(|cx| {
+                cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+                    let shell = cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true,
+                            Some("user1".into()),
+                            None,
+                            None,
+                        )
+                    });
+                    shell_entity = Some(shell.clone());
+                    shell
+                })
+            })
+            .unwrap();
+        let shell_entity = shell_entity.unwrap();
+        let note_id = note.note_id.clone();
+        window
+            .update(cx, |shell, window, cx| {
+                shell.select_note(note_id, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.background_executor.allow_parking();
+        let mut cx = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let content = shell_entity.read_with(&cx, |shell, _| {
+            shell.editing.as_ref().unwrap().content.clone()
+        });
+        let key = |s: &str| gpui_kit::Keystroke::parse(s).unwrap();
+
+        // V on line 1 selects the whole line (0..4 incl. `\n`).
+        cx.update(|window, cx| {
+            shell_entity.update(cx, |shell, cx| {
+                shell.vim_key_down(&key("V"), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).selected_range(),
+                0..4,
+                "V must select the whole current line"
+            );
+        });
+
+        // j extends by whole lines: rows 0..=1 → "one\ntwo\n" = 0..8.
+        cx.update(|window, cx| {
+            shell_entity.update(cx, |shell, cx| {
+                shell.vim_key_down(&key("j"), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).selected_range(),
+                0..8,
+                "V+j must extend by whole lines"
+            );
+        });
+
+        // y yanks the two lines linewise; p pastes them below row 1.
+        cx.update(|window, cx| {
+            shell_entity.update(cx, |shell, cx| {
+                shell.vim_key_down(&key("y"), window, cx);
+                shell.vim_key_down(&key("p"), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).value(),
+                "one\ntwo\none\ntwo\nthree\nfour",
+                "V yank+p must paste whole lines"
+            );
+        });
+
+        // From row 2, jj lands on row 4 ("three"); V selects it, j extends
+        // to row 5, d removes rows 4..=5 — no blank residue.
+        cx.update(|window, cx| {
+            shell_entity.update(cx, |shell, cx| {
+                shell.vim_key_down(&key("j"), window, cx);
+                shell.vim_key_down(&key("j"), window, cx);
+                shell.vim_key_down(&key("V"), window, cx);
+                shell.vim_key_down(&key("j"), window, cx);
+                shell.vim_key_down(&key("d"), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).value(),
+                "one\ntwo\none\ntwo",
+                "V d must remove whole lines cleanly"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Issue 21 需求4/5: Enter list continuation and pair closing,
     /// driven through the real dispatch chain (capture hooks in the
     /// rendered editor column).
@@ -5627,6 +5813,7 @@ mod tests {
                             crate::i18n::Lang::En,
                             true, // signed in: render the shell, not auth
                             Some("user1".into()),
+                            None,
                             None,
                         )
                     });
@@ -5745,7 +5932,7 @@ mod tests {
         // Same binding the real app registers in main.rs.
         cx.update(|cx| {
             cx.bind_keys([gpui_kit::KeyBinding::new(
-                "cmd-t",
+                "secondary-t",
                 crate::search_overlay::ToggleFullPreview,
                 None,
             )]);
@@ -5762,6 +5949,7 @@ mod tests {
                             crate::i18n::Lang::En,
                             true,
                             Some("user1".into()),
+                            None,
                             None,
                         )
                     });
@@ -5819,6 +6007,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Round 32: the ⌘T preview keeps generous side margins and a capped,
+    /// centered column even on a very wide window — the text must not run
+    /// edge-to-edge.
+    #[gpui_kit::test]
+    fn full_preview_keeps_reading_margins(cx: &mut gpui_kit::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("leanote-fpmargins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let store = leanote_core::Store::open(dir.clone(), "user1".to_string()).unwrap();
+            store
+                .add_note(leanote_core::NewNote {
+                    title: "t".into(),
+                    content: "# hi".into(),
+                    tags: vec![],
+                    notebook_title: "nb".into(),
+                    is_markdown: true,
+                })
+                .unwrap();
+        }
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            cx.bind_keys([gpui_kit::KeyBinding::new(
+                "secondary-t",
+                crate::search_overlay::ToggleFullPreview,
+                None,
+            )]);
+        });
+        let mut shell_entity: Option<gpui_kit::Entity<AppShell>> = None;
+        let window = cx
+            .update(|cx| {
+                cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+                    let shell = cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true,
+                            Some("user1".into()),
+                            None,
+                            None,
+                        )
+                    });
+                    shell_entity = Some(shell.clone());
+                    shell
+                })
+            })
+            .unwrap();
+        window
+            .update(cx, |shell, window, cx| {
+                let id = shell.visible_notes()[0].note_id.clone();
+                shell.select_note(id, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.background_executor.allow_parking();
+        let mut cx = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        // A wide "fullscreen" window: 1920 logical px.
+        cx.simulate_resize(gpui_kit::size(gpui_kit::px(1920.), gpui_kit::px(1080.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("cmd-t");
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let frame = cx.debug_bounds("full-preview").expect("preview rendered");
+        let w = frame.size.width;
+        assert!(
+            w <= gpui_kit::px(1120.),
+            "preview column must be capped, got {w:?}"
+        );
+        let window_w = gpui_kit::px(1920.);
+        let left = frame.origin.x;
+        let right = window_w - (frame.origin.x + w);
+        assert!(
+            left >= gpui_kit::px(48.) && right >= gpui_kit::px(48.),
+            "side margins must stay generous, left={left:?} right={right:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Ticket 11 follow-up: New Notebook opens a modal dialog; Enter
     /// confirms; the new notebook lands FIRST in its sibling group.
     #[gpui_kit::test]
@@ -5842,6 +6110,7 @@ mod tests {
                             crate::i18n::Lang::En,
                             true,
                             Some("user1".into()),
+                            None,
                             None,
                         )
                     })
@@ -5868,7 +6137,7 @@ mod tests {
         cx.run_until_parked();
 
         let first = shell_entity
-            .update(&mut cx, |shell, cx| {
+            .update(&mut cx, |shell, _cx| {
                 shell
                     .store()
                     .and_then(|s| s.notebooks().ok())
@@ -5877,6 +6146,128 @@ mod tests {
             .unwrap();
         assert_eq!(first.title, "Fresh", "dialog Enter creates the notebook");
         assert_eq!(first.seq, -1, "new notebook prepends (min sibling Seq - 1)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix 2: a local edit flips `pending_sync`; invalidate_lists recomputes
+    /// it from IsDirty rows; logout resets it.
+    #[gpui_kit::test]
+    fn pending_sync_tracks_dirty_rows(cx: &mut gpui_kit::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("leanote-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let store = leanote_core::Store::open(dir.clone(), "user1".to_string()).unwrap();
+            let _ = store
+                .add_note(leanote_core::NewNote {
+                    title: "dirty".into(),
+                    content: "x".into(),
+                    tags: vec![],
+                    notebook_title: "nb".into(),
+                    is_markdown: true,
+                })
+                .unwrap();
+            // add_note writes IsDirty=1 (local-only row, never pushed).
+        }
+        cx.update(gpui_kit::init);
+        let (window, shell_entity) = cx
+            .update(|cx| {
+                gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true,
+                            Some("user1".into()),
+                            None,
+                            None,
+                        )
+                    })
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let _ = window;
+
+        shell_entity.update(cx, |shell, _cx| {
+            shell.invalidate_lists();
+            assert!(shell.pending_sync, "IsDirty=1 rows must set pending_sync");
+            // Label follows: pending wins over the unset sync_status.
+            assert!(
+                shell
+                    .sync_status_label()
+                    .to_string()
+                    .contains("waiting to sync"),
+                "label must show the pending hint, got {}",
+                shell.sync_status_label()
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fix 1: ⌘S / ⌘N dispatch app-scope actions on the root (same
+    /// bindings main.rs registers). ⌘N must reach new_note.
+    #[gpui_kit::test]
+    fn cmd_n_creates_note(cx: &mut gpui_kit::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("leanote-cmdn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let store = leanote_core::Store::open(dir.clone(), "user1".to_string()).unwrap();
+            let _ = store.create_notebook("nb", "").unwrap();
+        }
+        cx.update(gpui_kit::init);
+        // Same bindings the real app registers in main.rs.
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui_kit::KeyBinding::new("secondary-n", crate::search_overlay::QuickNewNote, None),
+                gpui_kit::KeyBinding::new("secondary-s", crate::search_overlay::QuickSyncNow, None),
+                // The old "cmd-" spelling parsed to key="" and never fired.
+                gpui_kit::KeyBinding::new("secondary-,", crate::search_overlay::OpenSettings, None),
+            ]);
+        });
+        let (window, shell_entity) = cx
+            .update(|cx| {
+                gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true,
+                            Some("user1".into()),
+                            None,
+                            None,
+                        )
+                    })
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.background_executor.allow_parking();
+        let mut cx = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let before = shell_entity
+            .update(&mut cx, |shell, _cx| shell.visible_notes().clone())
+            .len();
+        cx.simulate_keystrokes("cmd-n");
+        cx.run_until_parked();
+        let after = shell_entity
+            .update(&mut cx, |shell, _cx| shell.visible_notes().clone())
+            .len();
+        assert_eq!(before + 1, after, "⌘N must create a note");
+
+        // ⌘, opens settings — a dialog on the window.
+        cx.simulate_keystrokes("cmd-,");
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "⌘, must open the settings dialog"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

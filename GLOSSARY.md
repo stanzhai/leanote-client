@@ -9,6 +9,7 @@
 - **全量同步 (Full Sync)** — 从 USN −1 拉齐 notebooks→notes→tags 的过程。
 - **增量同步 (Incr Sync)** — 对比服务器 USN 与本地 `LastSyncUsn`，先拉 delta 再推送本地脏数据（push）。
 - **脏标记 (Dirty flags)** — `IsDirty`（内容已改待推）、`LocalIsNew`/`IsNew`（本地新建未上服务器）、`IsDeleted`（标记删除待推）。服务端确认后清除。
+- **待同步 (Pending sync)** — 任一表存在 `IsDirty=1` 行的状态（`Store::has_dirty()`，三表 COUNT）。驱动底部 sync 按钮的第四态 icon（RefreshCw）与「有更新待同步」提示；重查点统一在 `invalidate_lists()`（所有本地变更后的失效点）。显示优先级 Err > Pending > Ok > None。
 - **同步摘要 (Sync summary)** — 登录后首同步完成的界面摘要卡：笔记本/笔记/笔记内容/标签四行计数 + 可选失败警示行 + 「即刻开始」进入主界面。内容拉取失败不中断同步（计入 `SyncStats.content_failures`），失败笔记保 `Content=''`+`ServerNoteId`，下次同步经 `notes_needing_content` 自动重试。
 - **冲突 (Conflict)** — 本地与服务器对同一条目都有未对齐修改的状态；产品语义是**呈现冲突并人工裁决**，绝不静默覆盖。
 - **服务端 ID 映射 (Server ID mapping)** — 本地 `NotebookId/NoteId` 与 `ServerNotebookId/ServerNoteId` 的对应关系；本地新建条目在首次推送前没有服务端 ID。
@@ -36,12 +37,12 @@
 
 ## 布局与界面（Rust 版）
 
-- **三栏布局 (Three-pane layout)** — Wake 式信息架构：左栏导航（搜索入口 + 固定导航 + 可折叠分组）+ 中栏笔记列表 + 右栏编辑/阅读面。无顶部通栏；窗口用系统透明标题栏，仅左栏顶部让位红绿灯（44px），中/右栏内容直通窗口顶边（ADR-0003，UI 优化轮修正）。
+- **三栏布局 (Three-pane layout)** — Wake 式信息架构：左栏导航（搜索入口 + 固定导航 + 可折叠分组）+ 中栏笔记列表 + 右栏编辑/阅读面。无顶部通栏；窗口用系统透明标题栏，仅左栏顶部让位红绿灯（44px），中/右栏内容直通窗口顶边（ADR-0003，UI 优化轮修正）。用户拖好的左/中栏宽度在窗口 resize 时保持不变，增量全部由右栏（阅读/编辑面）吸收（gpui-base resizable 定制，issue 35）。
 - **最近 (Recent)** — 左栏固定导航首项：最近编辑的 `RECENT_LIMIT=20` 条笔记（UpdatedTime 倒序）；导航徽章计数与列表共用同一上限常量（`min(20, live)`），不是全库存量。第五轮起取代「全部笔记」入口；浏览全部走笔记本/标签分组（ADR-0003 第 6 条）。
 - **视觉语言 (Visual language)** — 取自 Wake 的“现代 macOS”风格：材质分层（titlebar/sidebar/list/background/popover 四层色）、无窗格边框线、持久 UI 零阴影、SF Pro 系统字、8 级字号、4px 间距栅格、分级圆角。与现 Electron 版的多主题体系是替代关系（ADR-0003）。**编辑器配色**是独立概念：仅作用于源码着色的 2–3 套配色（默认跟随系统明暗），不等于全局多主题。**主题色 (accent)** 是视觉语言的参数：6 色板本地偏好，用于选中态与动作色（ADR-0005）。
-- **⌘K 面板 (⌘K palette)** — 顶部悬浮式全局面板（宽 680px），三段式：快捷动作（新建笔记/立即同步）+ 最近打开（本地记录 top6）+ 即输即搜（统一搜索核心），⌘K / ⌘⇧P 触发，空输入显示最近打开（Wake 同款交互；语义 = Electron 版 command palette 的复刻超集，旧词条「⌘K 搜索」已并入）。应用内搜索仅此入口。导出备份/Vim 切换已移至设置面板（第十轮）。
+- **⌘K 面板 (⌘K palette)** — 顶部悬浮式全局面板（宽 560px，2026-10-27 自 680 收窄），三段式：快捷动作（新建笔记/立即同步）+ 最近打开（本地记录 top6）+ 即输即搜（统一搜索核心），⌘K / ⌘⇧P 触发，空输入显示最近打开（Wake 同款交互；语义 = Electron 版 command palette 的复刻超集，旧词条「⌘K 搜索」已并入）。应用内搜索仅此入口。导出备份/Vim 切换已移至设置面板（第十轮）。快捷键绑定统一用 gpui `secondary-` 前缀（macOS ⌘ / 其他 Ctrl），一条绑定双平台且 Kbd 提示符号正确。
 - **编辑器 (Editor)** — 右栏源码编辑面：kit `Editor` 组件 + tree-sitter 语法着色（全部 kit 语言 feature，含 markdown 内嵌代码块注入着色）+ 编辑器配色；第一行 = 标题 + 工具按钮（预览/附件/历史，仅 icon），第二行 = markdown 格式工具栏（含插入图片）+ 帮助。选中 Markdown 笔记**默认即编辑态**，源码为默认模式、预览为开关；改动防抖自动保存，⌘S 保留；标题行兼作窗口拖拽区（ADR-0004）。
-- **Vim 模式 (Vim mode)** — 编辑器的键位层：normal/insert/visual 状态机 + 常用子集（motion、operator、yank/paste、`:w`/`:q`），默认开启、可关闭、持久化。模式反馈 = 光标形状（normal=block、insert=竖线、visual=block+选区）**+ 编辑态底部状态栏的模式段**（`-- NORMAL/INSERT/VISUAL --`，vim 关闭时显示 `-- 普通 --`）。刻意不承诺完整 vi 兼容（无寄存器语法、无宏、无插件），不兼容行为是决策不是缺陷（ADR-0004/0005）。
+- **Vim 模式 (Vim mode)** — 编辑器的键位层：normal/insert/visual 状态机 + 常用子集（motion、operator、yank/paste、`:w`/`:q`），默认开启、可关闭、持久化。visual 分 charwise（`v`）与 linewise（`V`，整行选择、motion 按行扩展、`d`/`y` 行级操作，行级复制粘贴复用 `yy`/`p` 路径）。模式反馈 = 光标形状（normal=block、insert=竖线、visual=block+选区）**+ 编辑态底部状态栏的模式段**（`-- NORMAL/INSERT/VISUAL --`，vim 关闭时显示 `-- 普通 --`）。刻意不承诺完整 vi 兼容（无寄存器语法、无宏、无插件），不兼容行为是决策不是缺陷（ADR-0004/0005）。
 - **专注模式 (Focus mode)** — 应用内无干扰模式：⇧⌘F 隐藏左/中栏，右栏占满整窗，再点或 ESC 退出。非 macOS 系统原生全屏。原名"全屏"，第六轮更名以区分全窗口预览。
 - **全窗口预览 (Full-window preview)** — ⌘T 在应用内将当前笔记的**渲染预览**铺满整窗（不触发 OS fullscreen），右上角关闭 icon，ESC/再按 ⌘T 退出；编辑态/阅读态均可用。与专注模式（隐藏栏但保留编辑面）正交。
 - **笔记图片 (Note image)** — 拖放/选择/工具栏插入图片 → 字节存本地 images 表（`LocalId`/`ServerId`/`Bytes`），笔记内容引用 `leanote://file/getImage?fileId=<24hex>`（保持 local id，不改写内容）；渲染前替换为 data URL。脏图片（无 ServerId）随笔记以 multipart 推送（`note/addNote`/`updateNote`），服务器 `Files` 回写 ServerId；同步拉取时 `pull_missing_images` 下载缺失字节（复刻 Electron `src/file.js` 语义，ADR-0006）。

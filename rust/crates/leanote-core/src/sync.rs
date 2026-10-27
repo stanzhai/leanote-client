@@ -1622,6 +1622,42 @@ impl Store {
             .execute("UPDATE accounts SET IsActive=0 WHERE IsActive=1", [])
     }
 
+    /// Most recent account row regardless of IsActive (logout keeps rows).
+    /// Login-prefill source: host+email only, token is dead after logout.
+    pub fn last_account(&self) -> rusqlite::Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT Host, Email FROM accounts ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+    }
+
+    /// Any un-pushed local change (notes/notebooks/tags IsDirty=1)?
+    /// One COUNT per table, no row materialization.
+    pub fn has_dirty(&self) -> rusqlite::Result<bool> {
+        for (sql, col) in [
+            (
+                "SELECT COUNT(*) FROM notes WHERE UserId=?1 AND IsDirty=1",
+                0,
+            ),
+            (
+                "SELECT COUNT(*) FROM notebooks WHERE UserId=?1 AND IsDirty=1",
+                0,
+            ),
+            ("SELECT COUNT(*) FROM tags WHERE UserId=?1 AND IsDirty=1", 0),
+        ] {
+            let n: i64 = self
+                .conn
+                .query_row(sql, params![self.user_id], |r| r.get(col))?;
+            if n > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     // -- incr sync (JS Sync.incrSync/sendChanges/_syncNoteToLocal) --
 
     pub fn dirty_notebooks(&self) -> rusqlite::Result<Vec<DirtyNotebook>> {

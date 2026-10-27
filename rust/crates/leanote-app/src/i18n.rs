@@ -144,6 +144,7 @@ keys! {
     // Review item 2: sync-now/logout controls.
     SyncNow => ("立即同步", "Sync now"),
     Logout => ("登出", "Log out"),
+    PendingSync => ("有更新待同步", "Changes waiting to sync"),
     // Issue 17: ⌘K quick actions + recents.
     QuickActions => ("快捷操作", "Quick actions"),
     Recents => ("最近打开", "Recents"),

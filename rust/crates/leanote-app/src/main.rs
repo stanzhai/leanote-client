@@ -254,20 +254,36 @@ fn main() {
 
             // Ticket 13: ⌘K / Ctrl+K toggle the global search overlay.
             // Issue 17: ⌘⇧P / Ctrl+Shift+P open the same palette.
+            //
+            // `secondary-` = ⌘ on macOS, Ctrl elsewhere: one binding per
+            // gesture instead of a cmd- + ctrl- pair. Beyond brevity, the
+            // pair is what made the ⌘K palette show the wrong hint: Kbd
+            // picks the *last* registered binding for an action, so ⌘N
+            // displayed as ⌃N on macOS.
             cx.bind_keys([
-                gpui_kit::KeyBinding::new("cmd-k", search_overlay::ToggleSearch, None),
-                gpui_kit::KeyBinding::new("ctrl-k", search_overlay::ToggleSearch, None),
-                gpui_kit::KeyBinding::new("cmd-shift-p", search_overlay::ToggleSearch, None),
-                gpui_kit::KeyBinding::new("ctrl-shift-p", search_overlay::ToggleSearch, None),
+                gpui_kit::KeyBinding::new("secondary-k", search_overlay::ToggleSearch, None),
+                gpui_kit::KeyBinding::new("secondary-shift-p", search_overlay::ToggleSearch, None),
                 // Issue 19: ⇧⌘F focus mode (both cases: macOS reports the
                 // shifted key as "F" on some IME paths).
-                gpui_kit::KeyBinding::new("cmd-shift-f", search_overlay::ToggleFocusMode, None),
-                gpui_kit::KeyBinding::new("cmd-shift-F", search_overlay::ToggleFocusMode, None),
-                gpui_kit::KeyBinding::new("ctrl-shift-f", search_overlay::ToggleFocusMode, None),
+                gpui_kit::KeyBinding::new(
+                    "secondary-shift-f",
+                    search_overlay::ToggleFocusMode,
+                    None,
+                ),
+                gpui_kit::KeyBinding::new(
+                    "secondary-shift-F",
+                    search_overlay::ToggleFocusMode,
+                    None,
+                ),
                 // Issue 21 需求10: ⌘T / Ctrl+T full-window markdown preview.
-                gpui_kit::KeyBinding::new("cmd-t", search_overlay::ToggleFullPreview, None),
-                gpui_kit::KeyBinding::new("ctrl-t", search_overlay::ToggleFullPreview, None),
-                gpui_kit::KeyBinding::new("cmd-,", search_overlay::OpenSettings, None),
+                gpui_kit::KeyBinding::new("secondary-t", search_overlay::ToggleFullPreview, None),
+                // ⌘, / Ctrl+, settings. NOTE: was "cmd-", which parses to
+                // key="" (trailing dash) and never matched a real keystroke.
+                gpui_kit::KeyBinding::new("secondary-,", search_overlay::OpenSettings, None),
+                // App-scope ⌘S sync / ⌘N new note. In the editor, ⌘S is
+                // captured earlier (save + sync) and never reaches these.
+                gpui_kit::KeyBinding::new("secondary-s", search_overlay::QuickSyncNow, None),
+                gpui_kit::KeyBinding::new("secondary-n", search_overlay::QuickNewNote, None),
             ]);
 
             let prefs = prefs::Prefs::load(&dir);
@@ -333,6 +349,15 @@ fn main() {
                 .ok()
                 .and_then(|s| s.active_account().ok().flatten());
             let signed_in = signed_in_account.is_some();
+            // Login prefill: last account row (logout keeps it) — host+email
+            // only; token is dead and password is never stored.
+            let remembered = if signed_in {
+                None
+            } else {
+                leanote_core::Store::open(dir.clone(), "user1".into())
+                    .ok()
+                    .and_then(|s| s.last_account().ok().flatten())
+            };
 
             let displays: Vec<gpui_kit::Bounds<gpui_kit::Pixels>> =
                 cx.displays().iter().map(|d| d.visible_bounds()).collect();
@@ -364,6 +389,7 @@ fn main() {
 
             let dir_for_window = dir.clone();
             let fake_for_window = fake.clone();
+            let remembered_for_window = remembered.clone();
             let dir_close = dir.clone();
             let (handle, shell) = gpui_kit::open_window(options, cx, move |window, cx| {
                 // Per-window appearance → keep tokens in sync with the OS.
@@ -408,6 +434,7 @@ fn main() {
                         fake_for_window
                             .as_ref()
                             .map(|(h, e, p)| (h.as_str(), e.as_str(), p.as_str())),
+                        remembered_for_window.clone(),
                     )
                 })
             })

@@ -38,8 +38,9 @@ gpui_kit::actions!(
 // backup into the settings dialog and Vim into its settings row).
 gpui_kit::actions!(leanote, [QuickNewNote, QuickSyncNow]);
 
-/// ADR-0003 fixed overlay width.
-pub const OVERLAY_W: f32 = 680.;
+/// Fixed overlay width. ADR-0003 said 680, but on a 13–14" laptop that
+/// spans most of the window; 560 reads as a floating palette (round 31).
+pub const OVERLAY_W: f32 = 560.;
 /// Result cap — the CLI's default surface (`-N 20`).
 pub const RESULT_LIMIT: usize = 20;
 
@@ -182,7 +183,11 @@ fn render_dialog(
                 .py_2()
                 .border_t_1()
                 .border_color(theme::border(dark))
-                .child(Label::new(t_footnote).text_size(theme::ui(11.)).text_color(muted))
+                .child(
+                    Label::new(t_footnote)
+                        .text_size(theme::ui(11.))
+                        .text_color(muted),
+                )
                 .into_any_element()
         })
         .on_query(move |query, _window, cx| {
@@ -198,14 +203,23 @@ fn render_dialog(
         let group = CommandGroup::new().items(rows.iter().map(|r| {
             CommandItem::new().child({
                 let r = r.clone();
-                let muted = muted;
                 move |_: &mut Window, _: &mut App| {
                     // Two aligned lines: title left, notebook · date right
                     // (flex-none so the time column stays flush), excerpt
                     // below, single line, ellipsized.
+                    //
+                    // Raw text nodes (`div().child(str)`), NOT kit Labels:
+                    // Label renders with its own `.text_color(foreground)`
+                    // (label.rs:211), which overrides the row's
+                    // accent_foreground on hover/selection — that was the
+                    // black-on-accent bug. A plain text node inherits the
+                    // row's color, so title AND excerpt flip white with it
+                    // (round 33); hierarchy is size-only (13/12px).
+                    //
+                    // No extra vertical padding: the kit row already has
+                    // py_1p5; this adds only the inter-line gap.
                     v_flex()
                         .gap_0p5()
-                        .py_1()
                         .w_full()
                         .child(
                             h_flex()
@@ -215,30 +229,30 @@ fn render_dialog(
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
-                                        .child(Label::new(r.title.clone()).text_size(theme::ui(14.))),
+                                        .text_size(theme::ui(13.))
+                                        .child(r.title.clone()),
                                 )
                                 .child(
                                     h_flex()
                                         .flex_none()
                                         .gap_1()
-                                        .child(
-                                            Label::new(r.notebook.clone())
-                                                .text_size(theme::ui(11.))
-                                                .text_color(muted),
-                                        )
-                                        .child(
-                                            Label::new(format!("· {}", r.date))
-                                                .text_size(theme::ui(11.))
-                                                .text_color(muted),
-                                        ),
+                                        .text_size(theme::ui(11.))
+                                        .child(r.notebook.clone())
+                                        .child(format!("· {}", r.date)),
                                 ),
                         )
                         .child(
-                            gpui_kit::div().w_full().min_w_0().truncate().child(
-                                Label::new(r.excerpt.clone())
-                                    .text_size(theme::ui(12.))
-                                    .text_color(muted),
-                            ),
+                            gpui_kit::div()
+                                .w_full()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(theme::ui(12.))
+                                // No explicit color: inherits the row's
+                                // (accent_)foreground, so hover/selection
+                                // flips the excerpt white together with the
+                                // title (round 33). Hierarchy comes from the
+                                // smaller size, not a muted color.
+                                .child(r.excerpt.clone()),
                         )
                         .into_any_element()
                 }

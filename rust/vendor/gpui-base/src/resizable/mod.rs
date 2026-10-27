@@ -193,7 +193,7 @@ impl ResizableState {
 
         if changed {
             // We need to make sure the total size is in line with the container size.
-            self.adjust_to_container_size(cx);
+            self.rebalance_shares(cx);
         }
     }
 
@@ -253,7 +253,7 @@ impl ResizableState {
 
         self.panels[panel_ix] = ResizablePanelState::default();
         self.sizes[panel_ix] = old_size;
-        self.adjust_to_container_size(cx);
+        self.rebalance_shares(cx);
     }
 
     /// Remove all panel state.
@@ -365,9 +365,37 @@ impl ResizableState {
         cx.notify();
     }
 
-    /// Adjust panel sizes according to the container size.
+    /// Distribute the container's space across the panels, keeping each
+    /// panel's *share*: used after an insert or remove, where the set of
+    /// panes changed and the survivors keep their relative proportions.
+    fn rebalance_shares(&mut self, cx: &mut Context<Self>) {
+        if self.container_size().is_zero() {
+            return;
+        }
+
+        let container_size = self.container_size();
+        let total: f32 = self.sizes.iter().map(|s| s.as_f32()).sum();
+        if !total.is_finite() || total <= 0. {
+            return;
+        }
+
+        for i in 0..self.panels.len() {
+            let ratio = self.sizes[i] / px(total);
+            let new_size = container_size * ratio;
+            self.sizes[i] = new_size;
+            self.panels[i].size = Some(new_size);
+        }
+        cx.notify();
+    }
+
+    /// React to the *container* (window) being resized.
     ///
-    /// When the container size changes, the panels should take up the same percentage as they did before.
+    /// A container resize changes only how much space there is; it is not a
+    /// user statement about the panes. So every panel that already has a
+    /// size keeps it (clamped to its range) and the **last** panel — the
+    /// flexible remainder in the common `sidebar | content` shape — absorbs
+    /// the whole delta. The old proportional rescale made a dragged 240px
+    /// sidebar breathe with every window resize.
     fn adjust_to_container_size(&mut self, cx: &mut Context<Self>) {
         if self.container_size().is_zero() {
             return;
@@ -384,21 +412,40 @@ impl ResizableState {
             return;
         }
 
-        let container_size = self.container_size();
-        let total = self.sizes.iter().map(|s| s.as_f32()).sum::<f32>();
+        let total: f32 = self.sizes.iter().map(|s| s.as_f32()).sum();
         if !total.is_finite() || total <= 0. {
             return;
         }
-        let total_size = px(total);
+        let container_size = self.container_size();
+        let last = self.panels.len() - 1;
 
-        for i in 0..self.panels.len() {
-            let size = self.sizes[i];
-            let ratio = size / total_size;
-            let new_size = container_size * ratio;
+        // Keep every sized panel at its current width (within its range);
+        // give whatever is left — the container minus the sum — to the last
+        // panel. A panel whose `size_range` is still the `Default` empty
+        // `0..0` (built programmatically, never rendered) counts as
+        // unconstrained: clamping into an empty range would zero it.
+        // Shrinking below a panel's minimum shrinks the last panel to its
+        // floor first; if even that cannot fit, flexbox overflow takes over
+        // on the next layout pass.
+        let clamp = |size: Pixels, range: &Range<Pixels>| {
+            if range.start >= range.end {
+                size
+            } else {
+                size.clamp(range.start, range.end)
+            }
+        };
+        let fixed: f32 = self
+            .panels
+            .iter()
+            .enumerate()
+            .take(last)
+            .map(|(i, panel)| clamp(self.sizes[i], &panel.size_range).as_f32())
+            .sum();
+        let rest = (container_size - px(fixed)).max(px(0.));
+        let rest = clamp(rest, &self.panels[last].size_range);
 
-            self.sizes[i] = new_size;
-            self.panels[i].size = Some(new_size);
-        }
+        self.sizes[last] = rest;
+        self.panels[last].size = Some(rest);
         cx.notify();
     }
 }
@@ -461,21 +508,59 @@ mod tests {
             window.draw(cx).clear(cx);
         });
         let before = cx.debug_bounds("fixed-sidebar").unwrap().size.width;
+        assert_eq!(before, px(240.));
 
         view.update(cx, |view, cx| {
             view.width = px(1200.);
             cx.notify();
         });
         cx.run_until_parked();
-        let settled_frame = cx.debug_bounds("fixed-sidebar").unwrap().size.width;
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        let followup_frame = cx.debug_bounds("fixed-sidebar").unwrap().size.width;
+        let after = cx.debug_bounds("fixed-sidebar").unwrap().size.width;
 
-        // Resizable panels preserve their proportional sizing across a
-        // container resize; the important invariant is that applying the
-        // state on the follow-up frame does not move the divider again.
-        assert_ne!(settled_frame, before);
-        assert_eq!(followup_frame, settled_frame);
+        // A container resize is not a statement about the panes: a sized
+        // panel keeps its width and the flexible remainder absorbs the
+        // delta. The follow-up frame must not move the divider either.
+        assert_eq!(after, before);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(cx.debug_bounds("fixed-sidebar").unwrap().size.width, after);
+        // The whole delta went to the content pane.
+        assert_eq!(
+            cx.debug_bounds("flexible-content").unwrap().size.width,
+            px(1200.) - px(240.)
+        );
+    }
+
+    /// A real window resize, not a wider container element: the sized panel
+    /// keeps the width the user left it at and only the flexible remainder
+    /// takes the delta — in both directions.
+    #[gpui::test]
+    fn a_window_resize_keeps_sized_panels_and_moves_only_the_remainder(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| MixedSizingHarness { width: px(800.) });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+        });
+
+        for width in [px(1200.), px(600.)] {
+            view.update(cx, |view, cx| {
+                view.width = width;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+
+            assert_eq!(
+                cx.debug_bounds("fixed-sidebar").unwrap().size.width,
+                px(240.),
+                "the sidebar must not breathe with the window at {width:?}"
+            );
+            assert_eq!(
+                cx.debug_bounds("flexible-content").unwrap().size.width,
+                width - px(240.)
+            );
+        }
     }
 
     struct CallerStateHarness {

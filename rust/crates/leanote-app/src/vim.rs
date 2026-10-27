@@ -127,9 +127,13 @@ pub enum VimAction {
     },
     /// Esc from insert: block-select the char at the insert caret.
     EnterNormal,
+    /// `v`.
     EnterVisual,
+    /// `V` — linewise visual (round 34): anchor + cursor snap to whole
+    /// lines, motions extend by line, `d`/`y` act line-wise.
+    EnterVisualLine,
+    /// `V`/`v` toggle while already visual: back to normal.
     LeaveVisual,
-    /// `y` in visual.
     YankSelection,
     /// `x`/`d`/`delete` in visual.
     DeleteSelection,
@@ -137,7 +141,7 @@ pub enum VimAction {
     YankMotion(DeleteOp),
     /// `c{motion}` — delete then insert.
     ChangeThenInsert(DeleteOp),
-    /// `p`
+    /// `p`.
     Paste,
     Undo,
     Command(Cmd),
@@ -153,7 +157,9 @@ pub struct VimState {
     /// Moving end of the visual selection (tracked here; the kit reports
     /// the selection end as its cursor, which is not always this).
     pub visual_cursor: usize,
-    /// `:` cmdline being typed.
+    /// `V`: visual selects whole lines (round 34). Cleared by
+    /// leave_visual/reset.
+    pub visual_linewise: bool,
     cmdline: String,
     /// Last yank.
     pub register: Option<String>,
@@ -190,12 +196,14 @@ impl VimState {
     pub fn set_mode(&mut self, mode: VimMode) {
         if mode != VimMode::Visual {
             self.visual_anchor = None;
+            self.visual_linewise = false;
         }
         self.mode = mode;
     }
 
     fn leave_visual(&mut self) {
         self.visual_anchor = None;
+        self.visual_linewise = false;
         self.mode = VimMode::Normal;
     }
 
@@ -322,7 +330,13 @@ impl VimState {
             },
             "v" => {
                 self.mode = VimMode::Visual; // anchor set by exec
+                self.visual_linewise = false;
                 VimAction::EnterVisual
+            }
+            "V" => {
+                self.mode = VimMode::Visual;
+                self.visual_linewise = true;
+                VimAction::EnterVisualLine
             }
             "p" => VimAction::Paste,
             "u" => VimAction::Undo,
@@ -357,9 +371,28 @@ impl VimState {
             "x" | "d" | "delete" => VimAction::DeleteSelection,
             "y" => VimAction::YankSelection,
             "p" => VimAction::Paste,
-            "v" | "V" | "escape" => {
+            "escape" => {
                 self.leave_visual();
                 VimAction::LeaveVisual
+            }
+            // v/V toggle out; V inside charwise upgrades to linewise.
+            "V" => {
+                if self.visual_linewise {
+                    self.leave_visual();
+                    VimAction::LeaveVisual
+                } else {
+                    self.visual_linewise = true;
+                    VimAction::EnterVisualLine
+                }
+            }
+            "v" => {
+                if self.visual_linewise {
+                    self.visual_linewise = false;
+                    VimAction::EnterVisual
+                } else {
+                    self.leave_visual();
+                    VimAction::LeaveVisual
+                }
             }
             _ => VimAction::Consumed,
         }
@@ -635,7 +668,14 @@ pub fn exec(
                 Motion::ParaBackward => para_backward(&text, row_of(&text, caret)),
             };
             if vim.mode == VimMode::Visual {
-                extend_selection(vim, state, target, cx);
+                if vim.visual_linewise {
+                    // V: every motion snaps to whole lines — only the
+                    // target row matters; column movements within a line
+                    // don't change the selection.
+                    extend_linewise_row(vim, state, row_of(&text, target), cx);
+                } else {
+                    extend_selection(vim, state, target, cx);
+                }
             } else {
                 rest(state, vim.mode, target, cx);
             }
@@ -669,13 +709,50 @@ pub fn exec(
         }
 
         VimAction::DeleteSelection => {
-            let range = state.selected_range();
-            if !range.is_empty() {
-                vim.register = Some(text.slice(range.start..range.end).to_string());
-                vim.register_linewise = false;
-                let start = range.start;
-                delete_range(state, range, window, cx);
-                rest(state, vim.mode, start, cx);
+            // V-selection deletes whole lines: snap to line boundaries and
+            // eat the trailing newline (mirrors dd, so no blank line
+            // remains; last line eats the preceding newline).
+            if vim.visual_linewise {
+                let range = state.selected_range();
+                let (first_row, last_row) = (
+                    row_of(&text, range.start),
+                    row_of(&text, range.end.saturating_sub(1)),
+                );
+                let start = line_range(&text, first_row).0;
+                let end = if last_row + 1 < text.lines_len() {
+                    text.line_start_offset(last_row + 1)
+                } else {
+                    text.len()
+                };
+                let (del_start, del_end) = if text.lines_len() <= 1 {
+                    (0, text.len())
+                } else if range.is_empty() {
+                    (start, start)
+                } else if end == text.len() && start > 0 {
+                    (start - 1, text.len())
+                } else {
+                    (start, end)
+                };
+                if del_end > del_start {
+                    vim.register = Some(text.slice(del_start..del_end).to_string());
+                    vim.register_linewise = true;
+                    delete_range(state, del_start..del_end, window, cx);
+                }
+                rest(
+                    state,
+                    VimMode::Normal,
+                    del_start.min(state.text().len()),
+                    cx,
+                );
+            } else {
+                let range = state.selected_range();
+                if !range.is_empty() {
+                    vim.register = Some(text.slice(range.start..range.end).to_string());
+                    vim.register_linewise = false;
+                    let start = range.start;
+                    delete_range(state, range, window, cx);
+                    rest(state, vim.mode, start, cx);
+                }
             }
             vim.leave_visual();
             cx.notify();
@@ -683,11 +760,30 @@ pub fn exec(
 
         VimAction::YankSelection => {
             let range = state.selected_range();
-            vim.register = Some(text.slice(range.start..range.end).to_string());
-            vim.register_linewise = false;
-            let start = range.start;
+            let start = if vim.visual_linewise {
+                // V: register gets whole lines (no trailing `\n` —
+                // put_register adds it when pasting, same convention as
+                // yy) and p pastes them as lines. The selection may be
+                // shorter than the snapped lines, so re-derive the span.
+                let (first_row, last_row) = (
+                    row_of(&text, range.start),
+                    row_of(&text, range.end.saturating_sub(1)),
+                );
+                let start = line_range(&text, first_row).0;
+                let end = line_range(&text, last_row).1;
+                vim.register = Some(text.slice(start..end).to_string());
+                vim.register_linewise = true;
+                // Rest on the last yanked line: p pastes below the
+                // cursor's line, so the copy lands right after the
+                // selection (vim's `Vy p` behavior).
+                line_range(&text, last_row).0
+            } else {
+                vim.register = Some(text.slice(range.start..range.end).to_string());
+                vim.register_linewise = false;
+                range.start
+            };
             vim.leave_visual();
-            rest(state, vim.mode, start, cx);
+            rest(state, VimMode::Normal, start, cx);
             cx.notify();
         }
 
@@ -787,6 +883,24 @@ pub fn exec(
             cx.notify();
         }
 
+        VimAction::EnterVisualLine => {
+            // Entering linewise (or upgrading from charwise): re-anchor at
+            // the caret and select its whole line. Re-entering linewise
+            // from charwise keeps the current selection's end as the new
+            // moving cursor, so V after v+j selects both lines.
+            let caret = if vim.visual_linewise
+                && vim.mode == VimMode::Visual
+                && state.selected_range().len() > 0
+            {
+                caret_of(vim, state)
+            } else {
+                state.selected_range().start
+            };
+            vim.begin_visual(caret);
+            extend_linewise(state, caret, cx);
+            cx.notify();
+        }
+
         VimAction::LeaveVisual => {
             let start = state.selected_range().start;
             rest(state, vim.mode, start, cx);
@@ -849,6 +963,44 @@ fn extend_selection(
         (target, next_char(state.text(), anchor))
     };
     state.set_selected_range(start..end, cx);
+}
+
+/// `V` selection snap: rows `anchor_row..=target_row` as one byte range
+/// (line starts to the boundary after the last selected line — i.e. its
+/// trailing `\n`, or the buffer end).
+fn linewise_range(text: &Rope, anchor_row: usize, target_row: usize) -> std::ops::Range<usize> {
+    let (lo, hi) = (anchor_row.min(target_row), anchor_row.max(target_row));
+    let start = text.line_start_offset(lo);
+    let end = if hi + 1 < text.lines_len() {
+        text.line_start_offset(hi + 1)
+    } else {
+        text.len()
+    };
+    start..end
+}
+
+/// Linewise visual: anchor row = `caret`'s row; select that whole row.
+fn extend_linewise(state: &mut EditorState, caret: usize, cx: &mut Context<EditorState>) {
+    let row = row_of(state.text(), caret);
+    let range = linewise_range(state.text(), row, row);
+    state.set_selected_range(range, cx);
+}
+
+/// Linewise visual motion: keep the anchor row, move the cursor to
+/// `target_row`, select `anchor_row..=target_row`.
+fn extend_linewise_row(
+    vim: &mut VimState,
+    state: &mut EditorState,
+    target_row: usize,
+    cx: &mut Context<EditorState>,
+) {
+    let anchor_row = vim
+        .visual_anchor
+        .map(|a| row_of(state.text(), a))
+        .unwrap_or(target_row);
+    let range = linewise_range(state.text(), anchor_row, target_row);
+    vim.visual_cursor = range.end.saturating_sub(1).min(range.end);
+    state.set_selected_range(range, cx);
 }
 
 /// rgpui `put_register`: linewise pastes a new line below; charwise
@@ -1044,6 +1196,25 @@ mod tests {
         assert_eq!(run(&mut v, "v"), VimAction::EnterVisual);
         assert_eq!(run(&mut v, "d"), VimAction::DeleteSelection);
         assert_eq!(run(&mut v, "escape"), VimAction::LeaveVisual);
+    }
+
+    #[test]
+    fn visual_line_toggle() {
+        let mut v = VimState::new();
+        assert_eq!(run(&mut v, "V"), VimAction::EnterVisualLine);
+        assert_eq!(v.mode, VimMode::Visual);
+        assert!(v.visual_linewise);
+        // V inside linewise leaves; v drops to charwise.
+        assert_eq!(run(&mut v, "V"), VimAction::LeaveVisual);
+        assert_eq!(v.mode, VimMode::Normal);
+        run(&mut v, "V");
+        assert_eq!(run(&mut v, "v"), VimAction::EnterVisual);
+        assert!(!v.visual_linewise);
+        // v inside charwise upgrades nothing — V does.
+        assert_eq!(run(&mut v, "V"), VimAction::EnterVisualLine);
+        assert!(v.visual_linewise);
+        assert_eq!(run(&mut v, "escape"), VimAction::LeaveVisual);
+        assert!(!v.visual_linewise);
     }
 
     #[test]

@@ -3385,26 +3385,28 @@ mod tests {
         let split = cx.read(|cx| area.read(cx).splits.get(&root).unwrap().entity.clone());
         let sizes = |cx: &mut VisualTestContext| cx.read(|cx| split.read(cx).sizes().clone());
 
-        // Absolute widths are `ResizableState`'s business — it redistributes
-        // against the measured container — so what is asserted is which slot
-        // disappeared, through the ratio the survivors keep.
+        // Absolute widths are `ResizableState`'s business — the split's
+        // tree decides each slot's *share* and the state is re-adopted to
+        // it after an edit, scaled to the measured container. The fixture's
+        // slot sizes (100 : 200 : 300) scale to 1920 as [640, 1280] when
+        // slot 0 survives (a tail truncation) and [768, 1152] when it is
+        // the removed alpha that goes — the survivors keep their own 200:300
+        // share. The tree's stored sizes, not the measured state, are the
+        // share's source: a container resize keeps the state's pixels per
+        // slot instead of rescaling them, so the two only agree right after
+        // an edit.
         let before = sizes(cx);
         assert_eq!(before.len(), 3);
-        let kept_if_correct = before[1] / before[2];
-        let kept_if_truncated = before[0] / before[1];
-        assert!(
-            (kept_if_correct - kept_if_truncated).abs() > 0.1,
-            "the fixture must be able to tell the two outcomes apart"
-        );
 
         cx.update(|window, cx| area.update(cx, |area, cx| area.remove_panel(alpha, window, cx)));
 
         let after = sizes(cx);
         assert_eq!(after.len(), 2);
-        assert!(
-            (after[0] / after[1] - kept_if_correct).abs() < 0.01,
-            "the survivors kept their own proportions: slot 0 was removed, not \
-             the tail — got {after:?} from {before:?}"
+        assert_eq!(
+            after,
+            vec![px(768.), px(1152.)],
+            "the survivors kept their own 200:300 share: slot 0 was removed, \
+             not the tail — got {after:?} from {before:?}"
         );
     }
 
