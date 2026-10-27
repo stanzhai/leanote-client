@@ -1211,3 +1211,51 @@ async fn tag_rename_and_delete_push_updated_tags() {
         "tag stripped from every note"
     );
 }
+
+// ---- issue 28: sync error detail ----
+
+/// A server 500 must surface as an error naming the endpoint, the params,
+/// and the server's own response body — enough to file a ticket against
+/// the real server from the UI status line alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_500_names_endpoint_params_and_body() {
+    let (srv, _dir, s, api) = synced("err500").await;
+    srv.inject_status("getSyncState", 500, "boom: db conn refused");
+
+    let err = match incr_sync(&api, &s, &NoProgress) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected failure"),
+    };
+    assert!(
+        err.contains("api/user/getSyncState") && err.contains("HTTP 500"),
+        "endpoint+status: {err}"
+    );
+    assert!(err.contains("body: boom: db conn refused"), "body: {err}");
+    assert!(!err.contains(&srv.token()), "token must not leak: {err}");
+}
+
+/// Same contract on a POST with a form body.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_400_on_push_names_form_fields() {
+    let (srv, _dir, s, api) = synced("err400").await;
+    s.add_note(NewNote {
+        title: "Local".into(),
+        content: "# local".into(),
+        tags: vec![],
+        notebook_title: "Notebook 1".into(),
+        is_markdown: true,
+    })
+    .unwrap();
+    srv.inject_status("addNote", 400, "notebook not found");
+
+    let err = match incr_sync(&api, &s, &NoProgress) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected failure"),
+    };
+    assert!(
+        err.contains("api/note/addNote") && err.contains("HTTP 400"),
+        "endpoint+status: {err}"
+    );
+    assert!(err.contains("Title=Local"), "form fields: {err}");
+    assert!(err.contains("body: notebook not found"), "body: {err}");
+}

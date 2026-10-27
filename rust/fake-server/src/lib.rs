@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -41,7 +42,6 @@ use serde_json::{json, Map, Value};
 
 /// A row pushed to a receiver, in arrival order. Field names are exactly the
 /// keys the JS client sent (PascalCase for note bodies, camelCase for
-/// notebook/tag/delete bodies).
 #[derive(Debug, Clone)]
 pub struct RecordedPush {
     /// e.g. `"notebook/addNotebook"`.
@@ -74,8 +74,10 @@ struct Inner {
     token: Option<String>,
     /// Next USN handed to push responses (>= max dataset USN).
     next_usn: i64,
-    /// `macAddr` + `v` received on the last `auth/login`, for wire-parity asserts.
     login_query: (String, String),
+    /// Next request whose path ends in this suffix gets this HTTP status +
+    /// body (issue 28: real-server 500 repro). None = normal behavior.
+    fail_status: Option<(String, u16, String)>,
 }
 
 /// Programmable state shared between test code and the server task.
@@ -130,7 +132,12 @@ impl FakeServer {
         self.inner.lock().unwrap().conflicts.push_back(map);
     }
 
-    /// Skip token checks until the next successful login.
+    /// Fail the next request to paths ending in `suffix` (e.g.
+    /// "addNote") with this HTTP status + body (issue 28).
+    pub fn inject_status(&self, suffix: &str, status: u16, body: impl Into<String>) {
+        self.inner.lock().unwrap().fail_status = Some((suffix.to_string(), status, body.into()));
+    }
+
     pub fn invalidate_token(&self) {
         self.inner.lock().unwrap().token = None;
     }
@@ -217,8 +224,32 @@ pub async fn start() -> FakeServer {
         .route("/api/file/getImage", get(get_image))
         .route("/api/tag/addTag", post(push("tag/addTag")))
         .route("/api/tag/deleteTag", post(push("tag/deleteTag")))
-        .with_state(inner.clone());
-
+        .with_state(inner.clone())
+        .layer(middleware::from_fn_with_state(
+            inner.clone(),
+            |State(inner): State<Arc<Mutex<Inner>>>,
+             req: axum::extract::Request,
+             next: middleware::Next| async move {
+                let fail = {
+                    let mut i = inner.lock().unwrap();
+                    let matched = i
+                        .fail_status
+                        .as_ref()
+                        .is_some_and(|(suffix, _, _)| req.uri().path().ends_with(suffix));
+                    if matched {
+                        i.fail_status.take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some((_, status, body)) = fail {
+                    return StatusCode::from_u16(status)
+                        .map(|s| (s, body).into_response())
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                }
+                next.run(req).await
+            },
+        ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

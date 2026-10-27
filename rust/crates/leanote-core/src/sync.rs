@@ -115,11 +115,13 @@ impl Api {
     }
 
     fn get(&self, path: &str, params: &[(&str, String)]) -> Result<Value, SyncError> {
-        self.agent
+        let mut resp = self
+            .agent
             .get(&self.url(path, params))
             .call()
-            .map_err(|e| SyncError::Unconnected(e.to_string()))?
-            .body_mut()
+            .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+        Self::check_status(&mut resp, "GET", path, params, &[])?;
+        resp.body_mut()
             .read_json::<Value>()
             .map_err(|e| SyncError::Unconnected(e.to_string()))
     }
@@ -130,13 +132,67 @@ impl Api {
         params: &[(&str, String)],
         form: &[(&str, &str)],
     ) -> Result<Value, SyncError> {
-        self.agent
+        let mut resp = self
+            .agent
             .post(&self.url(path, params))
             .send_form(form.iter().map(|(k, v)| (*k, *v)))
-            .map_err(|e| SyncError::Unconnected(e.to_string()))?
-            .body_mut()
+            .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+        Self::check_status(&mut resp, "POST", path, params, form)?;
+        resp.body_mut()
             .read_json::<Value>()
             .map_err(|e| SyncError::Unconnected(e.to_string()))
+    }
+
+    /// 2xx → `Ok(())` (caller reads the body). 3xx should not happen (ureq
+    /// follows redirects). 4xx/5xx → read the server body and report the
+    /// endpoint + params + response so a real-server 500 is diagnosable
+    /// from the UI status line alone. The form body is included as sent
+    /// (password/token never reach it: token rides in the URL, `pwd` only
+    /// on auth/login where the params are macAddr/v).
+    fn check_status(
+        resp: &mut ureq::http::Response<ureq::Body>,
+        method: &str,
+        path: &str,
+        params: &[(&str, String)],
+        form: &[(&str, &str)],
+    ) -> Result<(), SyncError> {
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = resp
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .take(500)
+            .collect::<String>();
+        let mut msg = format!("{method} api/{path}: HTTP {}", status.as_u16());
+        if !params.is_empty() {
+            msg.push_str("; params: ");
+            msg.push_str(
+                &params
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("&"),
+            );
+        }
+        if !form.is_empty() {
+            msg.push_str("; form: ");
+            msg.push_str(
+                &form
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("&"),
+            );
+        }
+        if !body.is_empty() {
+            msg.push_str(&format!("; body: {body}"));
+        }
+        Err(SyncError::Api(msg))
     }
 
     /// JS `Common.isOk`: only `Ok:false` in an object means failure; arrays
@@ -208,6 +264,13 @@ impl Api {
             .get(&self.url("file/getImage", &[("fileId", file_id.to_string())]))
             .call()
             .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+        Self::check_status(
+            &mut resp,
+            "GET",
+            "file/getImage",
+            &[("fileId", file_id.to_string())],
+            &[],
+        )?;
         let mime = resp
             .headers()
             .get("content-type")
@@ -238,6 +301,13 @@ impl Api {
             .get(&self.url("file/getAttach", &[("fileId", file_id.to_string())]))
             .call()
             .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+        Self::check_status(
+            &mut resp,
+            "GET",
+            "file/getAttach",
+            &[("fileId", file_id.to_string())],
+            &[],
+        )?;
         let is_json = resp
             .headers()
             .get("content-type")
@@ -431,11 +501,13 @@ impl Api {
                 .map_err(|e| SyncError::Unconnected(e.to_string()))?;
             builder = builder.part(&img.local_id.0, part);
         }
-        self.agent
+        let mut resp = self
+            .agent
             .post(&self.url(path, &[]))
             .send(builder)
-            .map_err(|e| SyncError::Unconnected(e.to_string()))?
-            .body_mut()
+            .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+        Self::check_status(&mut resp, "POST", path, &[], &mform)?;
+        resp.body_mut()
             .read_json::<Value>()
             .map_err(|e| SyncError::Unconnected(e.to_string()))
     }
@@ -463,6 +535,9 @@ impl Api {
 
 fn default_agent() -> Agent {
     Agent::config_builder()
+        // Keep 4xx/5xx as responses so check_status can read the server's
+        // error body (Error::StatusCode would drop it).
+        .http_status_as_error(false)
         .timeout_connect(Some(std::time::Duration::from_secs(10)))
         .timeout_global(Some(std::time::Duration::from_secs(60)))
         .build()
