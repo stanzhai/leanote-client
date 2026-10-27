@@ -9,7 +9,7 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::label::Label;
 use gpui_kit::prelude::*;
-use gpui_kit::{px, Hsla};
+use gpui_kit::Hsla;
 use leanote_core::sync::ConflictRow;
 
 /// Which conflict the bar shows, if any. Selection-first: the bar belongs to
@@ -52,20 +52,27 @@ pub(crate) fn keep_both_suffix(lang: Lang) -> &'static str {
 }
 
 fn small(text: &str, color: Hsla) -> Label {
-    Label::new(text).text_size(px(11.)).text_color(color)
+    Label::new(text).text_size(theme::ui(11.)).text_color(color)
 }
 
 /// One version column of the bar.
-fn version(label: &str, title: &str, content: &str, time: &str, fg: Hsla, muted: Hsla) -> gpui_kit::Div {
+fn version(
+    label: &str,
+    title: &str,
+    content: &str,
+    time: &str,
+    fg: Hsla,
+    muted: Hsla,
+) -> gpui_kit::Div {
     v_flex()
         .flex_1()
         .min_w_0()
         .gap_1()
         .child(small(label, muted))
-        .child(Label::new(title).text_size(px(13.)).text_color(fg))
+        .child(Label::new(title).text_size(theme::ui(13.)).text_color(fg))
         .child(
             Label::new(format!("{} · {}", excerpt(content), time))
-                .text_size(px(12.))
+                .text_size(theme::ui(12.))
                 .text_color(muted),
         )
 }
@@ -93,7 +100,7 @@ pub(crate) fn render(
         .bg(theme::material(Material::Popover, dark))
         .child(
             Label::new(t(i18n::Key::ConflictTitle))
-                .text_size(px(13.))
+                .text_size(theme::ui(13.))
                 .text_color(fg),
         )
         .child(

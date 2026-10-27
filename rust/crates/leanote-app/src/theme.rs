@@ -117,9 +117,45 @@ pub fn muted_foreground(dark: bool) -> Hsla {
     }
 }
 
-/// Sans follows the system (".SystemUIFont" = SF Pro on macOS); mono = Menlo.
+/// Sans follows the system (".SystemUIFont" = SF Pro on macOS).
+/// UI round 11 #2: no separate mono face — the editor binds to the UI
+/// font (sans_for) so the font pref applies everywhere at once.
 pub const SANS: &str = ".SystemUIFont";
-pub const MONO: &str = "Menlo";
+/// LXGW WenKai (霞鹜文楷): the user-installed CJK handwriting face. The
+/// family name CoreText publishes once the ttf lands in ~/Library/Fonts.
+pub const WENKAI: &str = "LXGW WenKai";
+
+/// UI font by prefs id: "" (default) → system sans, "wenkai" → LXGW WenKai.
+/// Falls back to the system face when the ttf isn't installed yet — gpui
+/// resolves unknown families through the platform fallback chain.
+pub fn sans_for(font_pref: &str) -> &'static str {
+    if font_pref == "wenkai" {
+        WENKAI
+    } else {
+        SANS
+    }
+}
+
+/// Editor font size by prefs id (UI round 12): "" (regular) → 14px,
+/// "medium" → 16px, "large" → 18px. The kit default was 13px; regular
+/// nudges it up one step while staying independent of the UI zoom, which
+/// scales this value in apply_wake_theme.
+pub fn editor_font_px(size_pref: &str) -> f32 {
+    match size_pref {
+        "medium" => 16.,
+        "large" => 18.,
+        _ => 14.,
+    }
+}
+
+/// Zoom-scaled UI length (UI round 12): the kit Root plugin stamps the
+/// window's rem from `theme.font_size` (= 14px × zoom), so a value expressed
+/// as a fraction of that rem scales with the zoom pref. All app-chrome
+/// text/geometry goes through this instead of bare `px()`, which never
+/// scaled — that's why the zoom slider only resized the editor.
+pub fn ui(n: f32) -> gpui_kit::AbsoluteLength {
+    gpui_kit::rems(n / 14.).into()
+}
 
 /// Editor palettes (issue 17): 2 non-default options, each with light/dark
 /// variants in Zed highlight-theme JSON. `id` matches the prefs value;
@@ -318,6 +354,14 @@ mod tests {
         assert_eq!(spacing(6), px(24.));
         // Fonts.
         assert_eq!(SANS, ".SystemUIFont");
-        assert_eq!(MONO, "Menlo");
+        assert_eq!(sans_for(""), SANS);
+        assert_eq!(sans_for("wenkai"), WENKAI);
+        // UI round 12: editor size steps strictly ascending.
+        assert!(editor_font_px("") < editor_font_px("medium"));
+        assert!(editor_font_px("medium") < editor_font_px("large"));
+        assert_eq!(editor_font_px("bogus"), editor_font_px(""));
+        // UI round 12: ui() expresses a px design length as rems of the
+        // 14px base rem, so it scales with theme.font_size (14 × zoom).
+        assert_eq!(ui(14.), gpui_kit::rems(1.).into());
     }
 }

@@ -7,6 +7,7 @@ mod app_shell;
 mod browse;
 mod conflict_bar;
 mod export;
+mod fonts;
 mod i18n;
 mod markdown_input;
 mod pdf;
@@ -298,8 +299,26 @@ fn main() {
             // setting it afterwards left kit hover/selection on the old hue.
             theme::set_accent(&prefs.accent);
             let zoom_boot = prefs.zoom;
+            let font_boot = prefs.font.clone();
+            let editor_size_boot = prefs.editor_font_size.clone();
             Theme::update(cx, move |theme| {
-                apply_wake_theme(theme, &palette_boot, zoom_boot)
+                apply_wake_theme(
+                    theme,
+                    &palette_boot,
+                    &font_boot,
+                    &editor_size_boot,
+                    zoom_boot,
+                )
+            });
+
+            // UI round 10 #6: fetch the WenKai ttf into ~/Library/Fonts on a
+            // background thread. Non-fatal: a failure keeps the system font;
+            // the settings row can retry. CoreText only sees the new file on
+            // the next launch.
+            std::thread::spawn(|| {
+                if let Err(e) = fonts::install_wenkai() {
+                    eprintln!("wenkai font install failed: {e}");
+                }
             });
 
             let lang = match prefs.lang {
@@ -363,8 +382,12 @@ fn main() {
                     }
                     Theme::sync_system_appearance(None, cx);
                     let palette = p.editor_palette.clone();
+                    let font = p.font;
+                    let editor_size = p.editor_font_size.clone();
                     let zoom = p.zoom;
-                    Theme::update(cx, move |theme| apply_wake_theme(theme, &palette, zoom));
+                    Theme::update(cx, move |theme| {
+                        apply_wake_theme(theme, &palette, &font, &editor_size, zoom)
+                    });
                 });
                 // Persist size/position at close.
                 window.on_window_should_close(cx, move |window, _cx| {
@@ -414,7 +437,13 @@ fn main() {
 /// Wake tokens on top of the kit theme (materials, radii, fonts).
 /// Call AFTER sync_system_appearance, never inside the same update that
 /// changes mode (mode swap reloads and wipes color edits).
-pub(crate) fn apply_wake_theme(theme: &mut Theme, palette_id: &str, zoom: f32) {
+pub(crate) fn apply_wake_theme(
+    theme: &mut Theme,
+    palette_id: &str,
+    font_pref: &str,
+    editor_size: &str,
+    zoom: f32,
+) {
     use gpui_kit::component::theme::{ThemeColor, ThemeMode};
     let dark = theme.mode == ThemeMode::Dark;
     // ThemeColor is Copy; light()/dark() hand back an Arc of the base table.
@@ -445,12 +474,15 @@ pub(crate) fn apply_wake_theme(theme: &mut Theme, palette_id: &str, zoom: f32) {
     theme.colors = colors;
     theme.radius = px(theme::RADIUS_PANEL);
     theme.radius_lg = px(theme::RADIUS_PANEL);
-    theme.font_family = theme::SANS.into();
-    theme.mono_font_family = theme::MONO.into();
+    theme.font_family = theme::sans_for(font_pref).into();
     // Issue 24: rem size must come from theme.font_size — the kit Root
     // plugin re-stamps window rem from it every frame, so any window-level
     // set_rem_size was dead on arrival. Zoom drives the font size instead.
     theme.font_size = px(14. * zoom);
+    // Editor face follows the UI font (one pref drives both); its SIZE is
+    // the editor-font pref scaled by the same zoom as the rest of the UI.
+    theme.mono_font_family = theme::sans_for(font_pref).into();
+    theme.mono_font_size = px(theme::editor_font_px(editor_size) * zoom);
     theme.shadow = false; // ADR-0003: zero shadow on persistent UI
                           // Issue 17: editor palette ("" = keep the kit default highlight theme).
     if !palette_id.is_empty() {
@@ -474,7 +506,7 @@ mod selection_tests {
         ] {
             let mut theme = gpui_kit::component::Theme::default();
             theme.mode = mode;
-            apply_wake_theme(&mut theme, "", 1.0);
+            apply_wake_theme(&mut theme, "", "", "", 1.0);
             let sel = theme.colors.selection;
             assert!(
                 sel.a < 1.,
@@ -490,5 +522,16 @@ mod selection_tests {
                 );
             }
         }
+    }
+
+    /// UI round 12 regression: a botched edit dropped `theme.font_size`, so
+    /// the UI rendered at the kit default 16px rem while only the editor
+    /// scaled — the zoom control appeared broken. Pin both font sizes.
+    #[test]
+    fn zoom_scales_ui_and_editor_fonts() {
+        let mut theme = gpui_kit::component::Theme::default();
+        apply_wake_theme(&mut theme, "", "", "medium", 1.2);
+        assert_eq!(theme.font_size, gpui_kit::px(14. * 1.2));
+        assert_eq!(theme.mono_font_size, gpui_kit::px(16. * 1.2));
     }
 }

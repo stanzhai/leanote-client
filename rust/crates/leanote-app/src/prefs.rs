@@ -34,9 +34,18 @@ pub struct Prefs {
     /// Issue 19 Q13: accent color id, e.g. "blue" (default) … "pink".
     #[serde(default)]
     pub accent: String,
-    /// Issue 23 #5: UI zoom factor (1.0/1.1/1.25/1.5/1.6 → rem size).
+    /// Issue 23 #5: UI zoom factor (1.0/1.1/1.2 → rem size). Older files
+    /// stored 1.25/1.5/1.6 — `load` clamps anything above 1.2 down to it.
     #[serde(default)]
     pub zoom: f32,
+    /// UI font id: "" = system default, "wenkai" = LXGW WenKai (needs the
+    /// ttf installed into ~/Library/Fonts — see fonts.rs).
+    #[serde(default)]
+    pub font: String,
+    /// Editor font size id (UI round 12): "" = regular (14px),
+    /// "medium" = 16px, "large" = 18px. Scaled by the UI zoom at apply time.
+    #[serde(default)]
+    pub editor_font_size: String,
     /// Issue 23 #10: markdown insertion toolbar in the editor (default off).
     #[serde(default)]
     pub editor_toolbar: bool,
@@ -56,6 +65,8 @@ impl Default for Prefs {
             pane_widths: PaneWidths::default(),
             accent: String::new(),
             zoom: 1.0,
+            font: String::new(),
+            editor_font_size: String::new(),
             editor_toolbar: false,
             nav: NavStatePref::default(),
         }
@@ -96,10 +107,15 @@ const FILE: &str = "prefs.json";
 
 impl Prefs {
     pub fn load(dir: &std::path::Path) -> Self {
-        std::fs::read_to_string(dir.join(FILE))
+        let mut p: Prefs = std::fs::read_to_string(dir.join(FILE))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // 1.25/1.5/1.6 collapse to the new top step.
+        if p.zoom > 1.21 {
+            p.zoom = 1.2;
+        }
+        p
     }
 
     pub fn save(&self, dir: &std::path::Path) {
@@ -146,7 +162,9 @@ mod tests {
                 mid: Some(380.),
             },
             accent: "purple".into(),
-            zoom: 1.25,
+            zoom: 1.2,
+            font: "wenkai".into(),
+            editor_font_size: "medium".into(),
             editor_toolbar: true,
             nav: NavStatePref {
                 selection: Some(("notebook".into(), "n1".into())),
@@ -170,6 +188,24 @@ mod tests {
         assert_eq!(old.pane_widths, PaneWidths::default());
         assert_eq!(old.accent, "");
         assert_eq!(old.nav, NavStatePref::default());
+        // UI round 10: legacy zoom steps (1.25/1.5/1.6) collapse to 1.2.
+        // The JSON carries every non-defaulted field (editor_palette,
+        // recents) — without them deserialization fails and falls to
+        // Default, which would mask the clamp.
+        std::fs::write(
+            dir.join(FILE),
+            r#"{"appearance":"Follow","lang":"Follow","editor_palette":"","recents":[],"zoom":1.6}"#,
+        )
+        .unwrap();
+        assert_eq!(Prefs::load(&dir).zoom, 1.2);
+        assert_eq!(Prefs::load(&dir).font, "");
+        // In-range values survive untouched.
+        std::fs::write(
+            dir.join(FILE),
+            r#"{"appearance":"Follow","lang":"Follow","editor_palette":"","recents":[],"zoom":1.1}"#,
+        )
+        .unwrap();
+        assert_eq!(Prefs::load(&dir).zoom, 1.1);
         assert!(!old.vim_default); // explicit false in file wins over default
         std::fs::remove_dir_all(&dir).ok();
     }

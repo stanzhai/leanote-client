@@ -27,8 +27,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    px, AnyElement, KeyDownEvent, MouseButton, SharedString, Task, UniformListScrollHandle, Window,
-    WindowControlArea,
+    px, rems, AnyElement, KeyDownEvent, MouseButton, SharedString, Task, UniformListScrollHandle,
+    Window, WindowControlArea,
 };
 use leanote_core::sync::{Api, NoProgress, SyncProgress, SyncStats};
 use std::sync::{Arc, Mutex};
@@ -163,6 +163,10 @@ pub struct AppShell {
     /// focused element the key dispatch path skips this shell's nodes
     /// entirely, and ESC would stop working.
     preview_focus: gpui_kit::FocusHandle,
+    /// UI round 10 #7: permanent focus target on the root so ⌘K/⌘, dispatch
+    /// even when no input has focus (gpui routes actions down the focus
+    /// chain; an unfocused window falls off it).
+    root_focus: gpui_kit::FocusHandle,
     /// Ticket 15: export outcome shown inline in the reader toolbar
     /// (e.g. PDF-fell-back-to-HTML reason). Cleared on selection change.
     export_status: Option<SharedString>,
@@ -327,6 +331,7 @@ impl AppShell {
             focus_mode: false,
             full_preview: false,
             preview_focus: cx.focus_handle(),
+            root_focus: cx.focus_handle(),
             export_status: None,
             search: crate::search_overlay::SearchOverlay::new(window, cx),
             search_rows: Vec::new(),
@@ -959,6 +964,8 @@ impl AppShell {
         // same stacked shape. Cost: one frame of kit-default colors before
         // the second update repaints.
         let palette = p.editor_palette.clone();
+        let font = p.font;
+        let editor_size = p.editor_font_size.clone();
         let zoom = p.zoom;
         let appearance = p.appearance;
         let sys_mode = gpui_kit::component::ThemeMode::from(cx.window_appearance());
@@ -978,7 +985,7 @@ impl AppShell {
             theme.apply_config(&config);
         });
         gpui_kit::component::Theme::update(cx, move |theme| {
-            crate::apply_wake_theme(theme, &palette, zoom)
+            crate::apply_wake_theme(theme, &palette, &font, &editor_size, zoom);
         });
         cx.notify();
     }
@@ -993,9 +1000,14 @@ impl AppShell {
             _ => String::new(),
         };
         p.save(&dir);
-        let (palette, zoom) = (p.editor_palette.clone(), p.zoom);
+        let (palette, font, editor_size, zoom) = (
+            p.editor_palette.clone(),
+            p.font,
+            p.editor_font_size.clone(),
+            p.zoom,
+        );
         gpui_kit::component::Theme::update(cx, move |theme| {
-            crate::apply_wake_theme(theme, &palette, zoom)
+            crate::apply_wake_theme(theme, &palette, &font, &editor_size, zoom)
         });
         cx.notify();
     }
@@ -1010,9 +1022,14 @@ impl AppShell {
         // Live swap must reach kit-owned surfaces (context-menu hover,
         // ghost-button hover read tokens.accent), not just theme::accent()
         // call sites — replay the wake overlay.
-        let (palette, zoom) = (p.editor_palette.clone(), p.zoom);
+        let (palette, font, editor_size, zoom) = (
+            p.editor_palette.clone(),
+            p.font,
+            p.editor_font_size.clone(),
+            p.zoom,
+        );
         gpui_kit::component::Theme::update(cx, move |theme| {
-            crate::apply_wake_theme(theme, &palette, zoom)
+            crate::apply_wake_theme(theme, &palette, &font, &editor_size, zoom)
         });
         cx.notify();
     }
@@ -1046,9 +1063,50 @@ impl AppShell {
         p.zoom = factor;
         p.save(&dir);
         let palette = p.editor_palette.clone();
+        let font = p.font;
+        let editor_size = p.editor_font_size.clone();
         gpui_kit::component::Theme::update(cx, move |theme| {
-            crate::apply_wake_theme(theme, &palette, factor)
+            crate::apply_wake_theme(theme, &palette, &font, &editor_size, factor)
         });
+    }
+
+    /// UI round 10 #6: UI font pref → disk + live swap. WenKai only takes
+    /// effect after the ttf is installed (fonts.rs) and the app restarts —
+    /// CoreText scans ~/Library/Fonts at process start.
+    fn set_font_setting(&mut self, id: &str, cx: &mut gpui_kit::Context<Self>) {
+        let dir = self.data_dir.clone();
+        let mut p = crate::prefs::Prefs::load(&dir);
+        p.font = id.to_string();
+        p.save(&dir);
+        let palette = p.editor_palette.clone();
+        let font = p.font;
+        let editor_size = p.editor_font_size.clone();
+        let zoom = p.zoom;
+        gpui_kit::component::Theme::update(cx, move |theme| {
+            crate::apply_wake_theme(theme, &palette, &font, &editor_size, zoom)
+        });
+        cx.notify();
+    }
+
+    /// UI round 12: editor font size pref (regular/medium/large) → disk +
+    /// live editor resize. Zoom still multiplies this on top (set_zoom).
+    fn set_editor_font_size(&mut self, ix: usize, cx: &mut gpui_kit::Context<Self>) {
+        let dir = self.data_dir.clone();
+        let mut p = crate::prefs::Prefs::load(&dir);
+        p.editor_font_size = match ix {
+            1 => "medium".into(),
+            2 => "large".into(),
+            _ => String::new(),
+        };
+        p.save(&dir);
+        let palette = p.editor_palette.clone();
+        let font = p.font;
+        let editor_size = p.editor_font_size.clone();
+        let zoom = p.zoom;
+        gpui_kit::component::Theme::update(cx, move |theme| {
+            crate::apply_wake_theme(theme, &palette, &font, &editor_size, zoom)
+        });
+        cx.notify();
     }
 
     /// Issue 23 #10: editor toolbar pref → disk + live toggle.
@@ -1844,7 +1902,7 @@ fn note_list_row(
     let row_muted = if is_sel { sel_fg } else { muted };
     gpui_kit::base::v_flex()
         .id(n.note_id.to_string())
-        .h(px(NOTE_ROW_H))
+        .h(theme::ui(NOTE_ROW_H))
         .w_full()
         // px(), not py_1_5()/gap_0p5(): those are rem units (0.375/0.125 rem)
         // and uniform_list's measure_item lays the item out as root without
@@ -1877,8 +1935,8 @@ fn note_list_row(
                 .child(
                     gpui_kit::div().flex_1().min_w_0().truncate().child(
                         Label::new(n.title.clone())
-                            .text_size(px(14.))
-                            .line_height(px(19.))
+                            .text_size(theme::ui(14.))
+                            .line_height(theme::ui(19.))
                             .text_color(row_fg),
                     ),
                 )
@@ -1912,7 +1970,7 @@ fn note_list_row(
             // selected accent band stay clean.
             el.child(
                 gpui_kit::div()
-                    .h(px(NOTE_ROW_DIVIDER_H))
+                    .h(theme::ui(NOTE_ROW_DIVIDER_H))
                     .w_full()
                     .bg(theme::border(dark)),
             )
@@ -2011,6 +2069,8 @@ impl Render for AppShell {
 
         // Whole window: material[0] shows through the 44px transparent titlebar.
         let root = gpui_kit::base::v_flex()
+            .id("shell-root")
+            .track_focus(&self.root_focus)
             .size_full()
             .bg(base_bg)
             .text_color(cx.theme().foreground)
@@ -2070,31 +2130,6 @@ impl Render for AppShell {
                 },
             ))
             .on_action(cx.listener(
-                |this, _: &crate::search_overlay::QuickExportBackup, window, cx| {
-                    window.close_dialog(cx);
-                    this.export_backup(cx);
-                },
-            ))
-            .on_action(cx.listener(
-                |this, _: &crate::search_overlay::QuickToggleVim, window, cx| {
-                    window.close_dialog(cx);
-                    this.vim_enabled = !this.vim_enabled;
-                    // Off mid-session: drop mode/pending/register so the
-                    // next enable starts clean (issue 17 Q12).
-                    if !this.vim_enabled {
-                        this.vim.reset();
-                    }
-                    // Sync the caret shape with the new mode (ADR-0005).
-                    if let Some(ed) = &this.editing {
-                        let content = ed.content.clone();
-                        content
-                            .update(cx, |state, cx| state.set_block_cursor(this.vim_enabled, cx));
-                    }
-                    this.save_vim_pref(cx);
-                    cx.notify();
-                },
-            ))
-            .on_action(cx.listener(
                 |this, _: &crate::search_overlay::QuickSyncNow, window, cx| {
                     window.close_dialog(cx);
                     this.sync_now(cx);
@@ -2126,9 +2161,11 @@ impl Render for AppShell {
 
         match &self.phase {
             Phase::Login | Phase::SigningIn | Phase::Failed { .. } => {
-                // Not signed in: right pane IS the login form (spec §1). Left
-                // + middle render as empty material so the window reads as
-                // the three-pane app from the first frame.
+                // Not signed in: right pane IS the login form (spec §1).
+                // Side panels stay as slots but collapse to zero — keeps
+                // the same 3-panel tree (and divider state) as the shell
+                // so post-login layout is untouched (same trick as ⌘T
+                // full preview).
                 let error = match &self.phase {
                     Phase::Failed { error } => Some(error.clone()),
                     _ => None,
@@ -2151,13 +2188,13 @@ impl Render for AppShell {
                         resizable_panel()
                             .size(px(widths.left.unwrap_or(LEFT_W)))
                             .size_range(px(LEFT_RANGE.0)..px(LEFT_RANGE.1))
-                            .child(gpui_kit::base::v_flex().h_full().w_full().bg(base_bg)),
+                            .visible(false),
                     )
                     .child(
                         resizable_panel()
                             .size(px(widths.mid.unwrap_or(MID_W)))
                             .size_range(px(MID_RANGE.0)..px(MID_RANGE.1))
-                            .child(gpui_kit::base::v_flex().h_full().w_full().bg(list_bg)),
+                            .visible(false),
                     )
                     .child(resizable_panel().child(render_login(
                         dark,
@@ -2314,7 +2351,7 @@ impl Render for AppShell {
 }
 
 fn small_label(text: impl Into<SharedString>, color: gpui_kit::Hsla) -> Label {
-    Label::new(text).text_size(px(13.)).text_color(color)
+    Label::new(text).text_size(theme::ui(13.)).text_color(color)
 }
 
 // --- Notebook sidebar drag-reorder (ticket 11 follow-up) ---
@@ -2346,7 +2383,7 @@ impl Render for NotebookDragGhost {
             )
             .child(
                 Label::new(self.0.clone())
-                    .text_size(px(13.))
+                    .text_size(theme::ui(13.))
                     .text_color(theme::accent_foreground()),
             )
     }
@@ -2366,6 +2403,7 @@ impl Render for DragHeaderState {
 
 fn drag_header(
     window: &mut Window,
+    lang: i18n::Lang,
     cx: &mut gpui_kit::Context<AppShell>,
 ) -> impl IntoElement + use<> {
     let state = window.use_state(cx, |_, _| DragHeaderState { should_move: false });
@@ -2375,7 +2413,7 @@ fn drag_header(
         .flex()
         .flex_none()
         .items_center()
-        .h(px(TITLEBAR_H))
+        .h(theme::ui(TITLEBAR_H))
         .w_full()
         .pl(px(if is_macos { 80. } else { 0. }))
         .when(is_macos, |this| {
@@ -2410,6 +2448,7 @@ fn drag_header(
                         .icon(AssetIcon::Search)
                         .ghost()
                         .small()
+                        .tooltip(i18n::t(lang, i18n::Key::TooltipSearch))
                         .on_click(
                             cx.listener(|this, _ev, window, cx| this.toggle_search(window, cx)),
                         ),
@@ -2432,7 +2471,7 @@ fn reader_drag_strip(
         .flex()
         .flex_none()
         .items_center()
-        .h(px(height))
+        .h(theme::ui(height))
         .w_full()
         .when(is_macos, |this| {
             this.on_double_click(|_, window, _| window.titlebar_double_click())
@@ -2467,7 +2506,7 @@ fn render_login(
     let fg = theme::foreground(dark);
     let muted = theme::muted_foreground(dark);
     let title = Label::new(t(i18n::Key::LoginTitle))
-        .text_size(px(22.))
+        .text_size(theme::ui(22.))
         .text_color(fg);
     let subtitle = small_label(t(i18n::Key::LoginSubtitle), muted);
 
@@ -2486,7 +2525,7 @@ fn render_login(
 
     let mut form = gpui_kit::base::v_flex()
         .gap_3()
-        .w(px(360.))
+        .w(theme::ui(360.))
         .child(title)
         .child(subtitle)
         .child(host_field)
@@ -2501,7 +2540,7 @@ fn render_login(
                 t(i18n::Key::SyncFailed),
                 err
             ))
-            .text_size(px(13.))
+            .text_size(theme::ui(13.))
             .text_color(gpui_kit::hsla(0. / 360., 0.78, 0.46, 1.)),
         );
     }
@@ -2557,14 +2596,14 @@ fn render_syncing(
         .child(
             gpui_kit::base::v_flex()
                 .gap_3()
-                .w(px(360.))
+                .w(theme::ui(360.))
                 .child(
                     gpui_kit::base::h_flex()
                         .gap_2()
                         .child(Spinner::new())
                         .child(
                             Label::new(t(i18n::Key::SyncingTitle))
-                                .text_size(px(22.))
+                                .text_size(theme::ui(22.))
                                 .text_color(theme::foreground(dark)),
                         ),
                 )
@@ -2624,7 +2663,7 @@ fn nav_row(
     }
     row.child(
         Label::new(node.title.clone())
-            .text_size(px(14.))
+            .text_size(theme::ui(14.))
             .text_color(if selected { sel_fg } else { fg }),
     )
     .child(gpui_kit::base::h_flex().flex_1())
@@ -2681,7 +2720,7 @@ impl AppShell {
                 cx.notify();
             }))
             .child(Icon::new(IconName::ChevronRight).xsmall().text_color(muted))
-            .child(Label::new(label).text_size(px(11.)).text_color(muted))
+            .child(Label::new(label).text_size(theme::ui(11.)).text_color(muted))
     }
 
     /// Left nav: identity area + All/Starred/Trash + Notebooks/Tags groups.
@@ -2775,7 +2814,7 @@ impl AppShell {
             // Issue 17: 44px header below is the window-drag region (see
             .px_3()
             .gap_1()
-            .child(drag_header(window, cx))
+            .child(drag_header(window, lang, cx))
             // Issue 17 Q7: identity moved to the bottom trio (see the nav
             // footer below) — no duplicate under the header.
             .child(all_row)
@@ -3008,7 +3047,7 @@ impl AppShell {
                                     .top(px(y - 1.))
                                     .left_0()
                                     .right_0()
-                                    .h(px(2.))
+                                    .h(theme::ui(2.))
                                     .bg(theme::accent()),
                             )
                         }
@@ -3019,7 +3058,7 @@ impl AppShell {
                             .top_0()
                             .right_0()
                             .bottom_0()
-                            .w(px(12.))
+                            .w(theme::ui(12.))
                             .child(
                                 Scrollbar::vertical(&scroll)
                                     .viewport_from_layout()
@@ -3110,7 +3149,7 @@ impl AppShell {
                             .top_0()
                             .right_0()
                             .bottom_0()
-                            .w(px(12.))
+                            .w(theme::ui(12.))
                             .child(
                                 Scrollbar::vertical(&scroll)
                                     .viewport_from_layout()
@@ -3151,7 +3190,7 @@ impl AppShell {
                         })
                         .child(
                             Label::new(format!("{}{}", "　".repeat(pdepth), ptitle))
-                                .text_size(px(14.)),
+                                .text_size(theme::ui(14.)),
                         ),
                 );
             }
@@ -3252,6 +3291,7 @@ impl AppShell {
             Button::new("nav-settings")
                 .icon(AssetIcon::Cog)
                 .ghost()
+                .tooltip(i18n::t(lang, i18n::Key::TooltipSettings))
                 .on_click(cx.listener(|this, _ev, window, cx| this.open_settings(window, cx))),
         );
         nav = nav.child(footer);
@@ -3284,15 +3324,17 @@ impl AppShell {
         row.into_any_element()
     }
 
-    /// Issue 17 Q7: centered settings dialog — appearance, editor palette,
-    /// language, vim default, account + logout.
+    /// Issue 17 Q7 / UI round 10: settings dialog — left section nav
+    /// (外观/编辑器/数据) + right rows. The build closure reruns every
+    /// frame (root.rs re-invokes the stored builder), so `shell.read(cx)`
+    /// per call keeps language live without reopening the dialog.
     fn open_settings(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
         let shell = cx.entity();
-        let lang = self.lang;
-        let t = move |k: i18n::Key| i18n::t(lang, k);
+        // Which section is selected, stable across the closure's frames.
+        let section: std::rc::Rc<std::cell::Cell<usize>> = std::rc::Rc::default();
         window.open_dialog(cx, move |dialog, _window, cx| {
             let shell_c = shell.clone();
-            let t = t;
+            let t = |k: i18n::Key| i18n::t(shell.read(cx).lang, k);
             let prefs = crate::prefs::Prefs::load(&shell.read(cx).data_dir);
             let acct = shell
                 .read(cx)
@@ -3301,202 +3343,289 @@ impl AppShell {
             let dark = shell.read(cx).dark(cx);
             let muted = theme::muted_foreground(dark);
 
-            // Row builders.
+            // Row builder.
             let row = |label: gpui_kit::SharedString, control: gpui_kit::AnyElement| {
                 gpui_kit::base::h_flex()
                     .justify_between()
                     .gap_3()
                     .py_1()
-                    .child(Label::new(label).text_size(px(13.)))
+                    .child(Label::new(label).text_size(theme::ui(13.)))
                     .child(control)
             };
 
-            let content = gpui_kit::base::v_flex()
-                .gap_2()
-                .px_1()
-                .py_1()
-                .w_full()
-                // Appearance
-                .child(row(
-                    t(i18n::Key::Appearance).into(),
-                    Self::segmented(
-                        "set-appearance",
-                        [
-                            t(i18n::Key::AppearanceFollow).into(),
-                            t(i18n::Key::AppearanceLight).into(),
-                            t(i18n::Key::AppearanceDark).into(),
-                        ],
-                        match prefs.appearance {
-                            crate::prefs::AppearancePref::Follow => 0,
-                            crate::prefs::AppearancePref::Light => 1,
-                            crate::prefs::AppearancePref::Dark => 2,
-                        },
-                        {
-                            let shell = shell_c.clone();
-                            move |ix, _window, cx| {
-                                shell.update(cx, |this, cx| {
-                                    this.set_appearance(ix, cx);
-                                });
+            // Right column for the active section.
+            let mut right = gpui_kit::base::v_flex().gap_2().px_1().py_1().w_full();
+            match section.get() {
+                // ── 外观 / Appearance ──────────────────────────────
+                0 => {
+                    right = right
+                        .child(row(
+                            t(i18n::Key::Appearance).into(),
+                            Self::segmented(
+                                "set-appearance",
+                                [
+                                    t(i18n::Key::AppearanceFollow).into(),
+                                    t(i18n::Key::AppearanceLight).into(),
+                                    t(i18n::Key::AppearanceDark).into(),
+                                ],
+                                match prefs.appearance {
+                                    crate::prefs::AppearancePref::Follow => 0,
+                                    crate::prefs::AppearancePref::Light => 1,
+                                    crate::prefs::AppearancePref::Dark => 2,
+                                },
+                                {
+                                    let shell = shell_c.clone();
+                                    move |ix, _window, cx| {
+                                        shell.update(cx, |this, cx| {
+                                            this.set_appearance(ix, cx);
+                                        });
+                                    }
+                                },
+                            ),
+                        ))
+                        // Interface zoom (issue 23 #5 / UI round 10: 3 steps).
+                        .child(row(t(i18n::Key::InterfaceZoom).into(), {
+                            let mut zooms = gpui_kit::base::h_flex().gap_1();
+                            for factor in [1.0f32, 1.1, 1.2] {
+                                let shell = shell_c.clone();
+                                let label = format!("{}%", (factor * 100.).round() as u32);
+                                let active = (prefs.zoom - factor).abs() < 0.01;
+                                zooms = zooms.child(
+                                    Button::new(SharedString::from(format!("set-zoom-{factor}")))
+                                        .label(label)
+                                        .when(active, |b| b.primary())
+                                        .when(!active, |b| b.ghost())
+                                        .xsmall()
+                                        .on_click(move |_, window, cx| {
+                                            let _ = shell.update(cx, |this, cx| {
+                                                this.set_zoom(factor, window, cx)
+                                            });
+                                        }),
+                                );
                             }
-                        },
-                    ),
-                ))
-                // Interface zoom (issue 23 #5): 5 steps, rem-based scale.
-                .child(row(t(i18n::Key::InterfaceZoom).into(), {
-                    let mut zooms = gpui_kit::base::h_flex().gap_1();
-                    for factor in [1.0f32, 1.1, 1.25, 1.5, 1.6] {
-                        let shell = shell_c.clone();
-                        let label = format!("{}%", (factor * 100.).round() as u32);
-                        let active = (prefs.zoom - factor).abs() < 0.01;
-                        zooms = zooms.child(
-                            Button::new(SharedString::from(format!("set-zoom-{factor}")))
-                                .label(label)
-                                .when(active, |b| b.primary())
-                                .when(!active, |b| b.ghost())
-                                .xsmall()
-                                .on_click(move |_, window, cx| {
-                                    let _ = shell
-                                        .update(cx, |this, cx| this.set_zoom(factor, window, cx));
+                            zooms.into_any_element()
+                        }))
+                        // UI font (UI round 10 #6): default / LXGW WenKai.
+                        .child(row(
+                            t(i18n::Key::UIFont).into(),
+                            Self::segmented(
+                                "set-font",
+                                [
+                                    t(i18n::Key::FontDefault).into(),
+                                    t(i18n::Key::FontWenKai).into(),
+                                    t(i18n::Key::FontDefault).into(),
+                                ],
+                                if prefs.font == "wenkai" { 1 } else { 0 },
+                                {
+                                    let shell = shell_c.clone();
+                                    move |ix, _window, cx| {
+                                        shell.update(cx, |this, cx| {
+                                            this.set_font_setting(
+                                                if ix == 1 { "wenkai" } else { "" },
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                },
+                            ),
+                        ))
+                        .child(small_label(
+                            if crate::fonts::INSTALL_FAILED
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                t(i18n::Key::FontInstallFailed)
+                            } else if crate::fonts::install_path().is_file() {
+                                t(i18n::Key::FontRestartHint)
+                            } else {
+                                t(i18n::Key::FontDownloading)
+                            },
+                            muted,
+                        ))
+                        // Language
+                        .child(row(
+                            t(i18n::Key::LanguageSetting).into(),
+                            Self::segmented(
+                                "set-lang",
+                                [
+                                    t(i18n::Key::AppearanceFollow).into(),
+                                    "中文".into(),
+                                    "English".into(),
+                                ],
+                                match prefs.lang {
+                                    crate::prefs::LangPref::Follow => 0,
+                                    crate::prefs::LangPref::Zh => 1,
+                                    crate::prefs::LangPref::En => 2,
+                                },
+                                {
+                                    let shell = shell_c.clone();
+                                    move |ix, _window, cx| {
+                                        shell.update(cx, |this, cx| {
+                                            this.set_lang(ix, cx);
+                                        });
+                                    }
+                                },
+                            ),
+                        ))
+                        .child(row(t(i18n::Key::AccentColor).into(), {
+                            let mut swatches = gpui_kit::base::h_flex().gap_1();
+                            for (id, hex) in theme::ACCENTS {
+                                let shell = shell_c.clone();
+                                let id = *id;
+                                let selected = prefs.accent == id;
+                                let mut sw = gpui_kit::div()
+                                    .id(SharedString::from(format!("accent-{id}")))
+                                    .size(px(18.))
+                                    .rounded_full()
+                                    .bg(gpui_kit::rgb(*hex))
+                                    .when(selected, |el| {
+                                        el.border_1().border_color(theme::foreground(dark))
+                                    });
+                                sw = sw.on_click(move |_, _window, cx| {
+                                    let _ = shell.update(cx, |this, cx| {
+                                        this.set_accent(id, cx);
+                                    });
+                                });
+                                swatches = swatches.child(sw);
+                            }
+                            swatches.into_any_element()
+                        }));
+                }
+                // ── 编辑器 / Editor ────────────────────────────────
+                1 => {
+                    right = right
+                        // Vim toggle (issue 23 #9)
+                        .child(row(
+                            t(i18n::Key::VimMode).into(),
+                            Switch::new("set-vim")
+                                .checked(prefs.vim_default)
+                                .on_click({
+                                    let shell = shell_c.clone();
+                                    move |checked, _window, cx| {
+                                        let _ = shell.update(cx, |this, cx| {
+                                            this.set_vim_setting(*checked, cx)
+                                        });
+                                    }
+                                })
+                                .into_any_element(),
+                        ))
+                        // Editor toolbar toggle (issue 23 #10)
+                        .child(row(
+                            t(i18n::Key::EditorToolbar).into(),
+                            Switch::new("set-editor-toolbar")
+                                .checked(prefs.editor_toolbar)
+                                .on_click({
+                                    let shell = shell_c.clone();
+                                    move |checked, _window, cx| {
+                                        let _ = shell.update(cx, |this, cx| {
+                                            this.set_editor_toolbar(*checked, cx)
+                                        });
+                                    }
+                                })
+                                .into_any_element(),
+                        ))
+                        // Editor palette moved to the Editor section (UI round 11).
+                        .child(row(
+                            t(i18n::Key::EditorPalette).into(),
+                            Self::segmented(
+                                "set-palette",
+                                [
+                                    t(i18n::Key::PaletteDefault).into(),
+                                    t(i18n::Key::PaletteWarm).into(),
+                                    t(i18n::Key::PaletteSolarized).into(),
+                                ],
+                                match prefs.editor_palette.as_str() {
+                                    "" => 0,
+                                    "warm" => 1,
+                                    _ => 2,
+                                },
+                                {
+                                    let shell = shell_c.clone();
+                                    move |ix, _window, cx| {
+                                        shell.update(cx, |this, cx| {
+                                            this.set_editor_palette(ix, cx);
+                                        });
+                                    }
+                                },
+                            ),
+                        ))
+                        // Editor font size (UI round 12): regular/medium/large;
+                        // the appearance zoom scales this on top.
+                        .child(row(
+                            t(i18n::Key::EditorFontSize).into(),
+                            Self::segmented(
+                                "set-editor-size",
+                                [
+                                    t(i18n::Key::FontSizeRegular).into(),
+                                    t(i18n::Key::FontSizeMedium).into(),
+                                    t(i18n::Key::FontSizeLarge).into(),
+                                ],
+                                match prefs.editor_font_size.as_str() {
+                                    "" => 0,
+                                    "medium" => 1,
+                                    _ => 2,
+                                },
+                                {
+                                    let shell = shell_c.clone();
+                                    move |ix, _window, cx| {
+                                        shell.update(cx, |this, cx| {
+                                            this.set_editor_font_size(ix, cx);
+                                        });
+                                    }
+                                },
+                            ),
+                        ))
+                }
+                // ── 数据 / Data ────────────────────────────────────
+                _ => {
+                    right = right
+                        .child(small_label(
+                            format!(
+                                "{}: {}",
+                                t(i18n::Key::AccountInfo),
+                                acct.as_ref().map(|a| a.email.as_str()).unwrap_or("-")
+                            ),
+                            muted,
+                        ))
+                        .child(small_label(
+                            format!(
+                                "{}: {}",
+                                t(i18n::Key::ServerLabel),
+                                acct.as_ref().map(|a| a.host.as_str()).unwrap_or("-")
+                            ),
+                            muted,
+                        ))
+                        .child(
+                            Button::new("set-export")
+                                .label(t(i18n::Key::ExportBackupButton).to_owned())
+                                .outline()
+                                .on_click({
+                                    let shell = shell_c.clone();
+                                    move |_ev, _window, cx| {
+                                        let _ = shell.update(cx, |this, cx| this.export_backup(cx));
+                                    }
                                 }),
-                        );
-                    }
-                    zooms.into_any_element()
-                }))
-                // Vim toggle (issue 23 #9)
-                .child(row(
-                    t(i18n::Key::VimMode).into(),
-                    Switch::new("set-vim")
-                        .checked(prefs.vim_default)
-                        .on_click({
-                            let shell = shell_c.clone();
-                            move |checked, _window, cx| {
-                                let _ =
-                                    shell.update(cx, |this, cx| this.set_vim_setting(*checked, cx));
-                            }
-                        })
-                        .into_any_element(),
-                ))
-                // Editor toolbar toggle (issue 23 #10)
-                .child(row(
-                    t(i18n::Key::EditorToolbar).into(),
-                    Switch::new("set-editor-toolbar")
-                        .checked(prefs.editor_toolbar)
-                        .on_click({
-                            let shell = shell_c.clone();
-                            move |checked, _window, cx| {
-                                let _ = shell
-                                    .update(cx, |this, cx| this.set_editor_toolbar(*checked, cx));
-                            }
-                        })
-                        .into_any_element(),
-                ))
-                // Editor palette
-                .child(row(
-                    t(i18n::Key::EditorPalette).into(),
-                    Self::segmented(
-                        "set-palette",
-                        [
-                            t(i18n::Key::PaletteDefault).into(),
-                            t(i18n::Key::PaletteWarm).into(),
-                            t(i18n::Key::PaletteSolarized).into(),
-                        ],
-                        match prefs.editor_palette.as_str() {
-                            "" => 0,
-                            "warm" => 1,
-                            _ => 2,
-                        },
-                        {
-                            let shell = shell_c.clone();
-                            move |ix, _window, cx| {
-                                shell.update(cx, |this, cx| {
-                                    this.set_editor_palette(ix, cx);
-                                });
-                            }
-                        },
-                    ),
-                ))
-                // Accent color
-                .child(row(t(i18n::Key::AccentColor).into(), {
-                    let mut swatches = gpui_kit::base::h_flex().gap_1();
-                    for (id, hex) in theme::ACCENTS {
-                        let shell = shell_c.clone();
-                        let id = *id;
-                        let selected = prefs.accent == id;
-                        let mut sw = gpui_kit::div()
-                            .id(SharedString::from(format!("accent-{id}")))
-                            .size(px(18.))
-                            .rounded_full()
-                            .bg(gpui_kit::rgb(*hex))
-                            .when(selected, |el| {
-                                el.border_1().border_color(theme::foreground(dark))
-                            });
-                        sw = sw.on_click(move |_, _window, cx| {
-                            let _ = shell.update(cx, |this, cx| {
-                                this.set_accent(id, cx);
-                            });
-                        });
-                        swatches = swatches.child(sw);
-                    }
-                    swatches.into_any_element()
-                }))
-                // Language
-                .child(row(
-                    t(i18n::Key::LanguageSetting).into(),
-                    Self::segmented(
-                        "set-lang",
-                        [
-                            t(i18n::Key::AppearanceFollow).into(),
-                            "中文".into(),
-                            "English".into(),
-                        ],
-                        match prefs.lang {
-                            crate::prefs::LangPref::Follow => 0,
-                            crate::prefs::LangPref::Zh => 1,
-                            crate::prefs::LangPref::En => 2,
-                        },
-                        {
-                            let shell = shell_c.clone();
-                            move |ix, _window, cx| {
-                                shell.update(cx, |this, cx| {
-                                    this.set_lang(ix, cx);
-                                });
-                            }
-                        },
-                    ),
-                ))
-                // Account + logout
-                .when_some(acct, |el, acct| {
-                    el.child(
-                        gpui_kit::base::v_flex()
-                            .gap_1()
-                            .pt_2()
-                            .mt_2()
-                            .border_t_1()
-                            .border_color(theme::border(dark))
-                            .child(small_label(
-                                format!("{}: {}", t(i18n::Key::AccountInfo), acct.email),
-                                muted,
-                            ))
-                            .child(small_label(
-                                format!("{}: {}", t(i18n::Key::ServerLabel), acct.host),
-                                muted,
-                            ))
-                            .child(
+                        )
+                        .when_some(acct.clone(), |el, _acct| {
+                            el.child(
                                 Button::new("settings-logout")
                                     .label(t(i18n::Key::Logout).to_owned())
                                     .outline()
                                     .on_click({
                                         let shell = shell_c.clone();
+                                        let lang_now = shell.read(cx).lang;
                                         move |_ev, window, cx| {
                                             let shell = shell.clone();
                                             window.open_dialog(cx, move |d, _w, _cx| {
                                                 d.w(px(360.)).child(
                                                     Alert::warning(
                                                         "logout-confirm",
-                                                        i18n::t(lang, i18n::Key::LogoutConfirmBody),
+                                                        i18n::t(
+                                                            lang_now,
+                                                            i18n::Key::LogoutConfirmBody,
+                                                        ),
                                                     )
                                                     .title(i18n::t(
-                                                        lang,
+                                                        lang_now,
                                                         i18n::Key::LogoutConfirmTitle,
                                                     ))
                                                     .on_close({
@@ -3505,8 +3634,8 @@ impl AppShell {
                                                             let _ = shell.update(cx, |this, cx| {
                                                                 this.logout(cx)
                                                             });
-                                                            // Pop the confirm, then the settings
-                                                            // dialog beneath it.
+                                                            // Pop the confirm, then the
+                                                            // settings dialog beneath it.
                                                             window.close_dialog(cx);
                                                             window.close_dialog(cx);
                                                         }
@@ -3515,12 +3644,44 @@ impl AppShell {
                                             });
                                         }
                                     }),
-                            ),
-                    )
-                });
+                            )
+                        });
+                }
+            }
+
+            // Left nav: three section buttons.
+            let mut nav = gpui_kit::base::v_flex().gap_1().w(theme::ui(110.));
+            for (ix, label) in [
+                i18n::Key::SectionAppearance,
+                i18n::Key::SectionEditor,
+                i18n::Key::SectionData,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let section = section.clone();
+                let active = section.get() == ix;
+                nav = nav.child(
+                    Button::new(SharedString::from(format!("set-section-{ix}")))
+                        .label(t(label).to_owned())
+                        .when(active, |b| b.primary())
+                        .when(!active, |b| b.ghost())
+                        .xsmall()
+                        .w_full()
+                        .on_click(move |_, _window, _cx| {
+                            section.set(ix);
+                        }),
+                );
+            }
+
+            let content = gpui_kit::base::h_flex()
+                .gap_4()
+                .items_start()
+                .child(nav)
+                .child(right);
 
             dialog
-                .w(px(440.))
+                .w(px(640.))
                 .title(t(i18n::Key::SettingsTitle))
                 .child(content)
         });
@@ -3671,7 +3832,7 @@ impl AppShell {
                         .gap_2()
                         .child(
                             Label::new(format!("{id}.bin"))
-                                .text_size(px(13.))
+                                .text_size(theme::ui(13.))
                                 .font_family("Menlo"),
                         )
                         .child(
@@ -4079,7 +4240,7 @@ impl AppShell {
             .when_some(icon, |el, icon| {
                 el.child(Icon::new(icon).small().text_color(muted))
             })
-            .child(Label::new(title.clone()).text_size(px(14.)).text_color(fg))
+            .child(Label::new(title.clone()).text_size(theme::ui(14.)).text_color(fg))
             .child(gpui_kit::base::h_flex().flex_1());
         match &self.nav {
             NavSelection::Notebook(_) => {
@@ -4087,6 +4248,7 @@ impl AppShell {
                     Button::new("new-note")
                         .icon(IconName::Plus)
                         .ghost()
+                        .tooltip(t(i18n::Key::TooltipNewNote))
                         .on_click(cx.listener(|this, _ev, window, cx| this.new_note(window, cx))),
                 );
             }
@@ -4096,7 +4258,7 @@ impl AppShell {
                 header = header.child(
                     Button::new("empty-trash")
                         .icon(AssetIcon::Trash)
-                        .ghost()
+                        .tooltip(t(i18n::Key::TooltipEmptyTrash))
                         .on_click(cx.listener(|this, _ev, window, cx| {
                             this.confirm_empty_trash(window, cx)
                         })),
@@ -4119,7 +4281,13 @@ impl AppShell {
             .child(header);
 
         if notes.is_empty() {
-            list = list.child(small_label(t(i18n::Key::EmptyNotes), muted));
+            list = list.child(
+                gpui_kit::base::v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .child(small_label(t(i18n::Key::EmptyNotes), muted)),
+            );
         } else {
             // Issue 17: virtualized — only visible rows render.
             let sel_id = self.selected.clone();
@@ -4177,7 +4345,7 @@ impl AppShell {
                         .top_0()
                         .right_0()
                         .bottom_0()
-                        .w(px(12.))
+                        .w(theme::ui(12.))
                         .child(
                             Scrollbar::vertical(&scroll)
                                 .viewport_from_layout()
@@ -4195,7 +4363,7 @@ impl AppShell {
             let mut picker = gpui_kit::base::v_flex().flex_1().min_h_0().gap_1().py_2();
             picker = picker.child(
                 Label::new(format!("{} · {}", t(i18n::Key::MoveNoteTo), title))
-                    .text_size(px(16.))
+                    .text_size(theme::ui(16.))
                     .text_color(fg),
             );
             let nodes = self.notebook_nav_nodes().clone();
@@ -4215,7 +4383,7 @@ impl AppShell {
                                 this.move_note_to(moved2.clone(), pid.clone(), cx)
                             });
                         })
-                        .child(Label::new(node.title.clone()).text_size(px(14.))),
+                        .child(Label::new(node.title.clone()).text_size(theme::ui(14.))),
                 );
             }
             let shell3 = shell.clone();
@@ -4331,7 +4499,7 @@ impl AppShell {
                         .justify_center()
                         .gap_2()
                         .child(Icon::new(AssetIcon::FileText).large().text_color(muted))
-                        .child(Label::new(hint).text_size(px(14.)).text_color(muted)),
+                        .child(Label::new(hint).text_size(theme::ui(14.)).text_color(muted)),
                 ),
             );
         };
@@ -4395,7 +4563,7 @@ impl AppShell {
         if let Some(status) = self.export_status.clone() {
             toolbar = toolbar.child(
                 Label::new(status)
-                    .text_size(px(12.))
+                    .text_size(theme::ui(12.))
                     .text_color(theme::muted_foreground(dark)),
             );
         }
@@ -4487,15 +4655,14 @@ impl AppShell {
         let title_row = gpui_kit::base::h_flex()
             .gap_2()
             .child(
-                // Issue 21: title 20px (fixed) — Styled .text_size flows
-                // into the state's text element (its prepaint reads
-                // window.text_style()). 36px row: 20px text + descender
-                // room; 32px clipped the glyph tops (issue 23 #8).
+                // Issue 21 / UI round 10: title = 1.25rem — scales with the
+                // interface zoom. 32px row at 100% (28px text + descender
+                // room); the fixed 20px/36px pair ignored zoom.
                 Input::new(&title_entity)
                     .appearance(false)
                     .bordered(false)
-                    .text_size(px(20.))
-                    .h(px(36.))
+                    .text_size(rems(1.25))
+                    .h(theme::ui(32.))
                     .flex_1()
                     .min_w_0(),
             )
@@ -4649,8 +4816,9 @@ impl AppShell {
                     .gap_2()
                     .px_2()
                     .mb_0()
-                    .border_b_1()
-                    .border_color(theme::border(dark))
+                    // UI round 10 #2: no bottom rule — the tag chips and
+                    // clock already read as a row; the border made the
+                    // editor look boxed-in.
                     .child(
                         gpui_kit::base::h_flex()
                             .flex_1()
@@ -4681,7 +4849,7 @@ impl AppShell {
                             .child(
                                 Input::new(&ed.tag_input)
                                     .xsmall()
-                                    .w(px(120.))
+                                    .w(theme::ui(120.))
                                     .cleanable(false),
                             ),
                     )
@@ -4692,7 +4860,7 @@ impl AppShell {
                             .child(Icon::new(AssetIcon::Clock).xsmall().text_color(muted))
                             .child(
                                 small_label(SharedString::from(fmt_time(ed.updated_time)), muted)
-                                    .text_size(px(12.)),
+                                    .text_size(theme::ui(12.)),
                             ),
                     ),
             )
@@ -4706,6 +4874,9 @@ impl AppShell {
             .px(px(5.))
             .gap_2()
             .min_h_0()
+            // UI round 10 #4: 1rem base for the editor/preview column so
+            // its intrinsic text scales with the interface zoom.
+            .text_size(rems(1.0))
             // Editor column ends 5px above the window bottom (issue #2).
             .pb(px(5.))
             .h_full()
@@ -4757,7 +4928,7 @@ impl AppShell {
                         .editing
                         .as_ref()
                         .is_some_and(|ed| ed.title.read(cx).has_selection_focus(window, cx));
-                    if in_title {
+                    if in_title && !this.editing.as_ref().is_some_and(|ed| ed.preview) {
                         if let Some(ed) = &this.editing {
                             ed.content.update(cx, |state, cx| state.focus(window, cx));
                         }

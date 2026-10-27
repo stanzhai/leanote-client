@@ -34,16 +34,9 @@ gpui_kit::actions!(
         OpenSettings
     ]
 );
-// Issue 17 Q6 quick actions: new note / sync / export backup / vim.
-gpui_kit::actions!(
-    leanote,
-    [
-        QuickNewNote,
-        QuickSyncNow,
-        QuickToggleVim,
-        QuickExportBackup
-    ]
-);
+// Issue 17 Q6 quick actions: new note / sync (UI round 10 moved export
+// backup into the settings dialog and Vim into its settings row).
+gpui_kit::actions!(leanote, [QuickNewNote, QuickSyncNow]);
 
 /// ADR-0003 fixed overlay width.
 pub const OVERLAY_W: f32 = 680.;
@@ -178,7 +171,7 @@ fn render_dialog(
                 .items_center()
                 .child(
                     Label::new(i18n::t(lang, key))
-                        .text_size(px(13.))
+                        .text_size(theme::ui(13.))
                         .text_color(muted),
                 )
                 .into_any_element()
@@ -189,7 +182,7 @@ fn render_dialog(
                 .py_2()
                 .border_t_1()
                 .border_color(theme::border(dark))
-                .child(Label::new(t_footnote).text_size(px(11.)).text_color(muted))
+                .child(Label::new(t_footnote).text_size(theme::ui(11.)).text_color(muted))
                 .into_any_element()
         })
         .on_query(move |query, _window, cx| {
@@ -222,7 +215,7 @@ fn render_dialog(
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
-                                        .child(Label::new(r.title.clone()).text_size(px(14.))),
+                                        .child(Label::new(r.title.clone()).text_size(theme::ui(14.))),
                                 )
                                 .child(
                                     h_flex()
@@ -230,12 +223,12 @@ fn render_dialog(
                                         .gap_1()
                                         .child(
                                             Label::new(r.notebook.clone())
-                                                .text_size(px(11.))
+                                                .text_size(theme::ui(11.))
                                                 .text_color(muted),
                                         )
                                         .child(
                                             Label::new(format!("· {}", r.date))
-                                                .text_size(px(11.))
+                                                .text_size(theme::ui(11.))
                                                 .text_color(muted),
                                         ),
                                 ),
@@ -243,7 +236,7 @@ fn render_dialog(
                         .child(
                             gpui_kit::div().w_full().min_w_0().truncate().child(
                                 Label::new(r.excerpt.clone())
-                                    .text_size(px(12.))
+                                    .text_size(theme::ui(12.))
                                     .text_color(muted),
                             ),
                         )
@@ -262,14 +255,6 @@ fn render_dialog(
                     (
                         Box::new(QuickNewNote) as Box<dyn gpui_kit::Action>,
                         i18n::t(lang, i18n::Key::NewNote),
-                    ),
-                    (
-                        Box::new(QuickExportBackup) as Box<dyn gpui_kit::Action>,
-                        i18n::t(lang, i18n::Key::ActionExportBackup),
-                    ),
-                    (
-                        Box::new(QuickToggleVim) as Box<dyn gpui_kit::Action>,
-                        i18n::t(lang, i18n::Key::VimOn),
                     ),
                     (
                         Box::new(QuickSyncNow) as Box<dyn gpui_kit::Action>,
