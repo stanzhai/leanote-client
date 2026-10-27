@@ -1259,3 +1259,51 @@ async fn server_400_on_push_names_form_fields() {
     assert!(err.contains("Title=Local"), "form fields: {err}");
     assert!(err.contains("body: notebook not found"), "body: {err}");
 }
+
+// ---- issue 29: note-level context in sync errors ----
+
+/// A 200 `{Ok:false}` from getNoteContent must name the endpoint, the
+/// noteId param, AND the local note title — the user's actual question is
+/// "which note is broken".
+#[tokio::test(flavor = "multi_thread")]
+async fn content_fetch_error_names_note() {
+    let (srv, _dir, s, api) = synced("note_ctx_200").await;
+    // One note's content is gone server-side: 200 + {"Ok":false,"Msg":"notExists"}.
+    let mut c = srv.contents();
+    c.remove("note0100");
+    srv.set_contents(c);
+    srv.set_sync_usn(1002);
+    // Wipe local content for that note so the sync refetches it.
+    s.set_note_content_by_server_id("note0100", "").unwrap();
+
+    let err = match incr_sync(&api, &s, &NoProgress) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected failure"),
+    };
+    assert!(
+        err.contains("api/note/getNoteContent") && err.contains("noteId=note0100"),
+        "endpoint+param: {err}"
+    );
+    assert!(err.contains("notExists"), "server msg: {err}");
+    assert!(err.contains("Note 100"), "note title: {err}");
+    assert!(!err.contains(&srv.token()), "token must not leak: {err}");
+}
+
+/// Same contract when the server answers 500 (both error paths carry the note).
+#[tokio::test(flavor = "multi_thread")]
+async fn content_fetch_500_names_note() {
+    let (srv, _dir, s, api) = synced("note_ctx_500").await;
+    s.set_note_content_by_server_id("note0100", "").unwrap();
+    srv.set_sync_usn(1002);
+    srv.inject_status("getNoteContent", 500, "db down");
+
+    let err = match incr_sync(&api, &s, &NoProgress) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected failure"),
+    };
+    assert!(
+        err.contains("api/note/getNoteContent") && err.contains("noteId=note0100"),
+        "endpoint+param: {err}"
+    );
+    assert!(err.contains("Note 100"), "note title: {err}");
+}

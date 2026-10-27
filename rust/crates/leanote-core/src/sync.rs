@@ -143,6 +143,15 @@ impl Api {
             .map_err(|e| SyncError::Unconnected(e.to_string()))
     }
 
+    /// `k=v&k=v` for error strings (token rides in the URL, never here).
+    fn kv(params: &[(&str, String)]) -> String {
+        params
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
     /// 2xx → `Ok(())` (caller reads the body). 3xx should not happen (ureq
     /// follows redirects). 4xx/5xx → read the server body and report the
     /// endpoint + params + response so a real-server 500 is diagnosable
@@ -171,13 +180,7 @@ impl Api {
         let mut msg = format!("{method} api/{path}: HTTP {}", status.as_u16());
         if !params.is_empty() {
             msg.push_str("; params: ");
-            msg.push_str(
-                &params
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join("&"),
-            );
+            msg.push_str(&Self::kv(params));
         }
         if !form.is_empty() {
             msg.push_str("; form: ");
@@ -196,25 +199,43 @@ impl Api {
     }
 
     /// JS `Common.isOk`: only `Ok:false` in an object means failure; arrays
-    /// (chunk endpoints) and objects without `Ok` are success.
-    fn ok_or_api(v: Value) -> Result<Value, SyncError> {
+    /// (chunk endpoints) and objects without `Ok` are success. A 200 with
+    /// `{Ok:false}` must still name the endpoint + params, else `notExists`
+    /// on getNoteContent gives no clue which note it was.
+    fn ok_or_api(
+        v: Value,
+        method: &str,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> Result<Value, SyncError> {
         match &v {
-            Value::Object(m) if m.get("Ok") == Some(&Value::Bool(false)) => Err(SyncError::Api(
-                m.get("Msg")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            )),
+            Value::Object(m) if m.get("Ok") == Some(&Value::Bool(false)) => {
+                let mut err = format!("{method} api/{path}");
+                if !params.is_empty() {
+                    err.push_str("; params: ");
+                    err.push_str(&Self::kv(params));
+                }
+                err.push_str(&format!(
+                    ": {}",
+                    m.get("Msg").and_then(Value::as_str).unwrap_or("")
+                ));
+                Err(SyncError::Api(err))
+            }
             _ => Ok(v),
         }
     }
 
     /// GET user/getSyncState → LastSyncUsn.
     pub fn get_sync_state(&self) -> Result<i64, SyncError> {
-        let v = Self::ok_or_api(self.get(
+        let v = Self::ok_or_api(
+            self.get(
+                "user/getSyncState",
+                &[("macAddr", mac_addr()), ("v", client_version())],
+            )?,
+            "GET",
             "user/getSyncState",
             &[("macAddr", mac_addr()), ("v", client_version())],
-        )?)?;
+        )?;
         Ok(v.get("LastSyncUsn").and_then(Value::as_i64).unwrap_or(0))
     }
 
@@ -228,13 +249,11 @@ impl Api {
             "tag" => "tag/getSyncTags",
             other => unreachable!("unknown sync kind {other}"),
         };
-        let v = Self::ok_or_api(self.get(
-            path,
-            &[
-                ("afterUsn", after_usn.to_string()),
-                ("maxEntry", MAX_ENTRY.to_string()),
-            ],
-        )?)?;
+        let params = [
+            ("afterUsn", after_usn.to_string()),
+            ("maxEntry", MAX_ENTRY.to_string()),
+        ];
+        let v = Self::ok_or_api(self.get(path, &params)?, "GET", path, &params)?;
         match v {
             Value::Array(rows) => Ok(rows),
             other => Err(SyncError::Api(format!(
@@ -245,10 +264,13 @@ impl Api {
 
     /// GET note/getNoteContent → Content for a server note id.
     pub fn get_note_content(&self, server_note_id: &str) -> Result<String, SyncError> {
-        let v = Self::ok_or_api(self.get(
+        let params = [("noteId", server_note_id.to_string())];
+        let v = Self::ok_or_api(
+            self.get("note/getNoteContent", &params)?,
+            "GET",
             "note/getNoteContent",
-            &[("noteId", server_note_id.to_string())],
-        )?)?;
+            &params,
+        )?;
         Ok(v.get("Content")
             .and_then(Value::as_str)
             .unwrap_or("")
@@ -328,7 +350,8 @@ impl Api {
         if is_json {
             let v: Value =
                 serde_json::from_slice(&body).map_err(|e| SyncError::Unconnected(e.to_string()))?;
-            let msg = match Self::ok_or_api(v) {
+            let params = [("fileId", file_id.to_string())];
+            let msg = match Self::ok_or_api(v, "GET", "file/getAttach", &params) {
                 Err(SyncError::Api(msg)) => msg,
                 _ => "attachment not found".into(),
             };
@@ -830,13 +853,16 @@ pub fn full_sync(
     // Contents for notes still missing one (JS `InitSync`).
     // ponytail: "needs content" == empty Content, so a server note whose real
     // content is the empty string is re-fetched each run; harmless (idempotent)
-    let server_ids = store
-        .note_server_ids_needing_content()
+    let server_notes = store
+        .notes_needing_content()
         .map_err(|e| SyncError::Unconnected(e.to_string()))?;
-    let total = server_ids.len();
-    for (done, sid) in server_ids.into_iter().enumerate() {
+    let total = server_notes.len();
+    for (done, (sid, title)) in server_notes.into_iter().enumerate() {
         progress.tick(done, total);
-        let content = api.get_note_content(&sid)?;
+        let content = api.get_note_content(&sid).map_err(|e| match e {
+            SyncError::Api(msg) => SyncError::Api(format!("{msg}; note 「{title}」")),
+            other => other,
+        })?;
         store
             .set_note_content_by_server_id(&sid, &content)
             .map_err(|e| SyncError::Unconnected(e.to_string()))?;
@@ -1018,8 +1044,11 @@ pub fn incr_sync(
             }
             // JS reloads content for updated notes; here only notes still
             // missing one (new rows land with Content='') get filled.
-            for sid in store.note_server_ids_needing_content().map_err(db_err)? {
-                let content = api.get_note_content(&sid)?;
+            for (sid, title) in store.notes_needing_content().map_err(db_err)? {
+                let content = api.get_note_content(&sid).map_err(|e| match e {
+                    SyncError::Api(msg) => SyncError::Api(format!("{msg}; note 「{title}」")),
+                    other => other,
+                })?;
                 store
                     .set_note_content_by_server_id(&sid, &content)
                     .map_err(db_err)?;
@@ -1469,12 +1498,12 @@ impl Store {
     }
 
     /// Server note ids whose local row still has no content.
-    pub fn note_server_ids_needing_content(&self) -> rusqlite::Result<Vec<String>> {
+    pub fn notes_needing_content(&self) -> rusqlite::Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT ServerNoteId FROM notes
+            "SELECT ServerNoteId, Title FROM notes
              WHERE ServerNoteId IS NOT NULL AND Content='' AND LocalIsDelete=0",
         )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect()
     }
 
