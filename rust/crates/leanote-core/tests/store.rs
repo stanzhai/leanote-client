@@ -233,11 +233,23 @@ fn convert_to_markdown_rewrites_content_flags_dirty() {
 
 #[test]
 fn filtered_queries_return_right_sets() {
-    let s = store("browse");
+    let dir = tmpdir_live("browse");
+    let s = Store::open(dir.clone(), "user1".to_string()).unwrap();
     let a = add(&s, "A", "c", &["rust"], "Inbox");
     let b = add(&s, "B", "c", &["rust", "gpui"], "Work");
     add(&s, "C", "c", &["design"], "Work");
-    // newest-first ordering (B then A, by UpdatedTime tie → rowid)
+    // list order is UpdatedTime DESC, rowid ASC. Three inserts inside one
+    // wall-clock millisecond tie and then fall to rowid, so the order below
+    // would be machine-dependent. Pin distinct times directly (same direct-
+    // SQL pattern as trash_and_deleted_notes_are_hidden).
+    let db = rusqlite::Connection::open(dir.join("leanote.db")).unwrap();
+    db.execute("UPDATE notes SET UpdatedTime=1000 WHERE Title='A'", [])
+        .unwrap();
+    db.execute("UPDATE notes SET UpdatedTime=2000 WHERE Title='B'", [])
+        .unwrap();
+    db.execute("UPDATE notes SET UpdatedTime=3000 WHERE Title='C'", [])
+        .unwrap();
+    drop(db);
     let all: Vec<String> = s
         .list_notes()
         .unwrap()

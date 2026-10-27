@@ -10,7 +10,10 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $Root = (Resolve-Path "$PSScriptRoot/../..").Path
+# makensis resolves .nsi paths relative to the .nsi file's own directory, so
+# every path baked into it must be absolute (CI passes ../dist from rust/).
 if (-not $OutDir) { $OutDir = Join-Path $Root 'dist' }
+elseif (-not [System.IO.Path]::IsPathRooted($OutDir)) { $OutDir = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $OutDir)) }
 if (-not $Version) {
     $cargoToml = Get-Content (Join-Path $Root 'rust/Cargo.toml') -Raw
     if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') { $Version = $Matches[1] }
@@ -105,7 +108,19 @@ SectionEnd
     Replace('!!STAGING!!', $Staging).
     Replace('!!ICON!!', $IconIco) | Set-Content -Path $Nsi -Encoding UTF8
 
-& makensis $Nsi | Out-Null
+# NSIS is on the runner images but not always on PATH (windows-11-arm);
+# fall back to the standard install location.
+$Makensis = Get-Command makensis -ErrorAction SilentlyContinue
+if (-not $Makensis) {
+    $cand = @(
+        "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+        "$env:ProgramFiles\NSIS\makensis.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $cand) { throw "makensis not found on PATH or in standard NSIS locations" }
+    $Makensis = $cand
+}
+
+& $Makensis $Nsi | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
 
 Write-Host "done:"
