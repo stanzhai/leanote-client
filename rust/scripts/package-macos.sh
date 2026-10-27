@@ -17,7 +17,7 @@ OUT=${2:-"$ROOT/dist"}
 VERSION=${3:-$(grep -A1 '^version' "$ROOT/rust/Cargo.toml" | grep -m1 '"' | sed 's/.*"\(.*\)".*/\1/')}
 TARGET="$ARCH-apple-darwin"
 APP_NAME=Leanote
-BUNDLE_ID=site.stanzhai.leanote
+BUNDLE_ID=site.stanzhai.leanote.client
 APP="$OUT/$APP_NAME.app"
 DMG="$OUT/Leanote_${VERSION}_macos_${ARCH}.dmg"
 

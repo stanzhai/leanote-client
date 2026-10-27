@@ -50,7 +50,7 @@ EOF
 cat > "$APPDIR/leanote.appdata.xml" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>site.stanzhai.leanote</id>
+  <id>site.stanzhai.leanote.client</id>
   <name>Leanote</name>
   <summary>Leanote note-taking desktop client</summary>
   <metadata_license>MIT</metadata_license>
