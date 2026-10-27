@@ -148,6 +148,13 @@ pub fn editor_font_px(size_pref: &str) -> f32 {
     }
 }
 
+/// Preview body text size (px): the editor font pref + UI zoom — note
+/// content views (reader/preview) share the editor's size, unlike app
+/// chrome which stays at 14px × zoom.
+pub fn preview_font_px(size_pref: &str, zoom: f32) -> f32 {
+    editor_font_px(size_pref) * zoom
+}
+
 /// Zoom-scaled UI length (UI round 12): the kit Root plugin stamps the
 /// window's rem from `theme.font_size` (= 14px × zoom), so a value expressed
 /// as a fraction of that rem scales with the zoom pref. All app-chrome

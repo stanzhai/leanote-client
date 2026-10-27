@@ -8,7 +8,6 @@ use crate::i18n::{self, Lang};
 use crate::theme::{self, Material};
 use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::base::Scrollbar;
-use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
 use gpui_kit::component::input::{
@@ -25,6 +24,7 @@ use gpui_kit::component::text::TextView;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, InteractiveElementExt, Sizable, WindowExt as _,
 };
+use gpui_kit::div;
 use gpui_kit::prelude::*;
 use gpui_kit::{
     px, rems, AnyElement, KeyDownEvent, MouseButton, SharedString, Task, UniformListScrollHandle,
@@ -63,12 +63,22 @@ pub enum Phase {
         done: usize,
         total: usize,
     },
+    /// Full sync finished → summary card + "start" button → Shell.
+    SyncDone(Box<SyncSummary>),
     /// Sync done → three-pane shell.
     Shell,
     /// Login or sync failed → back to login with an error line.
     Failed {
         error: SharedString,
     },
+}
+
+pub(crate) struct SyncSummary {
+    notebooks: usize,
+    notes: usize,
+    contents: usize,
+    tags: usize,
+    content_failures: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -480,9 +490,15 @@ impl AppShell {
             };
             let _ = this.update(cx, |shell, cx| {
                 match result {
-                    Ok((user_id, _stats)) => {
+                    Ok((user_id, stats)) => {
                         shell.user_id = user_id;
-                        shell.phase = Phase::Shell;
+                        shell.phase = Phase::SyncDone(Box::new(SyncSummary {
+                            notebooks: stats.notebooks,
+                            notes: stats.notes,
+                            contents: stats.contents,
+                            tags: stats.tags,
+                            content_failures: stats.content_failures.len(),
+                        }));
                         shell.invalidate_lists();
                     }
                     Err(e) => {
@@ -1684,6 +1700,25 @@ impl AppShell {
         });
     }
 
+    /// Regular confirm dialog (Cancel / Log out) for both logout entries.
+    fn logout_confirm_dialog(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        let shell = cx.entity();
+        let lang = self.lang;
+        window.open_alert_dialog(cx, move |alert, _window, _cx| {
+            let shell_ok = shell.clone();
+            alert
+                .title(i18n::t(lang, i18n::Key::LogoutConfirmTitle))
+                .description(i18n::t(lang, i18n::Key::LogoutConfirmBody))
+                .show_cancel(true)
+                .ok_text(i18n::t(lang, i18n::Key::Logout))
+                .cancel_text(i18n::t(lang, i18n::Key::Cancel))
+                .on_ok(move |_ev, _window, cx| {
+                    let _ = shell_ok.update(cx, |this, cx| this.logout(cx));
+                    true
+                })
+        });
+    }
+
     fn begin_new_notebook(
         &mut self,
         parent: String,
@@ -1783,6 +1818,8 @@ impl AppShell {
         }
         self.nav_edit = None;
         self.invalidate_lists();
+        // Same as drop_notebook: reparenting is server-visible, sync now.
+        self.sync_now(cx);
         cx.notify();
     }
 
@@ -2065,7 +2102,6 @@ impl Render for AppShell {
         let lang = self.lang;
         let t = move |k: i18n::Key| i18n::t(lang, k);
         let base_bg = theme::material(Material::Base, dark);
-        let list_bg = theme::material(Material::List, dark);
 
         // Whole window: material[0] shows through the 44px transparent titlebar.
         let root = gpui_kit::base::v_flex()
@@ -2143,7 +2179,8 @@ impl Render for AppShell {
         // Issue 18: panes are user-resizable; widths persist (prefs).
         // The group wraps every phase's three children in panels so the
         // saved geometry applies from the login frame onward.
-        let widths = crate::prefs::Prefs::load(&self.data_dir).pane_widths;
+        let prefs = crate::prefs::Prefs::load(&self.data_dir);
+        let widths = prefs.pane_widths;
         let mut body = gpui_kit::component::h_resizable("main-panes").on_resize({
             let dir = self.data_dir.clone();
             move |state, _window, cx| {
@@ -2212,15 +2249,31 @@ impl Render for AppShell {
                         resizable_panel()
                             .size(px(widths.left.unwrap_or(LEFT_W)))
                             .size_range(px(LEFT_RANGE.0)..px(LEFT_RANGE.1))
-                            .child(gpui_kit::base::v_flex().h_full().w_full().bg(base_bg)),
+                            .visible(false),
                     )
                     .child(
                         resizable_panel()
                             .size(px(widths.mid.unwrap_or(MID_W)))
                             .size_range(px(MID_RANGE.0)..px(MID_RANGE.1))
-                            .child(gpui_kit::base::v_flex().h_full().w_full().bg(list_bg)),
+                            .visible(false),
                     )
                     .child(resizable_panel().child(render_syncing(dark, lines, *done, *total, &t)));
+            }
+            Phase::SyncDone(summary) => {
+                body = body
+                    .child(
+                        resizable_panel()
+                            .size(px(widths.left.unwrap_or(LEFT_W)))
+                            .size_range(px(LEFT_RANGE.0)..px(LEFT_RANGE.1))
+                            .visible(false),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size(px(widths.mid.unwrap_or(MID_W)))
+                            .size_range(px(MID_RANGE.0)..px(MID_RANGE.1))
+                            .visible(false),
+                    )
+                    .child(resizable_panel().child(render_sync_done(dark, summary, &t, cx)));
             }
             Phase::Shell { .. } if self.full_preview => {
                 // Issue 21 需求10: ⌘T full-window preview — the selected
@@ -2270,11 +2323,14 @@ impl Render for AppShell {
                         .store()
                         .map(|s| browse::resolve_note_images(&content, &s))
                         .unwrap_or(content);
+                    let preview_px =
+                        px(theme::preview_font_px(&prefs.editor_font_size, prefs.zoom));
                     let preview = gpui_kit::base::v_flex()
                         .id("full-preview")
                         .track_focus(&self.preview_focus)
                         .size_full()
                         .p(px(32.))
+                        .text_size(preview_px)
                         .child(
                             gpui_kit::base::h_flex().justify_end().child(
                                 Button::new("full-preview-close")
@@ -2613,6 +2669,66 @@ fn render_syncing(
         )
         .into_element()
 }
+
+/// Post-sync summary card: counts + optional content-failure warning +
+/// "Start now" button that flips Phase::SyncDone → Shell.
+fn render_sync_done(
+    dark: bool,
+    summary: &SyncSummary,
+    t: &dyn Fn(i18n::Key) -> &'static str,
+    cx: &mut gpui_kit::Context<AppShell>,
+) -> impl IntoElement {
+    let muted = theme::muted_foreground(dark);
+    let row = |k: i18n::Key, n: usize| {
+        gpui_kit::base::h_flex()
+            .justify_between()
+            .child(small_label(SharedString::from(t(k)), muted))
+            .child(Label::new(n.to_string()).text_color(theme::foreground(dark)))
+    };
+    let warning = if summary.content_failures > 0 {
+        Some(small_label(
+            SharedString::from(format!(
+                "{} {}",
+                summary.content_failures,
+                t(i18n::Key::SyncSummaryFailures)
+            )),
+            theme::accent(),
+        ))
+    } else {
+        None
+    };
+    let start = Button::new("sync-start")
+        .label(t(i18n::Key::SyncSummaryStart).to_owned())
+        .primary()
+        .w_full()
+        .on_click(cx.listener(|this, _ev, _window, cx| {
+            this.phase = Phase::Shell;
+            cx.notify();
+        }));
+    gpui_kit::base::v_flex()
+        .flex_1()
+        .h_full()
+        .bg(theme::material(Material::Background, dark))
+        .items_start()
+        .justify_center()
+        .child(
+            gpui_kit::base::v_flex()
+                .gap_3()
+                .w(theme::ui(360.))
+                .child(
+                    Label::new(t(i18n::Key::SyncDone))
+                        .text_size(theme::ui(22.))
+                        .text_color(theme::foreground(dark)),
+                )
+                .child(row(i18n::Key::SyncSummaryNotebooks, summary.notebooks))
+                .child(row(i18n::Key::SyncSummaryNotes, summary.notes))
+                .child(row(i18n::Key::SyncSummaryContents, summary.contents))
+                .child(row(i18n::Key::SyncSummaryTags, summary.tags))
+                .children(warning)
+                .child(start),
+        )
+        .into_element()
+}
 /// One clickable nav row; `id` doubles as the element id.
 fn nav_row(
     shell: &gpui_kit::WeakEntity<AppShell>,
@@ -2720,7 +2836,11 @@ impl AppShell {
                 cx.notify();
             }))
             .child(Icon::new(IconName::ChevronRight).xsmall().text_color(muted))
-            .child(Label::new(label).text_size(theme::ui(11.)).text_color(muted))
+            .child(
+                Label::new(label)
+                    .text_size(theme::ui(11.))
+                    .text_color(muted),
+            )
     }
 
     /// Left nav: identity area + All/Starred/Trash + Notebooks/Tags groups.
@@ -3251,33 +3371,13 @@ impl AppShell {
                                         let shell = shell.clone();
                                         menu.item(
                                             PopupMenuItem::new(i18n::t(lang, i18n::Key::Logout))
-                                                .on_click(move |_ev, window, cx| {
+                                                .on_click({
                                                     let shell = shell.clone();
-                                                    window.open_dialog(cx, move |d, _w, _cx| {
-                                                        d.w(px(360.)).child(
-                                                            Alert::warning(
-                                                                "logout-confirm",
-                                                                i18n::t(
-                                                                    lang,
-                                                                    i18n::Key::LogoutConfirmBody,
-                                                                ),
-                                                            )
-                                                            .title(i18n::t(
-                                                                lang,
-                                                                i18n::Key::LogoutConfirmTitle,
-                                                            ))
-                                                            .on_close({
-                                                                let shell = shell.clone();
-                                                                move |_e, window, cx| {
-                                                                    let _ = shell
-                                                                        .update(cx, |this, cx| {
-                                                                            this.logout(cx)
-                                                                        });
-                                                                    window.close_dialog(cx);
-                                                                }
-                                                            }),
-                                                        )
-                                                    });
+                                                    move |_ev, window, cx| {
+                                                        let _ = shell.update(cx, |this, cx| {
+                                                            this.logout_confirm_dialog(window, cx)
+                                                        });
+                                                    }
                                                 }),
                                         )
                                     }
@@ -3612,35 +3712,9 @@ impl AppShell {
                                     .outline()
                                     .on_click({
                                         let shell = shell_c.clone();
-                                        let lang_now = shell.read(cx).lang;
                                         move |_ev, window, cx| {
-                                            let shell = shell.clone();
-                                            window.open_dialog(cx, move |d, _w, _cx| {
-                                                d.w(px(360.)).child(
-                                                    Alert::warning(
-                                                        "logout-confirm",
-                                                        i18n::t(
-                                                            lang_now,
-                                                            i18n::Key::LogoutConfirmBody,
-                                                        ),
-                                                    )
-                                                    .title(i18n::t(
-                                                        lang_now,
-                                                        i18n::Key::LogoutConfirmTitle,
-                                                    ))
-                                                    .on_close({
-                                                        let shell = shell.clone();
-                                                        move |_e, window, cx| {
-                                                            let _ = shell.update(cx, |this, cx| {
-                                                                this.logout(cx)
-                                                            });
-                                                            // Pop the confirm, then the
-                                                            // settings dialog beneath it.
-                                                            window.close_dialog(cx);
-                                                            window.close_dialog(cx);
-                                                        }
-                                                    }),
-                                                )
+                                            let _ = shell.update(cx, |this, cx| {
+                                                this.logout_confirm_dialog(window, cx)
                                             });
                                         }
                                     }),
@@ -3748,6 +3822,8 @@ impl AppShell {
         let lang = self.lang;
         let t = move |k: i18n::Key| i18n::t(lang, k);
         let shell = cx.entity();
+        let prefs = crate::prefs::Prefs::load(&self.data_dir);
+        let preview_px = px(theme::preview_font_px(&prefs.editor_font_size, prefs.zoom));
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let shell_c = shell.clone();
             let src = browse::reader_markdown_src(&title, &content, true);
@@ -3755,9 +3831,11 @@ impl AppShell {
                 .w(px(560.))
                 .title(t(i18n::Key::History))
                 .child(
-                    TextView::markdown("history-preview", src)
-                        .scrollable(true)
-                        .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
+                    div().text_size(preview_px).child(
+                        TextView::markdown("history-preview", src)
+                            .scrollable(true)
+                            .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
+                    ),
                 )
                 .child(
                     Button::new("history-restore")
@@ -3781,14 +3859,16 @@ impl AppShell {
     fn open_md_help(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
         let lang = self.lang;
         let t = move |k: i18n::Key| i18n::t(lang, k);
+        let prefs = crate::prefs::Prefs::load(&self.data_dir);
+        let preview_px = px(theme::preview_font_px(&prefs.editor_font_size, prefs.zoom));
         window.open_dialog(cx, move |dialog, _window, _cx| {
             dialog
                 .w(px(440.))
                 .title(t(i18n::Key::MarkdownHelpTitle))
-                .child(TextView::markdown(
+                .child(div().text_size(preview_px).child(TextView::markdown(
                     "md-help",
                     browse::reader_markdown_src("", i18n::markdown_help_body(lang), true),
-                ))
+                )))
         });
     }
 
@@ -4143,6 +4223,9 @@ impl AppShell {
         }
         self.notebook_drag_target = None;
         self.invalidate_lists();
+        // Reorder is server-visible state (Seq/ParentNotebookId push) — sync
+        // right away instead of waiting for the manual cloud button.
+        self.sync_now(cx);
         cx.notify();
     }
 
@@ -4240,7 +4323,11 @@ impl AppShell {
             .when_some(icon, |el, icon| {
                 el.child(Icon::new(icon).small().text_color(muted))
             })
-            .child(Label::new(title.clone()).text_size(theme::ui(14.)).text_color(fg))
+            .child(
+                Label::new(title.clone())
+                    .text_size(theme::ui(14.))
+                    .text_color(fg),
+            )
             .child(gpui_kit::base::h_flex().flex_1());
         match &self.nav {
             NavSelection::Notebook(_) => {
@@ -4421,6 +4508,7 @@ impl AppShell {
         window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) -> gpui_kit::Div {
+        let prefs = crate::prefs::Prefs::load(&self.data_dir);
         let muted = theme::muted_foreground(dark);
         let notebook_names = self.notebook_names().clone();
 
@@ -4574,10 +4662,12 @@ impl AppShell {
             .unwrap_or_else(|| n.content.clone());
         let src = browse::reader_markdown_src(&n.title, &content, n.is_markdown);
 
-        let mut col = gpui_kit::base::v_flex().px(px(5.)).gap_2().min_h_0();
-        if let Some(bar) = bar {
-            col = col.child(bar);
-        }
+        let preview_px = px(theme::preview_font_px(&prefs.editor_font_size, prefs.zoom));
+        let mut col = gpui_kit::base::v_flex()
+            .px(px(5.))
+            .gap_2()
+            .min_h_0()
+            .text_size(preview_px);
         col = col
             .child(
                 gpui_kit::base::h_flex()
@@ -4774,12 +4864,17 @@ impl AppShell {
         let body = if preview {
             let src = content_entity.read(cx).value().to_string();
             let title_txt = title_entity.read(cx).value().to_string();
+            let prefs = crate::prefs::Prefs::load(&self.data_dir);
             gpui_kit::base::v_flex()
                 .min_h_0()
                 .flex_1()
                 // Issue 23 #7: 10px side margins (editor-internal preview;
                 // the ⌘T full-window preview keeps its 32px frame).
                 .px(px(10.))
+                .text_size(px(theme::preview_font_px(
+                    &prefs.editor_font_size,
+                    prefs.zoom,
+                )))
                 .child(
                     TextView::markdown(
                         "editor-preview",

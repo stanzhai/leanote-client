@@ -16,7 +16,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use leanote_core::{Id, NewNote, NoteUpdate, Store};
+use leanote_core::{NewNote, NoteUpdate, Store};
 use serde_json::{Map, Value};
 use std::sync::{Arc, Mutex};
 
@@ -107,7 +107,10 @@ pub(crate) fn json_response(status: StatusCode, body: String) -> Response {
 fn fail(status: StatusCode, error: &str) -> (StatusCode, String) {
     (
         status,
-        format!(r#"{{"success":false,"error":{}}}"#, Value::String(error.to_string())),
+        format!(
+            r#"{{"success":false,"error":{}}}"#,
+            Value::String(error.to_string())
+        ),
     )
 }
 
@@ -150,7 +153,7 @@ pub(crate) fn api_dispatch(store: &Store, method: Method, path: &str, body: Byte
 
 /// JS `if (!data.title)` — absent/null/empty-string reject; any other JSON
 /// type is truthy and coerces to string (clients only send strings anyway).
-fn required_string(obj: &Map<String, Value>, key: &str, err: &str) -> Option<String> {
+fn required_string(obj: &Map<String, Value>, key: &str) -> Option<String> {
     match obj.get(key) {
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
         _ => None,
@@ -179,10 +182,10 @@ fn tags_value(v: Option<&Value>) -> Option<Vec<String>> {
 fn handle_add_note(store: &Store, data: &Value) -> (StatusCode, String) {
     let empty = Map::new();
     let obj = data.as_object().unwrap_or(&empty);
-    let Some(title) = required_string(obj, "title", "title is required") else {
+    let Some(title) = required_string(obj, "title") else {
         return fail(StatusCode::BAD_REQUEST, "title is required");
     };
-    let Some(content) = required_string(obj, "content", "content is required") else {
+    let Some(content) = required_string(obj, "content") else {
         return fail(StatusCode::BAD_REQUEST, "content is required");
     };
     let notebook = match obj.get("notebook") {
@@ -206,7 +209,7 @@ fn handle_add_note(store: &Store, data: &Value) -> (StatusCode, String) {
 fn handle_update_note(store: &Store, data: &Value) -> (StatusCode, String) {
     let empty = Map::new();
     let obj = data.as_object().unwrap_or(&empty);
-    let Some(note_id) = required_string(obj, "noteId", "noteId is required") else {
+    let Some(note_id) = required_string(obj, "noteId") else {
         return fail(StatusCode::BAD_REQUEST, "noteId is required");
     };
 
@@ -223,7 +226,10 @@ fn handle_update_note(store: &Store, data: &Value) -> (StatusCode, String) {
         tags: tags_value(obj.get("tags")),
         // JS assigns note.NotebookId when the title matches, but
         // updateNoteOrContent never persists it — accepted, ignored.
-        notebook_title: obj.get("notebook").and_then(Value::as_str).map(str::to_string),
+        notebook_title: obj
+            .get("notebook")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     };
     match store.update_note(&full_id, upd) {
         Ok(Some(n)) => ok_note(&n.note_id.to_string()),

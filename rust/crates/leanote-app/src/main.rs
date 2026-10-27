@@ -20,6 +20,7 @@ mod window_state;
 
 use app_shell::AppShell;
 use gpui_base::input::set_language_config;
+use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::input::language_config::LanguageConfig;
 use gpui_kit::component::Theme;
 use gpui_kit::{px, AppContext as _, TitlebarOptions, WindowOptions};
@@ -484,10 +485,17 @@ pub(crate) fn apply_wake_theme(
     theme.mono_font_family = theme::sans_for(font_pref).into();
     theme.mono_font_size = px(theme::editor_font_px(editor_size) * zoom);
     theme.shadow = false; // ADR-0003: zero shadow on persistent UI
-                          // Issue 17: editor palette ("" = keep the kit default highlight theme).
-    if !palette_id.is_empty() {
-        theme.highlight_theme = theme::editor_palette(palette_id, dark);
-    }
+                          // Issue 17: editor palette; `""` = kit default (must RESET — skipping
+                          // the write left a previously-picked palette live until restart).
+    theme.highlight_theme = if palette_id.is_empty() {
+        if dark {
+            HighlightTheme::default_dark()
+        } else {
+            HighlightTheme::default_light()
+        }
+    } else {
+        theme::editor_palette(palette_id, dark)
+    };
 }
 
 #[cfg(test)]

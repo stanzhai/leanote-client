@@ -9,6 +9,7 @@
 - **全量同步 (Full Sync)** — 从 USN −1 拉齐 notebooks→notes→tags 的过程。
 - **增量同步 (Incr Sync)** — 对比服务器 USN 与本地 `LastSyncUsn`，先拉 delta 再推送本地脏数据（push）。
 - **脏标记 (Dirty flags)** — `IsDirty`（内容已改待推）、`LocalIsNew`/`IsNew`（本地新建未上服务器）、`IsDeleted`（标记删除待推）。服务端确认后清除。
+- **同步摘要 (Sync summary)** — 登录后首同步完成的界面摘要卡：笔记本/笔记/笔记内容/标签四行计数 + 可选失败警示行 + 「即刻开始」进入主界面。内容拉取失败不中断同步（计入 `SyncStats.content_failures`），失败笔记保 `Content=''`+`ServerNoteId`，下次同步经 `notes_needing_content` 自动重试。
 - **冲突 (Conflict)** — 本地与服务器对同一条目都有未对齐修改的状态；产品语义是**呈现冲突并人工裁决**，绝不静默覆盖。
 - **服务端 ID 映射 (Server ID mapping)** — 本地 `NotebookId/NoteId` 与 `ServerNotebookId/ServerNoteId` 的对应关系；本地新建条目在首次推送前没有服务端 ID。
 

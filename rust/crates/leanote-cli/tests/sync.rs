@@ -1037,7 +1037,13 @@ async fn notebook_ops_push_add_update_delete_with_seq() {
         .iter()
         .find(|p| p.fields["title"] == json!("Work-sub"))
         .unwrap();
-    assert_eq!(sub_push.fields["seq"].as_str().unwrap_or("0"), "0");
+    // Issue 0 regression: the hierarchy must travel — child's parent is
+    // the parent's SERVER id ("nb2" here is the synced server id of Work2).
+    let sub_parent = sub_push.fields["parentNotebookId"].as_str().unwrap_or("");
+    assert!(
+        !sub_parent.is_empty(),
+        "child push carries parent server id"
+    );
     // update pushed for every rewritten root sibling (nb1, nb3); Work2 was
     // LocalIsNew so it travels as addNotebook, not updateNotebook
     let ups: Vec<&leanote_fakeserver::RecordedPush> = pushes
@@ -1073,6 +1079,65 @@ async fn notebook_ops_push_add_update_delete_with_seq() {
             .collect::<Vec<_>>()
     );
     assert!(s.list_trash().unwrap().is_empty(), "no notes lived in Work");
+}
+
+/// Issue 0 regression: local parent+child notebooks push parent-first and
+/// the child's parentNotebookId is the PARENT's server id (JS
+/// getServerNotebookIdByNotebookId), never "" — hierarchy survives push.
+#[tokio::test(flavor = "multi_thread")]
+async fn notebook_hierarchy_pushes_parent_server_id_parent_first() {
+    let (srv, _dir, s, api) = synced("nb_hierarchy").await;
+    let parent = s.create_notebook("Parent", "").unwrap();
+    let child = s.create_notebook("Child", &parent.notebook_id).unwrap();
+
+    srv.clear_pushes();
+    incr_sync(&api, &s, &NoProgress).unwrap();
+
+    let pushes = srv.pushes();
+    let adds: Vec<&leanote_fakeserver::RecordedPush> = pushes
+        .iter()
+        .filter(|p| p.endpoint == "notebook/addNotebook")
+        .collect();
+    let child_push = adds
+        .iter()
+        .find(|p| p.fields["title"] == json!("Child"))
+        .expect("child addNotebook");
+    // The fake server assigns the parent a fresh server id ("srvnb…") and
+    // the child must carry THAT id, not "" nor the local parent id.
+    let parent_local = parent.notebook_id.0.clone();
+    let child_parent = child_push.fields["parentNotebookId"].as_str().unwrap_or("");
+    assert!(
+        !child_parent.is_empty() && child_parent != parent_local,
+        "child carries the parent's SERVER id (got {child_parent:?}, local parent {parent_local:?})"
+    );
+    // Cross-check via the store mapping: after push the parent row holds
+    // the server-assigned id; the child must reference exactly that.
+    let parent_sid = s
+        .notebook_server_id(&parent.notebook_id.0)
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(child_parent, parent_sid, "server id mapping matches");
+    // Parent-first: the parent's addNotebook precedes the child's.
+    let parent_ix = pushes
+        .iter()
+        .position(|p| p.endpoint == "notebook/addNotebook" && p.fields["title"] == json!("Parent"))
+        .expect("parent push index");
+    let child_ix = pushes
+        .iter()
+        .position(|p| p.endpoint == "notebook/addNotebook" && p.fields["title"] == json!("Child"))
+        .expect("child push index");
+    assert!(parent_ix < child_ix, "parent pushed before child");
+    // Local mapping intact after push.
+    let stored_child = s
+        .notebooks()
+        .unwrap()
+        .into_iter()
+        .find(|nb| nb.notebook_id == child.notebook_id)
+        .unwrap();
+    assert_eq!(
+        stored_child.parent_notebook_id, parent.notebook_id.0,
+        "local parent link unchanged"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1260,11 +1325,11 @@ async fn server_400_on_push_names_form_fields() {
     assert!(err.contains("body: notebook not found"), "body: {err}");
 }
 
-// ---- issue 29: note-level context in sync errors ----
+// ---- issue 29: note-level context in content-fetch failures ----
 
-/// A 200 `{Ok:false}` from getNoteContent must name the endpoint, the
-/// noteId param, AND the local note title — the user's actual question is
-/// "which note is broken".
+/// A failed getNoteContent must NOT abort the sync: the note keeps its
+/// server id with empty content (auto-retried next sync) and the failure is
+/// reported with endpoint + noteId + local note title.
 #[tokio::test(flavor = "multi_thread")]
 async fn content_fetch_error_names_note() {
     let (srv, _dir, s, api) = synced("note_ctx_200").await;
@@ -1276,10 +1341,9 @@ async fn content_fetch_error_names_note() {
     // Wipe local content for that note so the sync refetches it.
     s.set_note_content_by_server_id("note0100", "").unwrap();
 
-    let err = match incr_sync(&api, &s, &NoProgress) {
-        Err(e) => e.to_string(),
-        Ok(_) => panic!("expected failure"),
-    };
+    let stats = incr_sync(&api, &s, &NoProgress).expect("sync must survive the failure");
+    assert_eq!(stats.content_failures.len(), 1, "one recorded failure");
+    let err = &stats.content_failures[0];
     assert!(
         err.contains("api/note/getNoteContent") && err.contains("noteId=note0100"),
         "endpoint+param: {err}"
@@ -1287,6 +1351,8 @@ async fn content_fetch_error_names_note() {
     assert!(err.contains("notExists"), "server msg: {err}");
     assert!(err.contains("Note 100"), "note title: {err}");
     assert!(!err.contains(&srv.token()), "token must not leak: {err}");
+    // USN advanced: the failure did not block the pull completion.
+    assert_eq!(s.last_sync_usn().unwrap(), 1002, "last sync usn advanced");
 }
 
 /// Same contract when the server answers 500 (both error paths carry the note).
@@ -1297,10 +1363,9 @@ async fn content_fetch_500_names_note() {
     srv.set_sync_usn(1002);
     srv.inject_status("getNoteContent", 500, "db down");
 
-    let err = match incr_sync(&api, &s, &NoProgress) {
-        Err(e) => e.to_string(),
-        Ok(_) => panic!("expected failure"),
-    };
+    let stats = incr_sync(&api, &s, &NoProgress).expect("sync must survive the failure");
+    assert_eq!(stats.content_failures.len(), 1, "one recorded failure");
+    let err = &stats.content_failures[0];
     assert!(
         err.contains("api/note/getNoteContent") && err.contains("noteId=note0100"),
         "endpoint+param: {err}"

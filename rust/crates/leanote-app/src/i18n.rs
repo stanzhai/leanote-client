@@ -52,6 +52,15 @@ keys! {
     SyncingTitle => ("正在全量同步", "Full sync in progress"),
     SyncingSubtitle => ("正在拉取您的笔记本、笔记与标签", "Pulling your notebooks, notes and tags"),
     SyncDone => ("同步完成", "Sync complete"),
+    SyncSummaryStart => ("即刻开始", "Start now"),
+    SyncSummaryNotebooks => ("笔记本", "Notebooks"),
+    SyncSummaryNotes => ("笔记", "Notes"),
+    SyncSummaryContents => ("笔记内容", "Note contents"),
+    SyncSummaryTags => ("标签", "Tags"),
+    SyncSummaryFailures => (
+        "篇笔记内容拉取失败，已记录，下次同步自动重试",
+        "note contents failed; recorded and retried next sync"
+    ),
     SyncFailed => ("同步失败", "Sync failed"),
     // Shell: left nav (ADR-0003).
     NavRecent => ("最近", "Recent"),
@@ -186,8 +195,8 @@ keys! {
     // Issue 17: logout confirmation.
     LogoutConfirmTitle => ("退出登录？", "Log out?"),
     LogoutConfirmBody => (
-        "退出后将清除本地数据，需要重新登录。",
-        "Local data is cleared; you will need to sign in again."
+        "本地缓存将保留，重新登录后会重新同步。",
+        "Local cache is kept; signing back in will re-sync."
     ),
 }
 
@@ -260,6 +269,12 @@ mod tests {
         Key::SyncingTitle,
         Key::SyncingSubtitle,
         Key::SyncDone,
+        Key::SyncSummaryStart,
+        Key::SyncSummaryNotebooks,
+        Key::SyncSummaryNotes,
+        Key::SyncSummaryContents,
+        Key::SyncSummaryTags,
+        Key::SyncSummaryFailures,
         Key::SyncFailed,
         Key::NavRecent,
         Key::NavStarred,

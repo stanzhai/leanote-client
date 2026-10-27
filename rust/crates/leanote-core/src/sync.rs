@@ -762,12 +762,16 @@ pub struct SyncStats {
     pub notes: usize,
     pub contents: usize,
     pub tags: usize,
+    /// Notes whose content fetch failed; kept with `Content=''` so
+    /// `notes_needing_content` retries them next sync (never aborts sync).
+    pub content_failures: Vec<String>,
 }
 
 /// A dirty notebook row (JS `getDirtyNotebooks`).
 pub struct DirtyNotebook {
     pub notebook_id: String,
     pub title: String,
+    pub parent_notebook_id: String,
     pub seq: i64,
     pub usn: i64,
     pub server_id: Option<String>,
@@ -819,6 +823,7 @@ pub fn full_sync(
         notes: 0,
         contents: 0,
         tags: 0,
+        content_failures: Vec::new(),
     };
     let now = now_ms();
 
@@ -859,15 +864,23 @@ pub fn full_sync(
     let total = server_notes.len();
     for (done, (sid, title)) in server_notes.into_iter().enumerate() {
         progress.tick(done, total);
-        let content = api.get_note_content(&sid).map_err(|e| match e {
-            SyncError::Api(msg) => SyncError::Api(format!("{msg}; note 「{title}」")),
-            other => other,
-        })?;
-        store
-            .set_note_content_by_server_id(&sid, &content)
-            .map_err(|e| SyncError::Unconnected(e.to_string()))?;
-        stats.contents += 1;
-        progress.note(format!("content: {sid}"));
+        match api.get_note_content(&sid) {
+            Ok(content) => {
+                store
+                    .set_note_content_by_server_id(&sid, &content)
+                    .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+                stats.contents += 1;
+                progress.note(format!("content: {sid}"));
+            }
+            Err(e) => {
+                let msg = match e {
+                    SyncError::Api(msg) => format!("{msg}; note 「{title}」"),
+                    other => other.to_string(),
+                };
+                progress.note(format!("content failed: {msg}"));
+                stats.content_failures.push(msg);
+            }
+        }
     }
     progress.tick(total, total);
 
@@ -992,6 +1005,7 @@ pub fn incr_sync(
         notes: 0,
         contents: 0,
         tags: 0,
+        content_failures: Vec::new(),
     };
     let mut again = false; // first round pushes; re-rounds only pull
     for _round in 0..5 {
@@ -1045,14 +1059,22 @@ pub fn incr_sync(
             // JS reloads content for updated notes; here only notes still
             // missing one (new rows land with Content='') get filled.
             for (sid, title) in store.notes_needing_content().map_err(db_err)? {
-                let content = api.get_note_content(&sid).map_err(|e| match e {
-                    SyncError::Api(msg) => SyncError::Api(format!("{msg}; note 「{title}」")),
-                    other => other,
-                })?;
-                store
-                    .set_note_content_by_server_id(&sid, &content)
-                    .map_err(db_err)?;
-                stats.contents += 1;
+                match api.get_note_content(&sid) {
+                    Ok(content) => {
+                        store
+                            .set_note_content_by_server_id(&sid, &content)
+                            .map_err(db_err)?;
+                        stats.contents += 1;
+                    }
+                    Err(e) => {
+                        let msg = match e {
+                            SyncError::Api(msg) => format!("{msg}; note 「{title}」"),
+                            other => other.to_string(),
+                        };
+                        progress.note(format!("content failed: {msg}"));
+                        stats.content_failures.push(msg);
+                    }
+                }
             }
             store
                 .set_last_sync_usn(api.get_sync_state()?)
@@ -1082,15 +1104,43 @@ fn push_dirty_notebooks(
     need_again: &mut bool,
     _stats: &mut SyncStats,
 ) -> Result<(), SyncError> {
-    for nb in store.dirty_notebooks().map_err(db_err)? {
+    // JS pushes parents before children (getDirtyNotebooks DFS): depth of
+    // each notebook in the parent chain (dirty subset), then sort by it.
+    let dirty = store.dirty_notebooks().map_err(db_err)?;
+    let depth_of = |nb: &DirtyNotebook, all: &[DirtyNotebook]| {
+        let mut depth = 0usize;
+        let mut cur = nb.parent_notebook_id.as_str();
+        while !cur.is_empty() && depth <= all.len() {
+            match all.iter().find(|o| o.notebook_id == cur) {
+                Some(p) => cur = p.parent_notebook_id.as_str(),
+                None => break,
+            }
+            depth += 1;
+        }
+        depth
+    };
+    let depths: Vec<usize> = dirty.iter().map(|nb| depth_of(nb, &dirty)).collect();
+    let mut paired: Vec<(usize, DirtyNotebook)> = depths.into_iter().zip(dirty).collect();
+    paired.sort_by_key(|(d, _)| *d);
+    let dirty: Vec<DirtyNotebook> = paired.into_iter().map(|(_, nb)| nb).collect();
+    for nb in dirty {
         let server_id = nb.server_id.clone();
+        // JS maps local parent id → server parent id (`""` for root).
+        let parent_server = if nb.parent_notebook_id.is_empty() {
+            String::new()
+        } else {
+            store
+                .notebook_server_id(&nb.parent_notebook_id)
+                .map_err(db_err)?
+                .unwrap_or_default()
+        };
         let ret = if nb.is_new && nb.is_deleted {
             store
                 .notebook_delete_local(&nb.notebook_id)
                 .map_err(db_err)?;
             continue;
         } else if nb.is_new {
-            api.add_notebook(&nb.title, nb.seq, "")?
+            api.add_notebook(&nb.title, nb.seq, &parent_server)?
         } else if nb.is_deleted {
             api.delete_notebook(server_id.as_deref().unwrap_or(""), nb.usn)?
         } else {
@@ -1099,7 +1149,7 @@ fn push_dirty_notebooks(
                 &nb.title,
                 nb.usn,
                 nb.seq,
-                "",
+                &parent_server,
             )?
         };
 
@@ -1576,7 +1626,7 @@ impl Store {
 
     pub fn dirty_notebooks(&self) -> rusqlite::Result<Vec<DirtyNotebook>> {
         let mut stmt = self.conn.prepare(
-            "SELECT NotebookId, Title, Seq, Usn, ServerNotebookId,
+            "SELECT NotebookId, Title, ParentNotebookId, Seq, Usn, ServerNotebookId,
                     LocalIsNew, IsDirty, LocalIsDelete
              FROM notebooks WHERE UserId=?1 AND IsDirty=1 ORDER BY rowid",
         )?;
@@ -1584,12 +1634,13 @@ impl Store {
             Ok(DirtyNotebook {
                 notebook_id: r.get(0)?,
                 title: r.get(1)?,
-                seq: r.get(2)?,
-                usn: r.get(3)?,
-                server_id: r.get(4)?,
-                is_new: r.get::<_, i64>(5)? != 0,
-                is_dirty: r.get::<_, i64>(6)? != 0,
-                is_deleted: r.get::<_, i64>(7)? != 0,
+                parent_notebook_id: r.get(2)?,
+                seq: r.get(3)?,
+                usn: r.get(4)?,
+                server_id: r.get(5)?,
+                is_new: r.get::<_, i64>(6)? != 0,
+                is_dirty: r.get::<_, i64>(7)? != 0,
+                is_deleted: r.get::<_, i64>(8)? != 0,
             })
         })?;
         rows.collect()
