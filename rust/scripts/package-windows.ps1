@@ -1,7 +1,7 @@
 # Package Leanote for Windows: NSIS installer + portable zip.
 #
 # Usage: powershell -File rust/scripts/package-windows.ps1 [-Arch x64|arm64] [-OutDir dist] [-Version 1.2.3]
-# Requires on PATH: cargo, makensis (NSIS 3.10+ ships on windows-* GH runners).
+# Requires on PATH: cargo, makensis (CI installs NSIS via choco; see release.yml).
 param(
     [Parameter(Mandatory = $true)][ValidateSet('x64', 'arm64')][string]$Arch,
     [string]$OutDir = "",

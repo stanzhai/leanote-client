@@ -69,6 +69,13 @@ jobs:
           sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libx11-dev \
             libwayland-dev libfontconfig-dev libfreetype-dev patchelf
 
+      # windows-latest = Server 2025 image: NSIS was dropped from it (2022
+      # still ships it); arm image has it off-PATH. Install explicitly.
+      - name: Install NSIS (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install nsis -y --no-progress
+
       - name: Build and package
         shell: bash
         env:

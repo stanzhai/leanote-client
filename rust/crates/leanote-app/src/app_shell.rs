@@ -5977,7 +5977,7 @@ mod tests {
             .size
             .width;
 
-        cx.simulate_keystrokes("cmd-t");
+        cx.simulate_keystrokes("secondary-t");
         cx.update(|_, cx| {
             assert!(
                 shell_entity.read(cx).full_preview,
@@ -6068,7 +6068,7 @@ mod tests {
         // A wide "fullscreen" window: 1920 logical px.
         cx.simulate_resize(gpui_kit::size(gpui_kit::px(1920.), gpui_kit::px(1080.)));
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.simulate_keystrokes("cmd-t");
+        cx.simulate_keystrokes("secondary-t");
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let frame = cx.debug_bounds("full-preview").expect("preview rendered");
@@ -6254,7 +6254,8 @@ mod tests {
         let before = shell_entity
             .update(&mut cx, |shell, _cx| shell.visible_notes().clone())
             .len();
-        cx.simulate_keystrokes("cmd-n");
+        // "secondary" is the portable spelling: cmd on macOS, ctrl on Linux.
+        cx.simulate_keystrokes("secondary-n");
         cx.run_until_parked();
         let after = shell_entity
             .update(&mut cx, |shell, _cx| shell.visible_notes().clone())
@@ -6262,7 +6263,7 @@ mod tests {
         assert_eq!(before + 1, after, "⌘N must create a note");
 
         // ⌘, opens settings — a dialog on the window.
-        cx.simulate_keystrokes("cmd-,");
+        cx.simulate_keystrokes("secondary-,");
         cx.run_until_parked();
         assert!(
             cx.update(|window, cx| window.has_active_dialog(cx)),
