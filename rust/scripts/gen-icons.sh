@@ -8,7 +8,7 @@
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-SRC="$ROOT/logo.png"
+SRC="$ROOT/logo/logo.png"
 OUT="$ROOT/rust/packaging"
 WORK=$(mktemp -d /tmp/leanote-icons.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT

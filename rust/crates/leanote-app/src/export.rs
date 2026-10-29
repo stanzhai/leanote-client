@@ -127,7 +127,14 @@ pub fn note_to_html(note: &Note) -> String {
 
 /// One embedded file row, JS shape: `{fileId, base64, md5, type, isAttach,
 /// createdTime}` (+`title`, which the writer side reads).
-fn file_row(file_id: &str, base64: &str, md5: &str, file_type: &str, is_attach: bool, created: &str) -> Value {
+fn file_row(
+    file_id: &str,
+    base64: &str,
+    md5: &str,
+    file_type: &str,
+    is_attach: bool,
+    created: &str,
+) -> Value {
     json!({
         "fileId": file_id,
         "base64": base64,
@@ -234,12 +241,24 @@ pub fn base64_encode(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -248,20 +267,21 @@ pub fn base64_encode(data: &[u8]) -> String {
 /// implementation; correctness over speed (backups are not hot paths).
 pub fn md5_hex(data: &[u8]) -> String {
     const S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
-        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
     ];
     const K: [u32; 64] = [
-        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
-        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
-        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
     ];
     let mut msg = data.to_vec();
     let bit_len = (data.len() as u64).wrapping_mul(8);
@@ -293,10 +313,7 @@ pub fn md5_hex(data: &[u8]) -> String {
             let tmp = d;
             d = c;
             c = b;
-            let sum = a
-                .wrapping_add(f)
-                .wrapping_add(K[i])
-                .wrapping_add(m[g]);
+            let sum = a.wrapping_add(f).wrapping_add(K[i]).wrapping_add(m[g]);
             b = b.wrapping_add(sum.rotate_left(S[i]));
             a = tmp;
         }
@@ -305,7 +322,13 @@ pub fn md5_hex(data: &[u8]) -> String {
         c0 = c0.wrapping_add(c);
         d0 = d0.wrapping_add(d);
     }
-    let digest = [a0.to_le_bytes(), b0.to_le_bytes(), c0.to_le_bytes(), d0.to_le_bytes()].concat();
+    let digest = [
+        a0.to_le_bytes(),
+        b0.to_le_bytes(),
+        c0.to_le_bytes(),
+        d0.to_le_bytes(),
+    ]
+    .concat();
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -317,8 +340,32 @@ pub fn safe_filename(title: &str) -> String {
         .map(|c| {
             if matches!(
                 c,
-                '/' | '#' | '$' | '!' | '^' | '*' | '\'' | ' ' | '"' | '%' | '&' | '(' | ')' | '+'
-                    | ',' | ':' | ';' | '<' | '>' | '=' | '?' | '@' | '|' | '\\' | '\t' | '\n' | '\r'
+                '/' | '#'
+                    | '$'
+                    | '!'
+                    | '^'
+                    | '*'
+                    | '\''
+                    | ' '
+                    | '"'
+                    | '%'
+                    | '&'
+                    | '('
+                    | ')'
+                    | '+'
+                    | ','
+                    | ':'
+                    | ';'
+                    | '<'
+                    | '>'
+                    | '='
+                    | '?'
+                    | '@'
+                    | '|'
+                    | '\\'
+                    | '\t'
+                    | '\n'
+                    | '\r'
             ) {
                 '-'
             } else {
@@ -384,8 +431,14 @@ mod tests {
         assert!(html.contains("<table>"), "table not rendered");
         assert!(html.contains("<th>a</th>"), "table header not rendered");
         assert!(html.contains("<pre><code"), "code block not rendered");
-        assert!(html.contains("<a href=\"https://leanote.com\">"), "link not rendered");
-        assert!(html.contains("<title>T &amp; &lt;title&gt;</title>"), "title unescaped");
+        assert!(
+            html.contains("<a href=\"https://leanote.com\">"),
+            "link not rendered"
+        );
+        assert!(
+            html.contains("<title>T &amp; &lt;title&gt;</title>"),
+            "title unescaped"
+        );
         assert!(html.starts_with("<!DOCTYPE html>"));
         assert!(html.contains("max-width:780px"), "inline css missing");
     }
@@ -395,16 +448,33 @@ mod tests {
         let n = note("<p>hi</p><img src=\"http://s.example/api/file/getImage?fileId=5581029f6289dc3301000000\">", false);
         let html = note_to_html(&n);
         assert!(html.contains("<p>hi</p>"));
-        assert!(html.contains("src=\"http://s.example/api/file/getImage?fileId=5581029f6289dc3301000000\""));
+        assert!(html.contains(
+            "src=\"http://s.example/api/file/getImage?fileId=5581029f6289dc3301000000\""
+        ));
     }
 
     #[test]
     fn backup_note_matches_js_plugin_shape() {
-        let n = note("![i](leanote://file/getImage?fileId=5581029f6289dc3301000000)", true);
-        let files = vec![("5581029f6289dc3301000000".to_string(), vec![1u8, 2, 3], false)];
+        let n = note(
+            "![i](leanote://file/getImage?fileId=5581029f6289dc3301000000)",
+            true,
+        );
+        let files = vec![(
+            "5581029f6289dc3301000000".to_string(),
+            vec![1u8, 2, 3],
+            false,
+        )];
         let v = backup_note(&n, &files);
         // Field names the import plugin reads (parseNote/fixContentLink).
-        for k in ["title", "content", "tags", "isMarkdown", "createdTime", "updatedTime", "files"] {
+        for k in [
+            "title",
+            "content",
+            "tags",
+            "isMarkdown",
+            "createdTime",
+            "updatedTime",
+            "files",
+        ] {
             assert!(v.get(k).is_some(), "missing field {k}");
         }
         let f = &v["files"][0];
@@ -430,8 +500,14 @@ mod tests {
         ];
         let v = backup_note(&n, &files);
         let c = v["content"].as_str().unwrap();
-        assert!(c.contains("leanote://file/getImage?fileId=5581029f6289dc3301000000"), "image url not rewritten: {c}");
-        assert!(c.contains("leanote://file/getAttach?fileId=aabbccddeeff001122334455"), "attach url not rewritten");
+        assert!(
+            c.contains("leanote://file/getImage?fileId=5581029f6289dc3301000000"),
+            "image url not rewritten: {c}"
+        );
+        assert!(
+            c.contains("leanote://file/getAttach?fileId=aabbccddeeff001122334455"),
+            "attach url not rewritten"
+        );
         assert!(v["files"][1]["isAttach"].as_bool().unwrap());
     }
 
@@ -497,7 +573,11 @@ mod tests {
         let _md = note_to_markdown_file(&n);
         // Guard against pathological quadratic behavior: 100KB must render
         // in well under a second (typical: single-digit ms).
-        assert!(start.elapsed().as_millis() < 1_000, "html gen took {:?}", start.elapsed());
+        assert!(
+            start.elapsed().as_millis() < 1_000,
+            "html gen took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

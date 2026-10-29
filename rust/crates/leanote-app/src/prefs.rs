@@ -22,7 +22,10 @@ pub enum LangPref {
 pub struct Prefs {
     pub appearance: AppearancePref,
     pub lang: LangPref,
-    pub editor_palette: String, // "" = default (theme built-in)
+    /// ADR-0010: UI theme family id, "" = default. Legacy files carrying
+    /// `editor_palette` ("warm"/"solarized") migrate via the serde alias.
+    #[serde(default, alias = "editor_palette")]
+    pub ui_theme: String,
     // Issue 19: vim keys on by default; old prefs files default to true too
     // (field is `default = ...` so pre-existing files load without it).
     #[serde(default = "default_vim_true")]
@@ -38,8 +41,12 @@ pub struct Prefs {
     /// stored 1.25/1.5/1.6 — `load` clamps anything above 1.2 down to it.
     #[serde(default)]
     pub zoom: f32,
-    /// UI font id: "" = system default, "wenkai" = LXGW WenKai (needs the
-    /// ttf installed into ~/Library/Fonts — see fonts.rs).
+    /// Round 5: nav glass strength — "off" | "weak" | "medium" | "strong".
+    /// Old files default to "medium". Maps to alpha in theme_family.
+    #[serde(default = "default_glass")]
+    pub glass: String,
+    /// UI font id: "" = system default, "wenkai-mono" = LXGW WenKai Mono
+    /// (needs the ttf installed into ~/Library/Fonts — see fonts.rs).
     #[serde(default)]
     pub font: String,
     /// Editor font size id (UI round 12): "" = regular (14px),
@@ -58,13 +65,14 @@ impl Default for Prefs {
     fn default() -> Self {
         Self {
             appearance: AppearancePref::default(),
+            ui_theme: String::new(),
             lang: LangPref::default(),
-            editor_palette: String::new(),
             vim_default: true,
             recents: Vec::new(),
             pane_widths: PaneWidths::default(),
             accent: String::new(),
             zoom: 1.0,
+            glass: default_glass(),
             font: String::new(),
             editor_font_size: String::new(),
             editor_toolbar: false,
@@ -91,6 +99,9 @@ pub struct NavStatePref {
 
 fn default_vim_true() -> bool {
     true
+}
+fn default_glass() -> String {
+    "medium".into()
 }
 
 fn default_true() -> bool {
@@ -154,7 +165,7 @@ mod tests {
         let p = Prefs {
             appearance: AppearancePref::Dark,
             lang: LangPref::Zh,
-            editor_palette: "solarized".into(),
+            ui_theme: "solarized".into(),
             vim_default: true,
             recents: vec!["a".into()],
             pane_widths: PaneWidths {
@@ -163,7 +174,8 @@ mod tests {
             },
             accent: "purple".into(),
             zoom: 1.2,
-            font: "wenkai".into(),
+            glass: "weak".into(),
+            font: "wenkai-mono".into(),
             editor_font_size: "medium".into(),
             editor_toolbar: true,
             nav: NavStatePref {
@@ -188,6 +200,8 @@ mod tests {
         assert_eq!(old.pane_widths, PaneWidths::default());
         assert_eq!(old.accent, "");
         assert_eq!(old.nav, NavStatePref::default());
+        // Round 5: files predating the glass pref get "medium".
+        assert_eq!(old.glass, "medium");
         // UI round 10: legacy zoom steps (1.25/1.5/1.6) collapse to 1.2.
         // The JSON carries every non-defaulted field (editor_palette,
         // recents) — without them deserialization fails and falls to
@@ -207,6 +221,21 @@ mod tests {
         .unwrap();
         assert_eq!(Prefs::load(&dir).zoom, 1.1);
         assert!(!old.vim_default); // explicit false in file wins over default
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ADR-0010: old files say `editor_palette` — the serde alias must
+    /// load it into ui_theme (warm/solarized ids carried over verbatim).
+    #[test]
+    fn legacy_editor_palette_key_migrates() {
+        let dir = std::env::temp_dir().join(format!("lnprefs-mig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(FILE),
+            r#"{"appearance":"Follow","lang":"Follow","editor_palette":"warm","vim_default":true,"recents":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(Prefs::load(&dir).ui_theme, "warm");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

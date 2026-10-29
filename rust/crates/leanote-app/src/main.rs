@@ -15,12 +15,12 @@ mod prefs;
 mod search_overlay;
 mod single_instance;
 mod theme;
+mod theme_family;
 mod vim;
 mod window_state;
 
 use app_shell::AppShell;
 use gpui_base::input::set_language_config;
-use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::input::language_config::LanguageConfig;
 use gpui_kit::component::Theme;
 use gpui_kit::{px, AppContext as _, TitlebarOptions, WindowOptions};
@@ -283,12 +283,13 @@ fn main() {
                 // App-scope ⌘S sync / ⌘N new note. In the editor, ⌘S is
                 // captured earlier (save + sync) and never reaches these.
                 gpui_kit::KeyBinding::new("secondary-s", search_overlay::QuickSyncNow, None),
-                gpui_kit::KeyBinding::new("secondary-n", search_overlay::QuickNewNote, None),
             ]);
 
             let prefs = prefs::Prefs::load(&dir);
-            let pref_palette: std::sync::Arc<String> =
-                std::sync::Arc::new(prefs.editor_palette.clone());
+            // ADR-0010: family first — apply_wake_theme's material/fg/border
+            // reads go through CURRENT_FAMILY.
+            theme::set_family(&prefs.ui_theme);
+            let pref_palette: std::sync::Arc<String> = std::sync::Arc::new(prefs.ui_theme.clone());
             let palette_boot = pref_palette.clone();
 
             // Theme: follow system first (loads registered theme), then overlay
@@ -408,7 +409,7 @@ fn main() {
                         return;
                     }
                     Theme::sync_system_appearance(None, cx);
-                    let palette = p.editor_palette.clone();
+                    let palette = p.ui_theme.clone();
                     let font = p.font;
                     let editor_size = p.editor_font_size.clone();
                     let zoom = p.zoom;
@@ -500,7 +501,21 @@ pub(crate) fn apply_wake_theme(
     // hover / ⌘K selection / ghost-button hover in light mode.
     colors.accent_foreground = theme::accent_foreground();
     theme.colors = colors;
-    theme.radius = px(theme::RADIUS_PANEL);
+    // Issue 19: the kit Root plugin paints the window from
+    // `tokens.background`, a field distinct from `colors` — the kit default
+    // (opaque white / neutral-950) covered the blurred window background.
+    // Root must stay fully transparent; the nav pane paints the glass tint.
+    //
+    // Both sides are set to the SAME transparent value. Reconcile then sees
+    // `colors.background` changed but `tokens.background.color` already
+    // equal to it and keeps the token (its "set on both sides to one color"
+    // branch) — writing only the token made reconcile stamp the opaque
+    // material back in whenever the family/mode changed `colors.background`,
+    // killing the glass until an identical second click. Only this pair:
+    // tokens.popover feeds menus/dialog panels, which stay opaque.
+    let transparent = gpui_kit::transparent_black();
+    theme.colors.background = transparent;
+    theme.tokens = (&theme.colors).into();
     theme.radius_lg = px(theme::RADIUS_PANEL);
     theme.font_family = theme::sans_for(font_pref).into();
     // Issue 24: rem size must come from theme.font_size — the kit Root
@@ -512,17 +527,10 @@ pub(crate) fn apply_wake_theme(
     theme.mono_font_family = theme::sans_for(font_pref).into();
     theme.mono_font_size = px(theme::editor_font_px(editor_size) * zoom);
     theme.shadow = false; // ADR-0003: zero shadow on persistent UI
-                          // Issue 17: editor palette; `""` = kit default (must RESET — skipping
-                          // the write left a previously-picked palette live until restart).
-    theme.highlight_theme = if palette_id.is_empty() {
-        if dark {
-            HighlightTheme::default_dark()
-        } else {
-            HighlightTheme::default_light()
-        }
-    } else {
-        theme::editor_palette(palette_id, dark)
-    };
+                          // ADR-0010: highlight theme comes from the active family ("" = kit
+                          // default). Must RESET every call — skipping the write left a
+                          // previously-picked family live until restart.
+    theme.highlight_theme = theme::family_highlight(palette_id, dark);
 }
 
 #[cfg(test)]
@@ -568,5 +576,41 @@ mod selection_tests {
         apply_wake_theme(&mut theme, "", "", "medium", 1.2);
         assert_eq!(theme.font_size, gpui_kit::px(14. * 1.2));
         assert_eq!(theme.mono_font_size, gpui_kit::px(16. * 1.2));
+    }
+}
+
+#[cfg(test)]
+mod glass_tests {
+    use super::*;
+
+    /// Round 4 regression: `Theme::update` runs `reconcile` after the
+    /// closure, which overwrites `tokens.background` with the (opaque)
+    /// `colors.background` whenever that color changed — family/accent/
+    /// appearance switches killed the window glass until a no-change second
+    /// click. The fix writes the SAME transparent value on both sides, the
+    /// branch reconcile leaves untouched. Simulate reconcile's field loop
+    /// for `background` after a family switch and assert the token survives.
+    #[test]
+    fn reconcile_keeps_transparent_background_token() {
+        let mut theme = gpui_kit::component::Theme::default();
+        apply_wake_theme(&mut theme, "moss", "", "", 1.0);
+        // reconcile's per-field logic, hand-rolled for `background`.
+        let colors_before = theme.colors;
+        let tokens_before = theme.tokens;
+        // A family/mode switch changes colors.background (opaque material
+        // of the OTHER family) before our closure re-runs.
+        apply_wake_theme(&mut theme, "", "", "", 1.0);
+        if theme.colors.background != colors_before.background {
+            if theme.tokens.background.color != theme.colors.background {
+                theme.tokens.background = theme.colors.background.into();
+            }
+        } else if theme.tokens.background != tokens_before.background {
+            theme.colors.background = theme.tokens.background.color;
+        }
+        let t = theme.tokens.background.color;
+        assert!(
+            t.a == 0.,
+            "glass token must stay fully transparent after reconcile, got {t:?}"
+        );
     }
 }

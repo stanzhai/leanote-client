@@ -2,7 +2,10 @@
 //! spacing grid, panel/selection radii, Wake-blue accent, SF Pro + Menlo.
 //! Dark/light follow the system; this module only carries the token values.
 
-use gpui_kit::component::highlighter::HighlightTheme;
+pub use crate::theme_family::{
+    border, family_highlight, family_index, foreground, glass_base, material, muted_foreground,
+    set_family, FAMILIES,
+};
 use gpui_kit::{hsla, px, Hsla, Pixels};
 
 /// The four material layers (ADR-0003: titlebar/sidebar, list, background, popover).
@@ -74,62 +77,22 @@ pub fn accent_foreground() -> Hsla {
     hsla(0., 0., 1., 1.)
 }
 
-pub fn border(dark: bool) -> Hsla {
-    if dark {
-        hsla(220. / 360., 0.09, 0.2, 1.)
-    } else {
-        hsla(220. / 360., 0.13, 0.88, 1.)
-    }
-}
-
-/// Material layer color for a light or dark theme.
-pub fn material(layer: Material, dark: bool) -> Hsla {
-    let (h, s) = (222. / 360., 0.);
-    // Issue 19: Base/List stay translucent so the window blur (Blurred
-    // background) shows through; higher layers stay opaque for readability.
-    let (l, a) = match (layer, dark) {
-        (Material::Base, false) => (0.955, 0.85),
-        (Material::List, false) => (0.985, 0.85),
-        (Material::Background, false) => (1.0, 1.),
-        (Material::Popover, false) => (1.0, 1.),
-        (Material::Base, true) => (0.13, 0.72),
-        (Material::List, true) => (0.165, 0.78),
-        (Material::Background, true) => (0.19, 1.),
-        (Material::Popover, true) => (0.23, 1.),
-    };
-    hsla(h, s, l, a)
-}
-
-pub fn foreground(dark: bool) -> Hsla {
-    if dark {
-        hsla(220. / 360., 0.14, 0.92, 1.)
-    } else {
-        hsla(222. / 360., 0.12, 0.12, 1.)
-    }
-}
-
-/// Secondary text (metadata, placeholders).
-pub fn muted_foreground(dark: bool) -> Hsla {
-    if dark {
-        hsla(220. / 360., 0.09, 0.62, 1.)
-    } else {
-        hsla(220. / 360., 0.08, 0.45, 1.)
-    }
-}
-
 /// Sans follows the system (".SystemUIFont" = SF Pro on macOS).
 /// UI round 11 #2: no separate mono face — the editor binds to the UI
 /// font (sans_for) so the font pref applies everywhere at once.
 pub const SANS: &str = ".SystemUIFont";
-/// LXGW WenKai (霞鹜文楷): the user-installed CJK handwriting face. The
-/// family name CoreText publishes once the ttf lands in ~/Library/Fonts.
-pub const WENKAI: &str = "LXGW WenKai";
+/// LXGW WenKai Mono (霞鹜文楷等宽): the user-installed CJK handwriting
+/// face. The family name CoreText publishes once the ttf lands in
+/// ~/Library/Fonts. Mono variant: CJK stays 2 cells wide, Latin/ASCII
+/// aligns — the right face for a note editor.
+pub const WENKAI: &str = "LXGW WenKai Mono";
 
-/// UI font by prefs id: "" (default) → system sans, "wenkai" → LXGW WenKai.
+/// UI font by prefs id: "" (default) → system sans, "wenkai-mono" →
+/// LXGW WenKai Mono ("wenkai" = the legacy non-mono id, still honored).
 /// Falls back to the system face when the ttf isn't installed yet — gpui
 /// resolves unknown families through the platform fallback chain.
 pub fn sans_for(font_pref: &str) -> &'static str {
-    if font_pref == "wenkai" {
+    if font_pref == "wenkai" || font_pref == "wenkai-mono" {
         WENKAI
     } else {
         SANS
@@ -163,171 +126,6 @@ pub fn preview_font_px(size_pref: &str, zoom: f32) -> f32 {
 pub fn ui(n: f32) -> gpui_kit::AbsoluteLength {
     gpui_kit::rems(n / 14.).into()
 }
-
-/// Editor palettes (issue 17): 2 non-default options, each with light/dark
-/// variants in Zed highlight-theme JSON. `id` matches the prefs value;
-/// `""` = keep the kit's default highlight theme.
-pub struct PaletteDef {
-    pub id: &'static str,
-    pub light: fn() -> &'static str,
-    pub dark: fn() -> &'static str,
-}
-
-pub fn editor_palettes() -> &'static [PaletteDef] {
-    &[
-        PaletteDef {
-            id: "warm",
-            light: warm_light,
-            dark: warm_dark,
-        },
-        PaletteDef {
-            id: "solarized",
-            light: solarized_light,
-            dark: solarized_dark,
-        },
-    ]
-}
-
-/// Parse the palette for `id`; unknown or malformed → kit default.
-/// Issue 23 #2: parsed once per (id, dark) — theme switches replay this on
-/// every appearance change and the JSON is tens of KB each time.
-pub fn editor_palette(id: &str, dark: bool) -> std::sync::Arc<HighlightTheme> {
-    use std::collections::HashMap;
-    use std::sync::{Arc, LazyLock, Mutex};
-    static CACHE: LazyLock<Mutex<HashMap<(&'static str, bool), Arc<HighlightTheme>>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-    let def = editor_palettes().iter().find(|p| p.id == id);
-    let key = (def.map(|d| d.id).unwrap_or(""), dark);
-    if let Some(hit) = CACHE.lock().unwrap().get(&key) {
-        return hit.clone();
-    }
-    let parsed = match def {
-        Some(d) => {
-            serde_json::from_str::<HighlightTheme>(if dark { (d.dark)() } else { (d.light)() })
-                .map(Arc::new)
-                .unwrap_or_else(|_| fallback(dark))
-        }
-        None => fallback(dark),
-    };
-    CACHE.lock().unwrap().insert(key, parsed.clone());
-    parsed
-}
-
-fn fallback(dark: bool) -> std::sync::Arc<HighlightTheme> {
-    if dark {
-        HighlightTheme::default_dark()
-    } else {
-        HighlightTheme::default_light()
-    }
-}
-
-/// Editor background must match the Background material so the editor pane
-/// stays seamless with the rest of the shell.
-fn palette_json(
-    name: &str,
-    appearance: &str,
-    bg: &str,
-    fg: &str,
-    active_line: &str,
-    syntax: &str,
-) -> String {
-    format!(
-        r##"{{"name":"{name}","appearance":"{appearance}","style":{{
-  "editor.background":"{bg}","editor.foreground":"{fg}",
-  "editor.active_line.background":"{active_line}",
-  "editor.line_number":"#8a8a8a","editor.active_line_number":"{fg}",
-  "editor.invisible":"#8a8a8a66",
-  "syntax":{syntax}
-}}}}"##
-    )
-}
-
-fn warm_light() -> &'static str {
-    static S: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        palette_json(
-            "Warm Light",
-            "light",
-            "#faf6f0",
-            "#3d332b",
-            "#f0e8dc",
-            PALETTE_WARM_SYNTAX,
-        )
-    });
-    &S
-}
-fn warm_dark() -> &'static str {
-    static S: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        palette_json(
-            "Warm Dark",
-            "dark",
-            "#2b2622",
-            "#e8dfd5",
-            "#35302a",
-            PALETTE_WARM_SYNTAX,
-        )
-    });
-    &S
-}
-fn solarized_light() -> &'static str {
-    static S: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        palette_json(
-            "Solarized Light",
-            "light",
-            "#fdf6e3",
-            "#657b83",
-            "#eee8d5",
-            PALETTE_SOLARIZED_SYNTAX,
-        )
-    });
-    &S
-}
-fn solarized_dark() -> &'static str {
-    static S: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        palette_json(
-            "Solarized Dark",
-            "dark",
-            "#002b36",
-            "#93a1a1",
-            "#073642",
-            PALETTE_SOLARIZED_SYNTAX,
-        )
-    });
-    &S
-}
-
-const PALETTE_WARM_SYNTAX: &str = r##"{
-  "attribute":{"color":"#8a6d3b"},"boolean":{"color":"#a05252"},
-  "comment":{"color":"#7f8c8d"},"comment.doc":{"color":"#7f8c8d"},
-  "constant":{"color":"#a05252"},"constructor":{"color":"#2f5f8f"},
-  "embedded":{"color":"#3d332b"},"emphasis":{"font_style":"italic"},
-  "emphasis.strong":{"font_weight":700},
-  "function":{"color":"#2f5f8f"},"keyword":{"color":"#a05252"},
-  "link_text":{"color":"#2f5f8f"},"link_uri":{"color":"#708090","font_style":"italic"},
-  "number":{"color":"#8a6d3b"},"string":{"color":"#5f7a4f"},
-  "string.escape":{"color":"#5f7a4f"},"string.regex":{"color":"#5f7a4f"},
-  "string.special":{"color":"#b0563a"},"string.special.symbol":{"color":"#b0563a"},
-  "tag":{"color":"#a05252"},"text.literal":{"color":"#6b5344"},
-  "text.code.span":{"color":"#6b5344"},"title":{"color":"#2f5f8f"},
-  "type":{"color":"#6b5344"},"property":{"color":"#3d332b"},
-  "variable":{"color":"#3d332b"},"variable.special":{"color":"#a05252"}
-}"##;
-
-const PALETTE_SOLARIZED_SYNTAX: &str = r##"{
-  "attribute":{"color":"#268bd2"},"boolean":{"color":"#b58900"},
-  "comment":{"color":"#93a1a1"},"comment.doc":{"color":"#93a1a1"},
-  "constant":{"color":"#cb4b16"},"constructor":{"color":"#268bd2"},
-  "embedded":{"color":"#657b83"},"emphasis":{"font_style":"italic"},
-  "emphasis.strong":{"font_weight":700},
-  "function":{"color":"#268bd2"},"keyword":{"color":"#859900"},
-  "link_text":{"color":"#268bd2"},"link_uri":{"color":"#93a1a1","font_style":"italic"},
-  "number":{"color":"#d33682"},"string":{"color":"#2aa198"},
-  "string.escape":{"color":"#2aa198"},"string.regex":{"color":"#dc322f"},
-  "string.special":{"color":"#dc322f"},"string.special.symbol":{"color":"#dc322f"},
-  "tag":{"color":"#268bd2"},"text.literal":{"color":"#586e75"},
-  "text.code.span":{"color":"#586e75"},"title":{"color":"#268bd2"},
-  "type":{"color":"#b58900"},"property":{"color":"#657b83"},
-  "variable":{"color":"#657b83"},"variable.special":{"color":"#cb4b16"}
-}"##;
 
 #[cfg(test)]
 mod tests {
@@ -363,6 +161,7 @@ mod tests {
         assert_eq!(SANS, ".SystemUIFont");
         assert_eq!(sans_for(""), SANS);
         assert_eq!(sans_for("wenkai"), WENKAI);
+        assert_eq!(sans_for("wenkai-mono"), WENKAI);
         // UI round 12: editor size steps strictly ascending.
         assert!(editor_font_px("") < editor_font_px("medium"));
         assert!(editor_font_px("medium") < editor_font_px("large"));
@@ -370,5 +169,67 @@ mod tests {
         // UI round 12: ui() expresses a px design length as rems of the
         // 14px base rem, so it scales with theme.font_size (14 × zoom).
         assert_eq!(ui(14.), gpui_kit::rems(1.).into());
+    }
+
+    fn lum(hex: &str) -> f32 {
+        // Relative luminance-lite: mean of max/min channel — enough to
+        // order grays and near-grays. Pure table test, no global state.
+        let h = hex.strip_prefix('#').unwrap_or(hex);
+        let ch: Vec<f32> = (0..3)
+            .map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap() as f32 / 255.)
+            .collect();
+        (ch.iter().cloned().fold(f32::MIN, f32::max) + ch.iter().cloned().fold(f32::MAX, f32::min))
+            / 2.
+    }
+
+    /// Families (ADR-0010): every family × appearance has all 4 layers as
+    /// parseable hex, Base/List translucent, fg distinct from bg, and
+    /// layer lightness ordering so depth reads in every family. Pure
+    /// table assertions — no CURRENT_FAMILY global, no test-order coupling.
+    #[test]
+    fn family_table_completeness() {
+        use crate::theme_family::FAMILIES;
+        assert_eq!(FAMILIES.len(), 6);
+        for f in FAMILIES {
+            for dark in [false, true] {
+                let c = if dark { &f.dark } else { &f.light };
+                let base_alpha = u8::from_str_radix(&c.base[7..9], 16).unwrap() as f32 / 255.;
+                let list_alpha = u8::from_str_radix(&c.list[7..9], 16).unwrap() as f32 / 255.;
+                assert!(base_alpha < 1., "{} base must stay translucent", f.id);
+                assert!(list_alpha < 1., "{} list must stay translucent", f.id);
+                assert_ne!(
+                    lum(c.fg),
+                    lum(c.background),
+                    "{} fg must differ from bg",
+                    f.id
+                );
+                assert!(
+                    lum(c.base) < lum(c.list),
+                    "{}: base {} !< list {}",
+                    f.id,
+                    c.base,
+                    c.list
+                );
+                assert!(
+                    lum(c.list) < lum(c.background),
+                    "{}: list {} !< bg {}",
+                    f.id,
+                    c.list,
+                    c.background
+                );
+                assert!(
+                    lum(c.background) <= lum(c.popover),
+                    "{}: bg {} !<= popover {}",
+                    f.id,
+                    c.background,
+                    c.popover
+                );
+            }
+        }
+        // legacy palette ids map onto the same-named families
+        assert_eq!(family_index("warm"), 2);
+        assert_eq!(family_index("solarized"), 3);
+        assert_eq!(family_index("bogus"), 0);
+        assert_eq!(family_index(""), 0);
     }
 }

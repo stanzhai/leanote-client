@@ -68,6 +68,10 @@ pub enum Motion {
     NextWord,
     /// `b`
     PrevWord,
+    /// `e` — end of the current/next word
+    WordEnd,
+    /// `ge` — start of the previous word end
+    PrevWordEnd,
     /// `{` — previous blank line (paragraph boundary)
     ParaBackward,
     /// `}` — next blank line (paragraph boundary)
@@ -89,7 +93,8 @@ impl Motion {
 pub enum DeleteOp {
     /// `x`/`delete` — char under the caret
     Char,
-    /// `dw`
+    /// `de`
+    ToWordEnd,
     ToNextWord,
     /// `d0`
     ToLineStart,
@@ -278,6 +283,9 @@ impl VimState {
                 ('g', "g") => {
                     return VimAction::Move(Motion::DocStart);
                 }
+                ('g', "e") => {
+                    return VimAction::Move(Motion::PrevWordEnd);
+                }
                 _ => None,
             } {
                 return VimAction::LineOp(line_op, usize::MAX);
@@ -300,6 +308,7 @@ impl VimState {
             "^" => VimAction::Move(Motion::FirstNonBlank),
             "G" => VimAction::Move(Motion::DocEnd),
             "w" => VimAction::Move(Motion::NextWord),
+            "e" => VimAction::Move(Motion::WordEnd),
             "b" => VimAction::Move(Motion::PrevWord),
             "g" | "d" | "y" | "c" => {
                 self.pending = key.chars().next();
@@ -367,6 +376,7 @@ impl VimState {
             "G" => VimAction::Move(Motion::DocEnd),
             "g" => VimAction::Move(Motion::DocStart),
             "w" => VimAction::Move(Motion::NextWord),
+            "e" => VimAction::Move(Motion::WordEnd),
             "b" => VimAction::Move(Motion::PrevWord),
             "x" | "d" | "delete" => VimAction::DeleteSelection,
             "y" => VimAction::YankSelection,
@@ -411,6 +421,7 @@ fn motion_of(key: &str) -> Option<Motion> {
         "{" => Motion::ParaBackward,
         "}" => Motion::ParaForward,
         "w" => Motion::NextWord,
+        "e" => Motion::WordEnd,
         "b" => Motion::PrevWord,
         _ => return None,
     })
@@ -419,6 +430,7 @@ fn motion_of(key: &str) -> Option<Motion> {
 fn operator_motion(op: char, m: Motion) -> VimAction {
     let del = match m {
         Motion::NextWord => DeleteOp::ToNextWord,
+        Motion::WordEnd => DeleteOp::ToWordEnd,
         Motion::LineStart => DeleteOp::ToLineStart,
         Motion::LineEnd => DeleteOp::ToLineEnd,
         Motion::FirstNonBlank => DeleteOp::ToFirstNonBlank,
@@ -438,8 +450,26 @@ fn operator_motion(op: char, m: Motion) -> VimAction {
 // Buffer math (rgpui ports) — byte offsets, char-count columns
 // ---------------------------------------------------------------------------
 
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+/// Vim's three character classes for word motions (`:h word`): keyword,
+/// punctuation, whitespace. Punctuation runs are themselves stops
+/// (`foo.bar` → `foo`/`.`/`bar`); the old binary classifier collapsed
+/// them. CJK follows vim's default `iskeyword`: a CJK run is ONE word —
+/// deliberate strict-vim choice (Zed splits per char; we do not).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    Keyword,
+    Punct,
+    Blank,
+}
+
+fn class_of(c: char) -> CharClass {
+    if c.is_alphanumeric() || c == '_' {
+        CharClass::Keyword
+    } else if c.is_whitespace() {
+        CharClass::Blank
+    } else {
+        CharClass::Punct
+    }
 }
 
 /// Line span excluding its `\n`: `(start, end)`.
@@ -514,22 +544,25 @@ fn prev_char(text: &Rope, offset: usize) -> usize {
     text.floor_char_boundary(offset.saturating_sub(1))
 }
 
-/// `w`: next word start, crossing lines and trailing punctuation.
+/// `w`: next word start. Three-class vim semantics: finish the current
+/// class run, then skip blanks (across newlines) to the next keyword or
+/// punct run. An empty line is a stop in itself.
 fn word_forward(text: &Rope, cursor: usize) -> usize {
     let len = text.len();
     let mut offset = cursor.min(len);
     let mut chars = text.chars_at(offset).peekable();
-    if chars.peek().is_some_and(|&c| is_word_char(c)) {
-        while let Some(&c) = chars.peek() {
-            if !is_word_char(c) {
-                break;
-            }
+    if let Some(&c) = chars.peek() {
+        let class = class_of(c);
+        while chars.peek().is_some_and(|&c| class_of(c) == class) {
             offset += c.len_utf8();
             chars.next();
         }
     }
     while let Some(&c) = chars.peek() {
-        if is_word_char(c) {
+        if c == '\n' && is_blank_row(text, row_of(text, offset)) {
+            return offset;
+        }
+        if class_of(c) != CharClass::Blank {
             break;
         }
         offset += c.len_utf8();
@@ -538,25 +571,145 @@ fn word_forward(text: &Rope, cursor: usize) -> usize {
     offset.min(len)
 }
 
-/// `b`: previous word start; from mid-word, back to that word's start.
+/// `b`: previous word start. From inside a run: that run's start; from a
+/// run start: the previous keyword/punct run's start (vim treats a punct
+/// run as its own word). Empty lines are stops — but only when arriving
+/// from elsewhere, so `b` on an empty line itself moves on.
 fn word_backward(text: &Rope, cursor: usize) -> usize {
-    let cursor = cursor.min(text.len());
-    let mut boundary = cursor;
-    for c in text.chars_at(cursor).reversed() {
-        if is_word_char(c) {
-            boundary -= c.len_utf8();
-            let mut back = text.chars_at(boundary).reversed();
-            while let Some(c2) = back.next() {
-                if !is_word_char(c2) {
+    let mut offset = cursor.min(text.len());
+    let mut chars = text.chars_at(offset).reversed();
+    // The char under the block caret (at `offset`) is NOT part of the
+    // backward scan; step past it, then handle whatever precedes.
+    let Some(first) = chars.next() else {
+        return offset;
+    };
+    offset -= first.len_utf8();
+    if class_of(first) != CharClass::Blank {
+        // Caret inside a keyword/punct run: back to that run's start.
+        let class = class_of(first);
+        while let Some(c) = chars.next() {
+            if class_of(c) != class {
+                return offset;
+            }
+            offset -= c.len_utf8();
+        }
+        return offset;
+    }
+    // Blank run: skip blanks back, stop on an empty line, then walk the
+    // previous run back to its start.
+    while let Some(c) = chars.next() {
+        if c == '\n' && offset != cursor && is_blank_row(text, row_of(text, offset)) {
+            return offset;
+        }
+        if class_of(c) != CharClass::Blank {
+            offset -= c.len_utf8();
+            let class = class_of(c);
+            while let Some(c) = chars.next() {
+                if class_of(c) != class {
+                    return offset;
+                }
+                offset -= c.len_utf8();
+            }
+            return offset;
+        }
+        offset -= c.len_utf8();
+    }
+    offset
+}
+
+/// End of the keyword/punct run starting at `offset`, expressed as the
+/// offset of the run's LAST char (where a block caret rests after `e`).
+fn run_end(text: &Rope, offset: usize) -> usize {
+    let mut end = offset;
+    let mut chars = text.chars_at(offset).peekable();
+    if let Some(&c) = chars.peek() {
+        let class = class_of(c);
+        while chars.peek().is_some_and(|&c| class_of(c) == class) {
+            end += c.len_utf8();
+            chars.next();
+        }
+    }
+    prev_char(text, end)
+}
+
+/// `e`: end of the current word when the caret sits before its last
+/// char; on a run's last char (or blanks) it moves to the END of the
+/// NEXT keyword/punct run. Empty lines are stops.
+fn word_end(text: &Rope, cursor: usize) -> usize {
+    let len = text.len();
+    let mut offset = cursor.min(len);
+    // The block caret covers the char AT `offset`.
+    if offset < len {
+        let cur = text.chars_at(offset).next().unwrap();
+        let class = class_of(cur);
+        if class != CharClass::Blank {
+            let mut chars = text.chars_at(offset).peekable();
+            let mut end = offset;
+            while let Some(&c) = chars.peek() {
+                if class_of(c) != class {
                     break;
                 }
-                boundary -= c2.len_utf8();
+                end += c.len_utf8();
+                chars.next();
             }
-            return boundary;
+            // Strictly inside the run (a same-class char follows the
+            // caret's char): rest on the run's last char.
+            if end > next_char(text, offset) {
+                return prev_char(text, end);
+            }
+            // On the run's last char: skip past it, find the next run.
+            offset = end;
         }
-        boundary -= c.len_utf8();
     }
-    0
+    // Skip blanks to the next non-blank run; an empty line is a stop.
+    let mut chars = text.chars_at(offset).peekable();
+    while let Some(&c) = chars.peek() {
+        if c == '\n' && is_blank_row(text, row_of(text, offset)) {
+            return offset;
+        }
+        if class_of(c) != CharClass::Blank {
+            return run_end(text, offset);
+        }
+        offset += c.len_utf8();
+        chars.next();
+    }
+    offset
+}
+
+/// `ge`: end (last char) of the word BEFORE the caret's word. Empty
+/// lines are stops.
+fn word_end_backward(text: &Rope, cursor: usize) -> usize {
+    let mut offset = cursor.min(text.len());
+    // Start of the run containing the caret's own char (blank caret →
+    // stay; the blank-skip below handles it).
+    if let Some(&cur) = text.chars_at(offset).peekable().peek() {
+        let class = class_of(cur);
+        if class != CharClass::Blank {
+            let mut chars = text.chars_at(offset).reversed();
+            while let Some(c) = chars.next() {
+                if class_of(c) != class {
+                    break;
+                }
+                offset -= c.len_utf8();
+            }
+        }
+    }
+    // Back over blanks (empty line = stop at its start) to the previous
+    // run's last char.
+    let mut chars = text.chars_at(offset).reversed();
+    while let Some(c) = chars.next() {
+        if c == '\n' {
+            let row = row_of(text, offset);
+            if is_blank_row(text, row) {
+                return text.line_start_offset(row);
+            }
+        }
+        if class_of(c) != CharClass::Blank {
+            return offset - c.len_utf8();
+        }
+        offset -= c.len_utf8();
+    }
+    offset
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +817,8 @@ pub fn exec(
                 }
                 Motion::NextWord => word_forward(&text, caret),
                 Motion::PrevWord => word_backward(&text, caret),
+                Motion::WordEnd => word_end(&text, caret),
+                Motion::PrevWordEnd => word_end_backward(&text, caret),
                 Motion::ParaForward => para_forward(&text, row_of(&text, caret)),
                 Motion::ParaBackward => para_backward(&text, row_of(&text, caret)),
             };
@@ -689,6 +844,8 @@ pub fn exec(
                     | Motion::FirstNonBlank
                     | Motion::NextWord
                     | Motion::PrevWord
+                    | Motion::WordEnd
+                    | Motion::PrevWordEnd
                     | Motion::ParaForward
                     | Motion::ParaBackward
             ) {
@@ -929,7 +1086,13 @@ fn delete_range_for(op: DeleteOp, text: &Rope, caret: usize) -> Option<std::ops:
             }
             caret..next_char(text, caret).min(line_end)
         }
-        DeleteOp::ToNextWord => caret..word_forward(text, caret),
+        // `dw`: vim's exclusive-motion rule — never eat past this line's
+        // end, so deleting the last word never eats the newline.
+        DeleteOp::ToNextWord => {
+            let end = word_forward(text, caret);
+            caret..end.min(line_end)
+        }
+        DeleteOp::ToWordEnd => caret..next_char(text, word_end(text, caret)),
         DeleteOp::ToLineStart => line_start..caret,
         DeleteOp::ToFirstNonBlank => {
             let mut first = line_start;
@@ -1091,6 +1254,9 @@ mod tests {
         let mut v = VimState::new();
         assert_eq!(run(&mut v, "g"), VimAction::Consumed);
         assert_eq!(run(&mut v, "g"), VimAction::Move(Motion::DocStart));
+        // ge: previous word end
+        run(&mut v, "g");
+        assert_eq!(run(&mut v, "e"), VimAction::Move(Motion::PrevWordEnd));
         // g followed by something else voids the pending g (x is swallowed)
         assert_eq!(run(&mut v, "g"), VimAction::Consumed);
         assert_eq!(run(&mut v, "x"), VimAction::Consumed);
@@ -1123,6 +1289,9 @@ mod tests {
             run(&mut v, "w"),
             VimAction::ChangeThenInsert(DeleteOp::ToNextWord)
         );
+        // de deletes to word end (inclusive)
+        run(&mut v, "d");
+        assert_eq!(run(&mut v, "e"), VimAction::Delete(DeleteOp::ToWordEnd));
     }
 
     #[test]
@@ -1252,5 +1421,91 @@ mod tests {
         assert_eq!(prev_char(&cjk, 3), 0);
         assert_eq!(char_offset_in_line(&cjk, 1, 1), 10);
         assert_eq!(char_col(&cjk, 3), 1);
+    }
+
+    #[test]
+    fn word_motions_punct_stops() {
+        // `abc = ef`: w stops at =, then ef (the reported bug).
+        let text: Rope = "abc = ef".into();
+        assert_eq!(word_forward(&text, 0), 4); // -> `=`
+        assert_eq!(word_forward(&text, 4), 6); // -> `ef`
+        assert_eq!(word_backward(&text, 6), 4);
+        assert_eq!(word_backward(&text, 4), 0);
+        // `foo.bar`: punct run is its own word.
+        let dots: Rope = "foo.bar".into();
+        assert_eq!(word_forward(&dots, 0), 3); // -> `.`
+        assert_eq!(word_forward(&dots, 3), 4); // -> `bar`
+        assert_eq!(word_backward(&dots, 4), 3);
+        // Punct run of several chars is one stop.
+        let many: Rope = "a == b".into();
+        assert_eq!(word_forward(&many, 0), 2); // -> `==`
+        assert_eq!(word_forward(&many, 2), 5); // -> `b`
+    }
+
+    #[test]
+    fn word_motions_markdown_syntax() {
+        // `**bold**` from the start lands at `bold`, not at the second `*`.
+        let md: Rope = "**bold** text".into();
+        assert_eq!(word_forward(&md, 0), 2); // -> `bold`
+        assert_eq!(word_forward(&md, 2), 6); // -> closing `**`
+        assert_eq!(word_forward(&md, 6), 9); // -> `text`
+                                             // Inline code: backtick run is one stop.
+        let code: Rope = "`code` x".into();
+        assert_eq!(word_forward(&code, 0), 1); // -> `code`
+        assert_eq!(word_forward(&code, 1), 5); // -> closing backtick
+    }
+
+    #[test]
+    fn word_motions_empty_line_is_a_stop() {
+        let text: Rope = "a\n\nb".into();
+        // w from `a` stops on the empty line (offset 2), then on `b`.
+        assert_eq!(word_forward(&text, 0), 2);
+        assert_eq!(word_forward(&text, 2), 3);
+        // b mirrors: from `b` back to the empty line, then to `a`.
+        assert_eq!(word_backward(&text, 3), 2);
+        assert_eq!(word_backward(&text, 2), 0);
+        // e stops on the empty line too.
+        assert_eq!(word_end(&text, 0), 2);
+        // ge from `b` stops on the empty line first (vim: empty lines are
+        // word stops for ge too, not skipped).
+        assert_eq!(word_end_backward(&text, 3), 2);
+    }
+
+    #[test]
+    fn word_motions_cjk_one_word() {
+        // Strict vim default: a CJK run is ONE word (`你好世界` jumps whole).
+        let cjk: Rope = "你好世界 abc".into();
+        assert_eq!(word_forward(&cjk, 0), 13); // -> `abc`
+        assert_eq!(word_backward(&cjk, 13), 0);
+        // e from the CJK start rests on the last CJK char.
+        assert_eq!(word_end(&cjk, 0), 9);
+        // Mixed run boundary: CJK followed directly by punct.
+        let mixed: Rope = "你好,x".into();
+        assert_eq!(word_forward(&mixed, 0), 6); // -> `,`
+    }
+
+    #[test]
+    fn word_end_motions() {
+        let text: Rope = "abc = ef".into();
+        // e from `a` rests on `c`; again rests on `=`; again on `f`.
+        assert_eq!(word_end(&text, 0), 2);
+        assert_eq!(word_end(&text, 2), 4);
+        assert_eq!(word_end(&text, 4), 7);
+        // Mid-word: e goes to this word's end.
+        assert_eq!(word_end(&text, 1), 2);
+        // ge from `e` (of ef) rests on `=`.
+        assert_eq!(word_end_backward(&text, 6), 4);
+    }
+
+    #[test]
+    fn dw_de_ranges() {
+        // dw on `abc` of `abc = ef` deletes only `abc` (to the `=`).
+        let text: Rope = "abc = ef".into();
+        assert_eq!(delete_range_for(DeleteOp::ToNextWord, &text, 0), Some(0..4));
+        // dw on the last word of a line stops at the line end.
+        let last: Rope = "ef".into();
+        assert_eq!(delete_range_for(DeleteOp::ToNextWord, &last, 0), Some(0..2));
+        // de deletes through the end of the next word (inclusive).
+        assert_eq!(delete_range_for(DeleteOp::ToWordEnd, &text, 0), Some(0..3));
     }
 }

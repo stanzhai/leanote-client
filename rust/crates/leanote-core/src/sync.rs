@@ -424,6 +424,7 @@ impl Api {
         title: &str,
         content: &str,
         is_markdown: bool,
+        is_blog: bool,
         tags: &[String],
         created: &str,
         updated: &str,
@@ -434,7 +435,7 @@ impl Api {
             ("NotebookId", notebook_server_id),
             ("Content", content),
             ("IsMarkdown", if is_markdown { "1" } else { "0" }),
-            ("IsBlog", "0"),
+            ("IsBlog", if is_blog { "1" } else { "0" }),
             ("CreatedTime", created),
             ("UpdatedTime", updated),
         ];
@@ -455,6 +456,7 @@ impl Api {
         title: &str,
         usn: i64,
         is_trash: bool,
+        is_blog: bool,
         tags: &[String],
         content: &str,
         updated: &str,
@@ -470,7 +472,7 @@ impl Api {
             ("Title", title),
             ("Usn", usn_s.as_str()),
             ("IsTrash", is_trash_s),
-            ("IsBlog", "0"),
+            ("IsBlog", if is_blog { "1" } else { "0" }),
             ("Content", content),
             ("Abstract", ""),
             ("UpdatedTime", updated),
@@ -795,6 +797,7 @@ pub struct DirtyNote {
     pub usn: i64,
     pub created_time: i64,
     pub updated_time: i64,
+    pub is_blog: bool,
     pub server_note_id: Option<String>,
 }
 
@@ -1214,6 +1217,7 @@ fn push_dirty_notes(
                 &n.title,
                 &n.content,
                 n.is_markdown,
+                n.is_blog,
                 &n.tags,
                 &fmt_datetime(n.created_time),
                 &fmt_datetime(n.updated_time),
@@ -1253,6 +1257,7 @@ fn push_dirty_notes(
                 &n.title,
                 n.usn,
                 n.is_trash,
+                n.is_blog,
                 &n.tags,
                 &n.content,
                 &fmt_datetime(n.updated_time),
@@ -1496,10 +1501,11 @@ impl Store {
                 "INSERT INTO notes (NoteId, UserId, NotebookId, Title, Content, \"Desc\", ImgSrc,
                     Tags, Abstract, IsMarkdown, IsTrash, IsDeleted, IsDirty, LocalIsNew,
                     LocalIsDelete, IsBlog, Star, Usn, CreatedTime, UpdatedTime, ServerNoteId)
-                 VALUES (?1,?2,?3,?4,'','','',?5,'',?6,?7,0,0,0,0,0,0,?8,?9,?10,?1)
+                 VALUES (?1,?2,?3,?4,'','','',?5,'',?6,?7,0,0,0,?11,0,0,?8,?9,?10,?1)
                  ON CONFLICT(NoteId) DO UPDATE SET
                     NotebookId=excluded.NotebookId, Title=excluded.Title, Tags=excluded.Tags,
                     IsMarkdown=excluded.IsMarkdown, IsTrash=excluded.IsTrash,
+                    IsBlog=excluded.IsBlog,
                     Usn=excluded.Usn, IsDirty=0, LocalIsNew=0, LocalIsDelete=0,
                     ServerNoteId=excluded.ServerNoteId",
                 params![
@@ -1513,6 +1519,7 @@ impl Store {
                     i64_field(row, "Usn"),
                     go_now_ms(row.get("CreatedTime"), now),
                     go_now_ms(row.get("UpdatedTime"), now),
+                    bool_field(row, "IsBlog") as i64,
                 ],
             )?;
         }
@@ -1686,7 +1693,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT NoteId, NotebookId, Title, Content, Tags, IsMarkdown, IsTrash,
                     IsDirty, LocalIsNew, LocalIsDelete, Usn, CreatedTime, UpdatedTime,
-                    ServerNoteId
+                    IsBlog, ServerNoteId
              FROM notes WHERE UserId=?1 AND IsDirty=1 ORDER BY rowid",
         )?;
         let rows = stmt.query_map(params![self.user_id], |r| {
@@ -1709,7 +1716,8 @@ impl Store {
                 usn: r.get(10)?,
                 created_time: r.get(11)?,
                 updated_time: r.get(12)?,
-                server_note_id: r.get(13)?,
+                is_blog: r.get::<_, i64>(13)? != 0,
+                server_note_id: r.get(14)?,
             })
         })?;
         rows.collect()
@@ -1845,7 +1853,7 @@ impl Store {
             .query_row(
                 "SELECT NoteId, NotebookId, Title, Content, Tags, IsMarkdown, IsTrash,
                         IsDirty, LocalIsNew, LocalIsDelete, Usn, CreatedTime, UpdatedTime,
-                        ServerNoteId
+                        IsBlog, ServerNoteId
                  FROM notes WHERE ServerNoteId=?1",
                 params![server_note_id],
                 |r| {
@@ -1868,7 +1876,8 @@ impl Store {
                         usn: r.get(10)?,
                         created_time: r.get(11)?,
                         updated_time: r.get(12)?,
-                        server_note_id: r.get(13)?,
+                        is_blog: r.get::<_, i64>(13)? != 0,
+                        server_note_id: r.get(14)?,
                     })
                 },
             )

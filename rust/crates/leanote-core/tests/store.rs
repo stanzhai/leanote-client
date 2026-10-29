@@ -339,6 +339,49 @@ fn toggle_star_flips_star_without_setting_isdirty() {
 }
 
 #[test]
+fn set_note2blog_publishes_and_marks_dirty() {
+    let s = store("blog");
+    let n = add(&s, "A", "c", &[], "Inbox");
+    // Clean it the way a sync pull would.
+    let clean_row = serde_json::json!({
+        "NoteId": n.note_id.to_string(),
+        "NotebookId": n.notebook_id.to_string(),
+        "Title": "A",
+        "Tags": [],
+        "IsMarkdown": true,
+        "IsTrash": false,
+        "IsDeleted": false,
+        "Usn": 1,
+    });
+    s.apply_sync_notes(&[clean_row], 0).unwrap();
+    // Publish: IsBlog=1 AND IsDirty=1 (JS setNote2Blog pushes the change).
+    s.set_note2blog(&n.note_id, true).unwrap();
+    let meta = s
+        .list_notes_filtered(None, false)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.note_id == n.note_id)
+        .unwrap();
+    assert!(meta.is_blog);
+    assert_eq!(s.raw_query_row("SELECT IsDirty FROM notes").unwrap(), 1);
+    // Publishing is metadata, not content: UpdatedTime must NOT move
+    // (else the note jumps to the top of Recent).
+    let before: i64 = s.raw_query_row("SELECT UpdatedTime FROM notes").unwrap();
+    s.set_note2blog(&n.note_id, true).unwrap(); // no-op republish
+    let after: i64 = s.raw_query_row("SELECT UpdatedTime FROM notes").unwrap();
+    assert_eq!(before, after);
+    // Unpublish round-trips.
+    s.set_note2blog(&n.note_id, false).unwrap();
+    let meta = s
+        .list_notes_filtered(None, false)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.note_id == n.note_id)
+        .unwrap();
+    assert!(!meta.is_blog);
+}
+
+#[test]
 fn trash_restore_hard_delete_and_empty() {
     let s = store("trashops");
     let keep = add(&s, "keep", "c", &[], "Inbox");

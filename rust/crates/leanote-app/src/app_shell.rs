@@ -9,6 +9,7 @@ use crate::theme::{self, Material};
 use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::base::Scrollbar;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::combobox::{Combobox, ComboboxEvent, ComboboxState};
 use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
 use gpui_kit::component::input::{
     Backspace, Delete, Editor, EditorState, Enter, Escape, IndentInline, Input, InputEvent,
@@ -18,9 +19,11 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::resizable_panel;
+use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::TextView;
+use gpui_kit::component::IndexPath;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, InteractiveElementExt, Sizable, WindowExt as _,
 };
@@ -103,6 +106,9 @@ enum NavEdit {
     /// Issue 18: move this note to another notebook — the middle list
     /// swaps to a target picker.
     MoveNote { id: leanote_core::Id },
+    /// Feature 3: batch move — same picker, commits to every
+    /// multi-selected note at once.
+    MoveNoteBatch,
     /// Rename this tag.
     RenameTag {
         old: String,
@@ -167,6 +173,12 @@ pub struct AppShell {
     /// Note currently shown in the reader (kept across list re-filters
     /// until the selection changes).
     selected: Option<leanote_core::Id>,
+    /// Feature 3 multi-select: ids beyond `selected` picked with
+    /// ⇧-range/⌘-toggle. Empty = plain single-select. `selected` stays
+    /// the anchor-carrying "last clicked" note for the reader pane.
+    selected_ids: Vec<leanote_core::Id>,
+    /// Where a ⇧ click extends from (last clicked row).
+    sel_anchor: Option<leanote_core::Id>,
     /// Issue 19: focus mode — hide left + middle panes (⇧⌘F toggles).
     focus_mode: bool,
     /// Issue 21 需求10: ⌘T full-window markdown preview (reader or
@@ -348,6 +360,8 @@ impl AppShell {
             notebooks_open: prefs.nav.notebooks_open,
             tags_open: prefs.nav.tags_open,
             selected: None,
+            selected_ids: Vec::new(),
+            sel_anchor: None,
             focus_mode: false,
             full_preview: false,
             preview_focus: cx.focus_handle(),
@@ -371,12 +385,15 @@ impl AppShell {
             tags_scroll: UniformListScrollHandle::new(),
             vim: crate::vim::VimState::new(),
         };
-        // Issue 20: accordions are exclusive; both default true on a fresh
-        // prefs file — notebooks win, tags collapse (persisted so it sticks).
-        if shell.notebooks_open && shell.tags_open {
-            shell.tags_open = false;
+        // Issue 20 made the accordions exclusive, which let one session's
+        // "I looked at Tags" persist as "Notebooks collapsed" forever.
+        // Notebooks are the primary tree: open them every launch; Tags
+        // keep whatever the user left (both open is fine — the header
+        // scroll area fits them).
+        if !shell.notebooks_open {
+            shell.notebooks_open = true;
             let mut p = crate::prefs::Prefs::load(&shell.data_dir);
-            p.nav.tags_open = false;
+            p.nav.notebooks_open = true;
             p.save(&shell.data_dir);
         }
         // Issue 19 #10: restore the last selected note when it still exists.
@@ -746,6 +763,8 @@ impl AppShell {
     fn select_nav(&mut self, nav: NavSelection, cx: &mut gpui_kit::Context<Self>) {
         self.nav = nav.clone();
         self.selected = None; // new filter → no stale reader content
+        self.selected_ids.clear(); // feature 3: multi-select is per-view
+        self.sel_anchor = None;
         self.close_editor();
         // Issue 19: persist nav selection.
         let dir = self.data_dir.clone();
@@ -762,14 +781,80 @@ impl AppShell {
         window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) {
-        // Issue 17 Q6: local recents (prefs).
+        self.apply_selection(id, gpui_kit::Modifiers::default(), window, cx);
+    }
+
+    /// Feature 3: plain click = single select; ⇧ = range from anchor
+    /// (visible-list order); ⌘/⌃ = toggle. Multi-select keeps the
+    /// reader on `selected` and swaps it for the batch overlay.
+    fn apply_selection(
+        &mut self,
+        id: leanote_core::Id,
+        mods: gpui_kit::Modifiers,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if mods.shift {
+            // Range anchor → clicked row, inclusive, in list order.
+            let notes: Vec<leanote_core::Id> = self
+                .visible_notes()
+                .iter()
+                .map(|n| n.note_id.clone())
+                .collect();
+            let anchor_ix = self
+                .sel_anchor
+                .as_ref()
+                .and_then(|a| notes.iter().position(|n| n == a))
+                .unwrap_or(0);
+            let hit_ix = notes.iter().position(|n| n == &id).unwrap_or(anchor_ix);
+            let (lo, hi) = if anchor_ix <= hit_ix {
+                (anchor_ix, hit_ix)
+            } else {
+                (hit_ix, anchor_ix)
+            };
+            self.selected_ids = notes[lo..=hi].to_vec();
+            self.selected = Some(id);
+            self.close_editor();
+            cx.notify();
+            return;
+        }
+        if mods.platform || mods.control {
+            // Seed with the plain-click selection on the first ⌘-click:
+            // the note selected before multi-select started stays in.
+            if self.selected_ids.is_empty() {
+                if let Some(cur) = &self.selected {
+                    self.selected_ids.push(cur.clone());
+                }
+                if self.sel_anchor.is_none() {
+                    self.sel_anchor = self.selected.clone();
+                }
+            }
+            let had = self.selected_ids.iter().any(|n| n == &id);
+            if had {
+                self.selected_ids.retain(|n| n != &id);
+                // `selected` drives the row highlight; keep it pointing
+                // at a row that is actually in the selection.
+                if self.selected.as_deref() == Some(&id) {
+                    self.selected = self.selected_ids.first().cloned();
+                }
+            } else {
+                self.selected_ids.push(id.clone());
+                self.sel_anchor = Some(id.clone());
+                self.selected = Some(id);
+            }
+            self.close_editor();
+            cx.notify();
+            return;
+        }
+        // Plain click: single select. Recents + last-note only apply here
+        // (multi-select is transient, not a reading position).
         let dir = self.data_dir.clone();
         let mut p = crate::prefs::Prefs::load(&dir);
         p.push_recent(&id.to_string());
-        // Issue 19: remember the last open note.
         p.nav.last_note = Some(id.to_string());
         p.save(&dir);
-
+        self.selected_ids.clear();
+        self.sel_anchor = Some(id.clone());
         self.selected = Some(id);
         self.converted_note = None;
         self.close_editor();
@@ -1019,7 +1104,7 @@ impl AppShell {
         // any color edits made inside are wiped. set_accent/main.rs use the
         // same stacked shape. Cost: one frame of kit-default colors before
         // the second update repaints.
-        let palette = p.editor_palette.clone();
+        let palette = p.ui_theme.clone();
         let font = p.font;
         let editor_size = p.editor_font_size.clone();
         let zoom = p.zoom;
@@ -1046,24 +1131,22 @@ impl AppShell {
         cx.notify();
     }
 
-    /// Issue 17 Q7: editor palette pref → disk + live replay.
-    fn set_editor_palette(&mut self, ix: usize, cx: &mut gpui_kit::Context<Self>) {
+    /// ADR-0010: theme family pref → disk + live replay. Family swap
+    /// retints materials/fg/border and the editor highlight together.
+    fn set_ui_theme(&mut self, id: &str, cx: &mut gpui_kit::Context<Self>) {
         let dir = self.data_dir.clone();
         let mut p = crate::prefs::Prefs::load(&dir);
-        p.editor_palette = match ix {
-            1 => "warm".into(),
-            2 => "solarized".into(),
-            _ => String::new(),
-        };
+        p.ui_theme = id.to_string();
         p.save(&dir);
-        let (palette, font, editor_size, zoom) = (
-            p.editor_palette.clone(),
+        theme::set_family(id);
+        let (family, font, editor_size, zoom) = (
+            p.ui_theme.clone(),
             p.font,
             p.editor_font_size.clone(),
             p.zoom,
         );
         gpui_kit::component::Theme::update(cx, move |theme| {
-            crate::apply_wake_theme(theme, &palette, &font, &editor_size, zoom)
+            crate::apply_wake_theme(theme, &family, &font, &editor_size, zoom)
         });
         cx.notify();
     }
@@ -1079,7 +1162,7 @@ impl AppShell {
         // ghost-button hover read tokens.accent), not just theme::accent()
         // call sites — replay the wake overlay.
         let (palette, font, editor_size, zoom) = (
-            p.editor_palette.clone(),
+            p.ui_theme.clone(),
             p.font,
             p.editor_font_size.clone(),
             p.zoom,
@@ -1118,7 +1201,7 @@ impl AppShell {
         let mut p = crate::prefs::Prefs::load(&dir);
         p.zoom = factor;
         p.save(&dir);
-        let palette = p.editor_palette.clone();
+        let palette = p.ui_theme.clone();
         let font = p.font;
         let editor_size = p.editor_font_size.clone();
         gpui_kit::component::Theme::update(cx, move |theme| {
@@ -1134,13 +1217,24 @@ impl AppShell {
         let mut p = crate::prefs::Prefs::load(&dir);
         p.font = id.to_string();
         p.save(&dir);
-        let palette = p.editor_palette.clone();
+        let palette = p.ui_theme.clone();
         let font = p.font;
         let editor_size = p.editor_font_size.clone();
         let zoom = p.zoom;
         gpui_kit::component::Theme::update(cx, move |theme| {
             crate::apply_wake_theme(theme, &palette, &font, &editor_size, zoom)
         });
+        cx.notify();
+    }
+
+    /// Round 5: nav glass strength → disk + live retint. Only the nav pane
+    /// reads the pref (glass_base in render_nav), so a plain notify
+    /// repaints it; no Theme::update needed.
+    fn set_glass(&mut self, id: &str, cx: &mut gpui_kit::Context<Self>) {
+        let dir = self.data_dir.clone();
+        let mut p = crate::prefs::Prefs::load(&dir);
+        p.glass = id.to_string();
+        p.save(&dir);
         cx.notify();
     }
 
@@ -1155,7 +1249,7 @@ impl AppShell {
             _ => String::new(),
         };
         p.save(&dir);
-        let palette = p.editor_palette.clone();
+        let palette = p.ui_theme.clone();
         let font = p.font;
         let editor_size = p.editor_font_size.clone();
         let zoom = p.zoom;
@@ -1454,6 +1548,21 @@ impl AppShell {
         cx.notify();
     }
 
+    /// Blog publish (IsBlog): unlike star, this IS a synced field —
+    /// set_note2blog marks the note dirty for the next push.
+    fn set_note2blog(
+        &mut self,
+        id: leanote_core::Id,
+        is_blog: bool,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if let Some(store) = self.store() {
+            let _ = store.set_note2blog(&id, is_blog);
+        }
+        self.invalidate_lists();
+        cx.notify();
+    }
+
     /// Issue 18: context-menu delete — trash a live note (soft delete,
     /// syncs back to the server like the web UI's delete).
     fn delete_note(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
@@ -1530,6 +1639,57 @@ impl AppShell {
             let _ = store.hard_delete_note(&id);
         }
         self.selected = None;
+        self.invalidate_lists();
+        cx.notify();
+    }
+
+    /// Feature 3: batch ops loop the single-note store calls over the
+    /// multi-selection. Selection is transient — cleared after a
+    /// destructive batch.
+    fn batch_star(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        let ids = self.selected_ids.clone();
+        if let Some(store) = self.store() {
+            for id in &ids {
+                let _ = store.toggle_star(id);
+            }
+        }
+        self.invalidate_lists();
+        cx.notify();
+    }
+
+    fn batch_delete(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        let ids = self.selected_ids.clone();
+        if let Some(store) = self.store() {
+            for id in &ids {
+                let _ = store.trash_note(id);
+            }
+        }
+        self.selected = None;
+        self.selected_ids.clear();
+        self.sel_anchor = None;
+        self.invalidate_lists();
+        cx.notify();
+    }
+
+    fn batch_move_to(&mut self, notebook: String, cx: &mut gpui_kit::Context<Self>) {
+        let ids = self.selected_ids.clone();
+        if let Some(store) = self.store() {
+            for id in &ids {
+                let _ = store.set_notebook(id, &leanote_core::Id(notebook.clone()));
+            }
+        }
+        self.nav_edit = None;
+        self.invalidate_lists();
+        cx.notify();
+    }
+
+    fn batch_set_note2blog(&mut self, is_blog: bool, cx: &mut gpui_kit::Context<Self>) {
+        let ids = self.selected_ids.clone();
+        if let Some(store) = self.store() {
+            for id in &ids {
+                let _ = store.set_note2blog(id, is_blog);
+            }
+        }
         self.invalidate_lists();
         cx.notify();
     }
@@ -1840,8 +2000,11 @@ impl AppShell {
                     }
                 }
             }
-            // MoveNotebook / MoveNote resolve directly in their *_to fns.
-            Some(NavEdit::MoveNotebook { .. }) | Some(NavEdit::MoveNote { .. }) | None => {}
+            // MoveNotebook / MoveNote(Batch) resolve in their *_to fns.
+            Some(NavEdit::MoveNotebook { .. })
+            | Some(NavEdit::MoveNote { .. })
+            | Some(NavEdit::MoveNoteBatch)
+            | None => {}
         }
         self.invalidate_lists();
         cx.notify();
@@ -1995,17 +2158,35 @@ fn note_list_row(
         .px(px(5.))
         .rounded(px(theme::RADIUS_SELECTION))
         .when(is_sel, |el| el.bg(theme::accent()))
-        .on_click(move |_ev, window, cx| {
+        .on_click(move |ev: &gpui_kit::ClickEvent, window, cx| {
+            let mods = ev.modifiers();
             let _ = shell.update(cx, |this: &mut AppShell, cx| {
-                this.select_note(id.clone(), window, cx)
+                this.apply_selection(id.clone(), mods, window, cx)
             });
         })
         .context_menu({
             let shell = shell_menu;
             let id = id_menu;
             let starred = n.star;
+            let is_blog = n.is_blog;
             let lang = crate::i18n::system_lang();
-            move |menu, _window, _cx| note_row_menu(menu, &shell, &id, lang, starred)
+            move |menu, _window, cx| {
+                // Feature 3: batch menu when the live multi-selection
+                // covers this row; otherwise the per-note menu.
+                let batch = shell
+                    .read_with(cx, |s, _| {
+                        s.selected_ids.len() > 1 && s.selected_ids.contains(&id)
+                    })
+                    .unwrap_or(false);
+                if batch {
+                    let count = shell
+                        .read_with(cx, |s, _| s.selected_ids.len())
+                        .unwrap_or(0);
+                    note_row_menu_batch(menu, &shell, lang, count)
+                } else {
+                    note_row_menu(menu, &shell, &id, lang, starred, is_blog)
+                }
+            }
         })
         .child(
             // Title block: one truncated line. The star rides in the
@@ -2020,6 +2201,14 @@ fn note_list_row(
                             .text_color(row_fg),
                     ),
                 )
+                .when(n.is_blog, |el| {
+                    el.child(
+                        Icon::new(IconName::Globe)
+                            .xsmall()
+                            .flex_none()
+                            .text_color(row_muted),
+                    )
+                })
                 .when(n.star, |el| {
                     el.child(
                         Icon::new(IconName::StarFill)
@@ -2066,10 +2255,12 @@ fn note_row_menu(
     id: &leanote_core::Id,
     lang: Lang,
     starred: bool,
+    is_blog: bool,
 ) -> gpui_kit::component::menu::PopupMenu {
     let shell_mv = shell.clone();
     let shell_del = shell.clone();
     let shell_star = shell.clone();
+    let shell_blog = shell.clone();
     let shell_html = shell.clone();
     let shell_md = shell.clone();
     let shell_pdf = shell.clone();
@@ -2079,6 +2270,7 @@ fn note_row_menu(
     let id_html = id.clone();
     let id_md = id.clone();
     let id_pdf = id.clone();
+    let id_blog = id.clone();
     menu.item(
         PopupMenuItem::new(i18n::t(lang, i18n::Key::MoveNoteTo)).on_click(
             move |_ev, _window, cx| {
@@ -2098,6 +2290,18 @@ fn note_row_menu(
         })
         .on_click(move |_ev, _window, cx| {
             let _ = shell_star.update(cx, |this, cx| this.toggle_star(id_star.clone(), cx));
+        }),
+    )
+    .item(
+        PopupMenuItem::new(if is_blog {
+            i18n::t(lang, i18n::Key::UnpublishBlog)
+        } else {
+            i18n::t(lang, i18n::Key::PublishBlog)
+        })
+        .on_click(move |_ev, _window, cx| {
+            let _ = shell_blog.update(cx, |this, cx| {
+                this.set_note2blog(id_blog.clone(), !is_blog, cx)
+            });
         }),
     )
     .item(
@@ -2135,6 +2339,57 @@ fn note_row_menu(
     )
 }
 
+/// Feature 3: batch menu while the multi-selection covers the clicked
+/// row. Exports/PDF stay single-note (export_note_* take one id; a zip
+/// exporter is out of scope).
+fn note_row_menu_batch(
+    menu: gpui_kit::component::menu::PopupMenu,
+    shell: &gpui_kit::WeakEntity<AppShell>,
+    lang: Lang,
+    count: usize,
+) -> gpui_kit::component::menu::PopupMenu {
+    let shell_star = shell.clone();
+    let shell_blog = shell.clone();
+    let shell_del = shell.clone();
+    let shell_mv = shell.clone();
+    menu.item(
+        PopupMenuItem::new(format!(
+            "{} ({})",
+            i18n::t(lang, i18n::Key::MoveNoteTo),
+            count
+        ))
+        .on_click(move |_ev, _window, cx| {
+            // Reuse the single-note move picker; the commit routes to
+            // batch_move_to while a multi-select is live.
+            let _ = shell_mv.update(cx, |this, cx| {
+                this.nav_edit = Some(NavEdit::MoveNoteBatch);
+                cx.notify();
+            });
+        }),
+    )
+    .separator()
+    .item(
+        PopupMenuItem::new(i18n::t(lang, i18n::Key::StarNote)).on_click(move |_ev, _window, cx| {
+            let _ = shell_star.update(cx, |this, cx| this.batch_star(cx));
+        }),
+    )
+    .item(
+        PopupMenuItem::new(i18n::t(lang, i18n::Key::PublishBlog)).on_click(
+            move |_ev, _window, cx| {
+                let _ = shell_blog.update(cx, |this, cx| this.batch_set_note2blog(true, cx));
+            },
+        ),
+    )
+    .separator()
+    .item(
+        PopupMenuItem::new(i18n::t(lang, i18n::Key::DeleteNote)).on_click(
+            move |_ev, _window, cx| {
+                let _ = shell_del.update(cx, |this, cx| this.batch_delete(cx));
+            },
+        ),
+    )
+}
+
 impl Render for AppShell {
     fn render(
         &mut self,
@@ -2144,9 +2399,13 @@ impl Render for AppShell {
         let dark = self.dark(cx);
         let lang = self.lang;
         let t = move |k: i18n::Key| i18n::t(lang, k);
-        let base_bg = theme::material(Material::Base, dark);
+        // Round 3: root stays TRANSPARENT so the NSVisualEffectView blur
+        // reaches the nav pane; every other pane paints an opaque surface
+        // over it (list: double .bg below, reader/editor: Background).
+        // Root painting Material::Base would glass the whole window.
+        let base_bg = gpui_kit::transparent_black();
 
-        // Whole window: material[0] shows through the 44px transparent titlebar.
+        // Root paints nothing; panes own their backgrounds.
         let root = gpui_kit::base::v_flex()
             .id("shell-root")
             .track_focus(&self.root_focus)
@@ -2214,7 +2473,6 @@ impl Render for AppShell {
                     this.sync_now(cx);
                 },
             ));
-
         // Issue 17: no separate titlebar strip. The left nav's 44px header
         // region is the drag area (see render_nav); every pane runs flush
         // to the window top edge.
@@ -2979,14 +3237,18 @@ impl AppShell {
             self.nav == NavSelection::Trash,
         );
 
+        // Glass lives ONLY here (user round 3): nav paints Material::Base
+        // over the NSVisualEffectView. Root/list/reader paint opaque
+        // materials so no blur shows through them. Round 5: the Base alpha
+        // follows the user's transparency pref (off/weak/medium/strong).
+        let glass = crate::prefs::Prefs::load(&self.data_dir).glass;
         let mut nav = gpui_kit::base::v_flex()
             .w_full()
             .h_full()
-            .bg(theme::material(Material::Base, dark))
+            .bg(theme::glass_base(dark, &glass))
             // Tests read this element's bounds to prove the pane layout
             // survives ⌘T full preview (no-op in release).
             .debug_selector(|| "nav-pane".into())
-            // Issue 17: 44px header below is the window-drag region (see
             .px_3()
             .gap_1()
             .child(drag_header(window, lang, cx))
@@ -3460,9 +3722,9 @@ impl AppShell {
     /// Issue 17 Q7: three-button segmented control (label trio + active index).
     /// `on_pick` receives the picked index; the dialog rebuild re-reads prefs,
     /// so the highlight stays in sync.
-    fn segmented(
+    fn segmented<const N: usize>(
         id: &'static str,
-        labels: [SharedString; 3],
+        labels: [SharedString; N],
         active: usize,
         on_pick: impl Fn(usize, &mut Window, &mut gpui_kit::App) + 'static,
     ) -> AnyElement {
@@ -3488,6 +3750,43 @@ impl AppShell {
     /// per call keeps language live without reopening the dialog.
     fn open_settings(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
         let shell = cx.entity();
+        // ADR-0010: family picker entity must exist BEFORE the dialog
+        // closure borrows cx — entity creation can't happen inside it.
+        let zh = self.lang == Lang::Zh;
+        let items: Vec<SharedString> = theme::FAMILIES
+            .iter()
+            .map(|f| SharedString::from(if zh { f.name_zh } else { f.name_en }))
+            .collect();
+        let sel = theme::family_index(&crate::prefs::Prefs::load(&self.data_dir).ui_theme);
+        let family_state = cx.new(|cx| {
+            ComboboxState::new(
+                SearchableVec::new(items),
+                vec![IndexPath::default().row(sel)],
+                window,
+                cx,
+            )
+            .searchable(false)
+        });
+        cx.subscribe(&family_state, {
+            let zh = zh;
+            move |this: &mut AppShell,
+                  _: gpui_kit::Entity<ComboboxState<SearchableVec<SharedString>>>,
+                  ev: &ComboboxEvent<SearchableVec<SharedString>>,
+                  cx| {
+                if let ComboboxEvent::Confirm(vals) = ev {
+                    let hit = vals.first().and_then(|v| {
+                        theme::FAMILIES.iter().position(|f| {
+                            SharedString::from(if zh { f.name_zh } else { f.name_en }) == *v
+                        })
+                    });
+                    if let Some(ix) = hit {
+                        let id = theme::FAMILIES[ix].id;
+                        this.set_ui_theme(id, cx);
+                    }
+                }
+            }
+        })
+        .detach();
         // Which section is selected, stable across the closure's frames.
         let section: std::rc::Rc<std::cell::Cell<usize>> = std::rc::Rc::default();
         window.open_dialog(cx, move |dialog, _window, cx| {
@@ -3541,6 +3840,72 @@ impl AppShell {
                                 },
                             ),
                         ))
+                        // ADR-0010: theme family — UI-wide, so it lives in
+                        // Appearance, not Editor. One pref retints everything.
+                        .child(row(
+                            t(i18n::Key::UiTheme).into(),
+                            // kit's Combobox renders `.size_full()` on its
+                            // root; a fixed-width wrapper keeps the trigger
+                            // right-aligned like every other row control
+                            // instead of stretching across the row.
+                            gpui_kit::div()
+                                .w(theme::ui(94.))
+                                .child(
+                                    Combobox::new(&family_state)
+                                        .with_size(gpui_kit::component::Size::Small)
+                                        .menu_width(gpui_kit::px(150.)),
+                                )
+                                .into_any_element(),
+                        ))
+                        .child(row(t(i18n::Key::AccentColor).into(), {
+                            let mut swatches = gpui_kit::base::h_flex().gap_1();
+                            for (id, hex) in theme::ACCENTS {
+                                let shell = shell_c.clone();
+                                let id = *id;
+                                let selected = prefs.accent == id;
+                                let mut sw = gpui_kit::div()
+                                    .id(SharedString::from(format!("accent-{id}")))
+                                    .size(px(18.))
+                                    .rounded_full()
+                                    .bg(gpui_kit::rgb(*hex))
+                                    .when(selected, |el| {
+                                        el.border_1().border_color(theme::foreground(dark))
+                                    });
+                                sw = sw.on_click(move |_, _window, cx| {
+                                    let _ = shell.update(cx, |this, cx| {
+                                        this.set_accent(id, cx);
+                                    });
+                                });
+                                swatches = swatches.child(sw);
+                            }
+                            swatches.into_any_element()
+                        }))
+                        // Round 5: nav transparency strength, 4 flat steps.
+                        .child(row(
+                            t(i18n::Key::GlassEffect).into(),
+                            Self::segmented(
+                                "set-glass",
+                                [
+                                    t(i18n::Key::GlassOff).into(),
+                                    t(i18n::Key::GlassWeak).into(),
+                                    t(i18n::Key::GlassMedium).into(),
+                                    t(i18n::Key::GlassStrong).into(),
+                                ],
+                                match prefs.glass.as_str() {
+                                    "off" => 0,
+                                    "weak" => 1,
+                                    "strong" => 3,
+                                    _ => 2,
+                                },
+                                {
+                                    let shell = shell_c.clone();
+                                    move |ix, _window, cx| {
+                                        let id = ["off", "weak", "medium", "strong"][ix];
+                                        shell.update(cx, |this, cx| this.set_glass(id, cx));
+                                    }
+                                },
+                            ),
+                        ))
                         // Interface zoom (issue 23 #5 / UI round 10: 3 steps).
                         .child(row(t(i18n::Key::InterfaceZoom).into(), {
                             let mut zooms = gpui_kit::base::h_flex().gap_1();
@@ -3571,15 +3936,14 @@ impl AppShell {
                                 [
                                     t(i18n::Key::FontDefault).into(),
                                     t(i18n::Key::FontWenKai).into(),
-                                    t(i18n::Key::FontDefault).into(),
                                 ],
-                                if prefs.font == "wenkai" { 1 } else { 0 },
+                                if prefs.font == "wenkai-mono" { 1 } else { 0 },
                                 {
                                     let shell = shell_c.clone();
                                     move |ix, _window, cx| {
                                         shell.update(cx, |this, cx| {
                                             this.set_font_setting(
-                                                if ix == 1 { "wenkai" } else { "" },
+                                                if ix == 1 { "wenkai-mono" } else { "" },
                                                 cx,
                                             );
                                         });
@@ -3587,18 +3951,32 @@ impl AppShell {
                                 },
                             ),
                         ))
-                        .child(small_label(
-                            if crate::fonts::INSTALL_FAILED
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                            {
-                                t(i18n::Key::FontInstallFailed)
-                            } else if crate::fonts::install_path().is_file() {
-                                t(i18n::Key::FontRestartHint)
-                            } else {
-                                t(i18n::Key::FontDownloading)
+                        // Font hint shows only while it still matters:
+                        // downloading (state 0, file absent), just installed
+                        // this run (state 1 + file written this session), or
+                        // failed (state 2). Silent when WenKai isn't in use
+                        // or was installed by an earlier run.
+                        .when(
+                            prefs.font == "wenkai-mono"
+                                && crate::fonts::INSTALL_STATE
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    != 1
+                                || crate::fonts::INSTALL_STATE
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    == 2,
+                            |el| {
+                                el.child(small_label(
+                                    match crate::fonts::INSTALL_STATE
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        2 => t(i18n::Key::FontInstallFailed),
+                                        1 => t(i18n::Key::FontRestartHint),
+                                        _ => t(i18n::Key::FontDownloading),
+                                    },
+                                    muted,
+                                ))
                             },
-                            muted,
-                        ))
+                        )
                         // Language
                         .child(row(
                             t(i18n::Key::LanguageSetting).into(),
@@ -3624,29 +4002,6 @@ impl AppShell {
                                 },
                             ),
                         ))
-                        .child(row(t(i18n::Key::AccentColor).into(), {
-                            let mut swatches = gpui_kit::base::h_flex().gap_1();
-                            for (id, hex) in theme::ACCENTS {
-                                let shell = shell_c.clone();
-                                let id = *id;
-                                let selected = prefs.accent == id;
-                                let mut sw = gpui_kit::div()
-                                    .id(SharedString::from(format!("accent-{id}")))
-                                    .size(px(18.))
-                                    .rounded_full()
-                                    .bg(gpui_kit::rgb(*hex))
-                                    .when(selected, |el| {
-                                        el.border_1().border_color(theme::foreground(dark))
-                                    });
-                                sw = sw.on_click(move |_, _window, cx| {
-                                    let _ = shell.update(cx, |this, cx| {
-                                        this.set_accent(id, cx);
-                                    });
-                                });
-                                swatches = swatches.child(sw);
-                            }
-                            swatches.into_any_element()
-                        }));
                 }
                 // ── 编辑器 / Editor ────────────────────────────────
                 1 => {
@@ -3680,31 +4035,6 @@ impl AppShell {
                                     }
                                 })
                                 .into_any_element(),
-                        ))
-                        // Editor palette moved to the Editor section (UI round 11).
-                        .child(row(
-                            t(i18n::Key::EditorPalette).into(),
-                            Self::segmented(
-                                "set-palette",
-                                [
-                                    t(i18n::Key::PaletteDefault).into(),
-                                    t(i18n::Key::PaletteWarm).into(),
-                                    t(i18n::Key::PaletteSolarized).into(),
-                                ],
-                                match prefs.editor_palette.as_str() {
-                                    "" => 0,
-                                    "warm" => 1,
-                                    _ => 2,
-                                },
-                                {
-                                    let shell = shell_c.clone();
-                                    move |ix, _window, cx| {
-                                        shell.update(cx, |this, cx| {
-                                            this.set_editor_palette(ix, cx);
-                                        });
-                                    }
-                                },
-                            ),
                         ))
                         // Editor font size (UI round 12): regular/medium/large;
                         // the appearance zoom scales this on top.
@@ -3812,9 +4142,13 @@ impl AppShell {
                 .child(nav)
                 .child(right);
 
+            // Round 3: kit paints the dialog panel from tokens.background,
+            // which apply_wake_theme forces transparent for the window
+            // glass. Re-opaque it here or settings floats on the blur.
             dialog
                 .w(px(640.))
                 .title(t(i18n::Key::SettingsTitle))
+                .bg(theme::material(Material::Popover, dark))
                 .child(content)
         });
     }
@@ -4415,7 +4749,10 @@ impl AppShell {
         let mut list = gpui_kit::base::v_flex()
             .w_full()
             .h_full()
-            .bg(theme::material(Material::List, dark))
+            // Round 5: no glass outside the nav — the list column is a
+            // solid surface. (Round 3 stacked translucent List over an
+            // opaque fill; same pixels, one fill fewer now.)
+            .bg(theme::material(Material::Background, dark))
             // Issue 17: list column runs flush to the window top (drag
             // region is the left nav's 44px header only).
             .px_3()
@@ -4436,6 +4773,8 @@ impl AppShell {
         } else {
             // Issue 17: virtualized — only visible rows render.
             let sel_id = self.selected.clone();
+            let multi: std::collections::HashSet<leanote_core::Id> =
+                self.selected_ids.iter().cloned().collect();
             let shell = cx.weak_entity();
             let notes_for_list = notes.clone();
             let scroll = self.notes_scroll.clone();
@@ -4462,7 +4801,8 @@ impl AppShell {
                                     // Issue 19: content excerpt (store-side
                                     // desc), single truncated line.
                                     let desc: SharedString = n.desc.clone().into();
-                                    let is_sel = sel_id.as_ref() == Some(&n.note_id);
+                                    let is_sel = sel_id.as_ref() == Some(&n.note_id)
+                                        || multi.contains(&n.note_id);
                                     let divided = ix + 1 < notes_for_list.len();
                                     note_list_row(
                                         &shell,
@@ -4501,21 +4841,38 @@ impl AppShell {
         }
 
         // Issue 18: "move note" picker replaces the note rows while
-        // choosing (mirrors the nav's notebook-move picker).
-        if let Some(NavEdit::MoveNote { id }) = &self.nav_edit {
-            let moved = id.clone();
+        // choosing (mirrors the nav's notebook-move picker). Feature 3:
+        // MoveNoteBatch shares it, committing to the whole selection.
+        #[derive(Clone)]
+        enum MoveTarget {
+            One(leanote_core::Id),
+            Batch(Vec<leanote_core::Id>),
+        }
+        let target = match &self.nav_edit {
+            Some(NavEdit::MoveNote { id }) => Some(MoveTarget::One(id.clone())),
+            Some(NavEdit::MoveNoteBatch) if !self.selected_ids.is_empty() => {
+                Some(MoveTarget::Batch(self.selected_ids.clone()))
+            }
+            _ => None,
+        };
+        if let Some(target) = target {
+            let count = match &target {
+                MoveTarget::One(_) => 1,
+                MoveTarget::Batch(v) => v.len(),
+            };
             let shell = cx.weak_entity();
             let mut picker = gpui_kit::base::v_flex().flex_1().min_h_0().gap_1().py_2();
-            picker = picker.child(
-                Label::new(format!("{} · {}", t(i18n::Key::MoveNoteTo), title))
-                    .text_size(theme::ui(16.))
-                    .text_color(fg),
-            );
+            let head = if count > 1 {
+                format!("{} ({})", t(i18n::Key::MoveNoteTo), count)
+            } else {
+                format!("{} · {}", t(i18n::Key::MoveNoteTo), title)
+            };
+            picker = picker.child(Label::new(head).text_size(theme::ui(16.)).text_color(fg));
             let nodes = self.notebook_nav_nodes().clone();
             for node in &nodes {
                 let shell2 = shell.clone();
                 let pid = node.id.clone();
-                let moved2 = moved.clone();
+                let tgt = target.clone();
                 picker = picker.child(
                     gpui_kit::base::h_flex()
                         .id(format!("note-mv-{pid}"))
@@ -4524,8 +4881,11 @@ impl AppShell {
                         .ml(px(12. * node.depth as f32))
                         .rounded(px(theme::RADIUS_SELECTION))
                         .on_click(move |_, _, cx| {
-                            let _ = shell2.update(cx, |this, cx| {
-                                this.move_note_to(moved2.clone(), pid.clone(), cx)
+                            let _ = shell2.update(cx, |this, cx| match &tgt {
+                                MoveTarget::One(id) => {
+                                    this.move_note_to(id.clone(), pid.to_string(), cx)
+                                }
+                                MoveTarget::Batch(_) => this.batch_move_to(pid.to_string(), cx),
                             });
                         })
                         .child(Label::new(node.title.clone()).text_size(theme::ui(14.))),
@@ -4545,7 +4905,8 @@ impl AppShell {
             return gpui_kit::base::v_flex()
                 .w_full()
                 .h_full()
-                .bg(theme::material(Material::List, dark))
+                // Opaque: no glass outside the nav (round 5).
+                .bg(theme::material(Material::Background, dark))
                 .px_3()
                 .gap_1()
                 .pt(px(10.))
@@ -4615,7 +4976,32 @@ impl AppShell {
             .selected
             .as_ref()
             .and_then(|id| self.store().and_then(|s| s.get_note_any(id).ok().flatten()));
-        // Editor mode takes over the pane for the selected note (ticket 10).
+        // Feature 3: multi-select replaces the reader with a batch
+        // summary — no single note to read, and it makes the modal
+        // state loud.
+        if self.selected_ids.len() > 1 {
+            let count = self.selected_ids.len();
+            let mut mask = gpui_kit::base::v_flex();
+            if let Some(bar) = bar {
+                mask = mask.child(bar);
+            }
+            return pane.child(
+                mask.flex_1().child(
+                    gpui_kit::base::v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(
+                            Label::new(format!("{} {}", count, t(i18n::Key::MultiSelected)))
+                                .text_size(theme::ui(16.))
+                                .text_color(muted),
+                        )
+                        .child(small_label(t(i18n::Key::MultiSelectHint), muted)),
+                ),
+            );
+        }
+
         if self
             .editing
             .as_ref()

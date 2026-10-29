@@ -10,16 +10,16 @@
 //! fallback — Typst itself does CJK line breaking and picks any font covering
 //! the glyphs.
 
+use markdown::mdast::Node;
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use markdown::mdast::Node;
 use typst::diag::{FileError, FileResult};
 use typst::foundations::{Bytes, Datetime, Duration};
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
+use typst::utils::LazyHash;
 use typst::LibraryExt;
 use typst::World;
-use typst::utils::LazyHash;
 
 /// Pre-preamble every export shares: A4, 2cm margins, 11pt body text.
 /// `#set text(lang: …)` is omitted: per-glyph font fallback (Typst picks the
@@ -207,8 +207,8 @@ fn escape_content(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
-            '\\' | '*' | '_' | '#' | '$' | '<' | '>' | '-' | '+' | '/' | '=' | '"'
-            | '\'' | '~' | '`' | '@' | '[' | ']' => {
+            '\\' | '*' | '_' | '#' | '$' | '<' | '>' | '-' | '+' | '/' | '=' | '"' | '\'' | '~'
+            | '`' | '@' | '[' | ']' => {
                 o.push('\\');
                 o.push(ch);
             }
@@ -240,11 +240,14 @@ impl World for NoteWorld<'_> {
         if id == self.main_id {
             Ok(self.source.clone())
         } else {
-            Err(FileError::NotFound(PathBuf::from(id.vpath().get_with_slash())))
+            Err(FileError::NotFound(PathBuf::from(
+                id.vpath().get_with_slash(),
+            )))
         }
     }
     fn file(&self, id: FileId) -> FileResult<Bytes> {
-        self.source(id).map(|s| Bytes::from_string(s.text().to_string()))
+        self.source(id)
+            .map(|s| Bytes::from_string(s.text().to_string()))
     }
     fn font(&self, index: usize) -> Option<Font> {
         self.fonts.font(index)
@@ -282,12 +285,13 @@ pub fn note_to_pdf_title(title: &str, markdown_src: &str) -> Result<Vec<u8>, Str
     };
     let doc = match typst::compile::<typst_layout::PagedDocument>(&world) {
         typst::diag::Warned { output: Ok(d), .. } => d,
-        typst::diag::Warned { output: Err(errs), .. } => {
+        typst::diag::Warned {
+            output: Err(errs), ..
+        } => {
             return Err(fmt_diags(&errs));
         }
     };
-    typst_pdf::pdf(&doc, &typst_pdf::PdfOptions::default())
-        .map_err(|e| fmt_diags(&e))
+    typst_pdf::pdf(&doc, &typst_pdf::PdfOptions::default()).map_err(|e| fmt_diags(&e))
 }
 
 /// First few diagnostic messages, semicolon-joined.
@@ -310,7 +314,10 @@ mod tests {
                   ```rust\nfn f() {}\n```\n\n- 甲项\n- 乙项\n\n> 引用块\n\n\
                   [链接](https://leanote.com) and ![img](leanote://file/getImage?fileId=x)\n\n---\n";
         let t = markdown_to_typst("我的笔记", md);
-        assert!(t.contains("#set page(paper: \"a4\", margin: 2cm)"), "preamble: {t}");
+        assert!(
+            t.contains("#set page(paper: \"a4\", margin: 2cm)"),
+            "preamble: {t}"
+        );
         assert!(t.contains("= 我的笔记"), "title heading: {t}");
         assert!(t.contains("= 标题 One"), "h1 heading: {t}");
         assert!(t.contains("*bold*"), "bold: {t}");
@@ -326,7 +333,10 @@ mod tests {
         assert!(t.contains("- 甲项"), "list item: {t}");
         assert!(t.contains("#quote(block: true)["), "blockquote: {t}");
         assert!(t.contains("引用块"), "quote CJK: {t}");
-        assert!(t.contains("(https:\\/\\/leanote.com)"), "link url in parens: {t}");
+        assert!(
+            t.contains("(https:\\/\\/leanote.com)"),
+            "link url in parens: {t}"
+        );
         assert!(!t.contains("fileId"), "image skipped: {t}");
         assert!(t.contains("#line(length: 100%)"), "hr: {t}");
     }

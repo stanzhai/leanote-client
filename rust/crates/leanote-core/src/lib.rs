@@ -148,18 +148,20 @@ pub struct NoteMeta {
     pub is_markdown: bool,
     pub is_trash: bool,
     pub star: bool,
+    /// Blog publish flag (IsBlog): the note is public on the blog site.
+    pub is_blog: bool,
     pub updated_time: i64,
 }
 
 /// Meta columns shared by the lightweight list queries (issue 19).
 pub(crate) const NOTES_META_COLS: &str = "SELECT NoteId, NotebookId, Title, \"Desc\", Tags,
-    IsMarkdown, IsTrash, Star, UpdatedTime
+    IsMarkdown, IsTrash, Star, IsBlog, UpdatedTime
  FROM notes";
 
 /// Live-note filter for the meta queries (same predicates as
 /// [`NOTES_LIVE_BASE`]).
 pub(crate) const NOTES_META_LIVE: &str = "SELECT NoteId, NotebookId, Title, \"Desc\", Tags,
-    IsMarkdown, IsTrash, Star, UpdatedTime
+    IsMarkdown, IsTrash, Star, IsBlog, UpdatedTime
  FROM notes WHERE IsTrash=0 AND LocalIsDelete=0 AND IsDeleted=0";
 
 #[derive(Clone, Debug, Default)]
@@ -940,6 +942,17 @@ impl Store {
         )
     }
 
+    /// JS Note.setNote2Blog: flip IsBlog and mark the note dirty so the
+    /// next sync pushes the publish state to the server. UpdatedTime is
+    /// untouched — publishing is metadata, not content, so it must not
+    /// re-sort the note to the top of Recent (JS does the same).
+    pub fn set_note2blog(&self, id: &Id, is_blog: bool) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE notes SET IsBlog=?2, IsDirty=1 WHERE NoteId=?1",
+            params![id.to_string(), is_blog as i64],
+        )
+    }
+
     // ---- Ticket 11: notebook & tag management (offline, sync-pushed) ----
 
     /// JS Notebook.addNotebook: new row, LocalIsNew+IsDirty (pushed on the
@@ -1466,7 +1479,8 @@ fn row_to_note_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteMeta> {
         is_markdown: r.get::<_, i64>(5)? != 0,
         is_trash: r.get::<_, i64>(6)? != 0,
         star: r.get::<_, i64>(7)? != 0,
-        updated_time: r.get(8)?,
+        is_blog: r.get::<_, i64>(8)? != 0,
+        updated_time: r.get(9)?,
     })
 }
 

@@ -36,19 +36,19 @@ pub fn acquire() -> Result<TcpListener, ()> {
 /// Called inside the GPUI run closure; smol converts the std listener.
 pub fn listen(listener: TcpListener, cx: &mut gpui_kit::App) {
     let listener = smol::net::TcpListener::from(smol::Async::new(listener).expect("listener"));
-    cx.spawn(async move |cx| {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else { break };
-            let mut buf = [0u8; 16];
-            use smol::io::AsyncReadExt as _;
-            let _ = stream.read(&mut buf).await;
-            let _ = cx.update(|cx| {
-                cx.activate(true);
-                if let Some(h) = WINDOW.get() {
-                    let _ = h.update(cx, |_, window, _| window.activate_window());
-                }
-            });
-        }
+    cx.spawn(async move |cx| loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            break;
+        };
+        let mut buf = [0u8; 16];
+        use smol::io::AsyncReadExt as _;
+        let _ = stream.read(&mut buf).await;
+        let _ = cx.update(|cx| {
+            cx.activate(true);
+            if let Some(h) = WINDOW.get() {
+                let _ = h.update(cx, |_, window, _| window.activate_window());
+            }
+        });
     })
     .detach();
 }

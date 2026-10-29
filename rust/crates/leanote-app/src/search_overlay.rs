@@ -34,8 +34,8 @@ gpui_kit::actions!(
         OpenSettings
     ]
 );
-// Issue 17 Q6 quick actions: new note / sync (UI round 10 moved export
-// backup into the settings dialog and Vim into its settings row).
+// Issue 17 Q6 quick actions. (⌘A note-list select-all removed: the
+// app-scope binding stole ⌘A from the editor's select-all.)
 gpui_kit::actions!(leanote, [QuickNewNote, QuickSyncNow]);
 
 /// Fixed overlay width. ADR-0003 said 680, but on a 13–14" laptop that
