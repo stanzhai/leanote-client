@@ -13,7 +13,7 @@ use gpui_kit::component::combobox::{Combobox, ComboboxEvent, ComboboxState};
 use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
 use gpui_kit::component::input::{
     Backspace, Delete, Editor, EditorState, Enter, Escape, IndentInline, Input, InputEvent,
-    InputState, OutdentInline,
+    InputState, MoveDown, MoveLeft, MoveRight, MoveUp, OutdentInline,
 };
 use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
@@ -210,9 +210,11 @@ pub struct AppShell {
     nav_edit: Option<NavEdit>,
     // --- Ticket 10 editor state ---
     /// Edit mode for `selected` (only entered for live IsMarkdown notes).
-    editing: Option<EditState>,
+    pub(crate) editing: Option<EditState>,
     /// History popover open (only meaningful while editing).
     history_open: bool,
+    /// 斜杠面板（ADR-0011）：编辑器内 `/` 触发的 4×4 命令格；None = 关。
+    pub(crate) slash_panel: Option<crate::slash_panel::SlashPanel>,
     /// Which history row is previewed (None = list view).
     history_preview: Option<leanote_core::Id>,
     /// List caches — invalidated by invalidate_lists() on any mutation
@@ -230,9 +232,6 @@ pub struct AppShell {
     vim: crate::vim::VimState,
     /// Vim enabled (toolbar toggle; persisted as prefs.vim_default).
     vim_enabled: bool,
-    /// Issue 23 #10: markdown insertion toolbar shown in the editor
-    /// (persisted as prefs.editor_toolbar; default off).
-    editor_toolbar: bool,
     // --- Notebook sidebar drag-reorder (ticket 11 follow-up) ---
     /// Drop target under the pointer while a notebook row is dragged.
     /// None = no valid target. Lives on the shell: rows are rebuilt every
@@ -244,16 +243,16 @@ pub struct AppShell {
 /// highlighting. Buffer lives in the kit's EditorState so IME composition is
 /// handled entirely by the kit; `saved_content` is the last persisted text so
 /// an unchanged editor never writes to the store (issue 17 Q2/Q8).
-struct EditState {
+pub(crate) struct EditState {
     note_id: leanote_core::Id,
     title: gpui_kit::Entity<InputState>,
-    content: gpui_kit::Entity<EditorState>,
+    pub(crate) content: gpui_kit::Entity<EditorState>,
     /// Last persisted content — auto-save compares against it.
     saved_content: String,
     /// True when the buffer has changed since last persist (drives autosave).
     dirty: bool,
     /// Show rendered preview instead of source.
-    preview: bool,
+    pub(crate) preview: bool,
     /// Set for one frame after a save, to flash "Saved".
     saved_flash: bool,
     /// Issue 23 #6: working copy of tags (status bar chips); Some(≠ store
@@ -344,7 +343,6 @@ impl AppShell {
             sync_status: None,
             pending_sync: false,
             vim_enabled: prefs.vim_default,
-            editor_toolbar: prefs.editor_toolbar,
             notebook_drag_target: None,
             data_dir,
             host,
@@ -375,6 +373,7 @@ impl AppShell {
             nav_edit: None,
             editing: None,
             history_open: false,
+            slash_panel: None,
             history_preview: None,
             cached_notebook_nodes: None,
             cached_tag_nodes: None,
@@ -1259,16 +1258,6 @@ impl AppShell {
         cx.notify();
     }
 
-    /// Issue 23 #10: editor toolbar pref → disk + live toggle.
-    fn set_editor_toolbar(&mut self, on: bool, cx: &mut gpui_kit::Context<Self>) {
-        let dir = self.data_dir.clone();
-        let mut p = crate::prefs::Prefs::load(&dir);
-        p.editor_toolbar = on;
-        p.save(&dir);
-        self.editor_toolbar = on;
-        cx.notify();
-    }
-
     /// Issue 23 #9: vim pref row (⌘K quick toggle stays).
     fn set_vim_setting(&mut self, on: bool, cx: &mut gpui_kit::Context<Self>) {
         self.vim_enabled = on;
@@ -1391,6 +1380,30 @@ impl AppShell {
             return false;
         }
         self.vim_consume(key, None, window, cx)
+    }
+
+    /// 斜杠面板打开时的方向键导航（用户需求 2）。方向键是 Move* 动作，
+    /// capture_action 阶段到达这里；面板未开时不拦（编辑器正常移动）。
+    fn slash_move(&mut self, dir: &str, cx: &mut gpui_kit::Context<Self>) {
+        let Some(mut panel) = self.slash_panel.clone() else {
+            return;
+        };
+        let keystroke = gpui_kit::Keystroke {
+            key: dir.into(),
+            ..Default::default()
+        };
+        let ev = KeyDownEvent {
+            keystroke,
+            is_held: false,
+            prefer_character_input: false,
+        };
+        if crate::slash_panel::key(&mut panel, &ev, self.lang) == Some(true) {
+            self.slash_panel = Some(panel);
+        } else {
+            self.slash_panel = None;
+        }
+        cx.notify();
+        cx.stop_propagation();
     }
 
     /// New note in the current nav context's notebook (IsNew=1, dirty) and
@@ -2657,9 +2670,12 @@ impl Render for AppShell {
                             ),
                         )
                         .child(
-                            TextView::markdown("full-preview", content)
-                                .scrollable(true)
-                                .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
+                            crate::mermaid::install(
+                                TextView::markdown("full-preview", content),
+                                dark,
+                            )
+                            .scrollable(true)
+                            .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
                         );
                     body = body
                         .child(
@@ -2823,6 +2839,51 @@ fn drag_header(
                         ),
                 ),
         )
+        // ADR-0011: Windows/Linux 自绘窗口控制按钮（macOS 交通灯由系统
+        // 绘制）。每块区域带 WindowControlArea hitbox，平台层据此做
+        // NCHITTEST/原生点击；按钮 UI 只是视觉提示，点击不打事件。
+        .when(!is_macos, |this| {
+            this.child(
+                gpui_kit::base::h_flex()
+                    .flex_none()
+                    .items_center()
+                    .child(win_control_btn(
+                        "win-min",
+                        AssetIcon::Minus,
+                        WindowControlArea::Min,
+                    ))
+                    .child(win_control_btn(
+                        "win-max",
+                        AssetIcon::Square,
+                        WindowControlArea::Max,
+                    ))
+                    .child(win_control_btn(
+                        "win-close",
+                        AssetIcon::X,
+                        WindowControlArea::Close,
+                    )),
+            )
+        })
+}
+
+/// ADR-0011: 一个自绘窗口控制按钮（Windows/Linux）。hitbox 交给平台
+/// 层处理，元素本身只提供 44×32 视觉区 + hover 反馈。
+fn win_control_btn(
+    id: &'static str,
+    icon: AssetIcon,
+    area: WindowControlArea,
+) -> impl IntoElement + use<> {
+    gpui_kit::div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .w(theme::ui(44.))
+        .h(theme::ui(32.))
+        .hover(|s| s.bg(gpui_kit::rgba(0x00000014)))
+        .child(Icon::new(icon))
+        .window_control_area(area)
 }
 
 /// Issue 17/21: transparent drag strip at the top of the right pane — drag
@@ -4021,21 +4082,6 @@ impl AppShell {
                                 })
                                 .into_any_element(),
                         ))
-                        // Editor toolbar toggle (issue 23 #10)
-                        .child(row(
-                            t(i18n::Key::EditorToolbar).into(),
-                            Switch::new("set-editor-toolbar")
-                                .checked(prefs.editor_toolbar)
-                                .on_click({
-                                    let shell = shell_c.clone();
-                                    move |checked, _window, cx| {
-                                        let _ = shell.update(cx, |this, cx| {
-                                            this.set_editor_toolbar(*checked, cx)
-                                        });
-                                    }
-                                })
-                                .into_any_element(),
-                        ))
                         // Editor font size (UI round 12): regular/medium/large;
                         // the appearance zoom scales this on top.
                         .child(row(
@@ -4212,10 +4258,11 @@ impl AppShell {
         cx: &mut gpui_kit::Context<Self>,
     ) {
         let lang = self.lang;
+        let dark = self.dark(cx);
         let t = move |k: i18n::Key| i18n::t(lang, k);
         let shell = cx.entity();
         let prefs = crate::prefs::Prefs::load(&self.data_dir);
-        let preview_px = px(theme::preview_font_px(&prefs.editor_font_size, prefs.zoom));
+        let _preview_px = px(theme::preview_font_px(&prefs.editor_font_size, prefs.zoom));
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let shell_c = shell.clone();
             let src = browse::reader_markdown_src(&title, &content, true);
@@ -4223,11 +4270,9 @@ impl AppShell {
                 .w(px(560.))
                 .title(t(i18n::Key::History))
                 .child(
-                    div().text_size(preview_px).child(
-                        TextView::markdown("history-preview", src)
-                            .scrollable(true)
-                            .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
-                    ),
+                    crate::mermaid::install(TextView::markdown("history-preview", src), dark)
+                        .scrollable(true)
+                        .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
                 )
                 .child(
                     Button::new("history-restore")
@@ -4248,7 +4293,8 @@ impl AppShell {
     }
 
     /// Issue 19: Markdown cheat-sheet dialog.
-    fn open_md_help(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+    pub(crate) fn open_md_help(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        let dark = self.dark(cx);
         let lang = self.lang;
         let t = move |k: i18n::Key| i18n::t(lang, k);
         let prefs = crate::prefs::Prefs::load(&self.data_dir);
@@ -4257,9 +4303,12 @@ impl AppShell {
             dialog
                 .w(px(440.))
                 .title(t(i18n::Key::MarkdownHelpTitle))
-                .child(div().text_size(preview_px).child(TextView::markdown(
-                    "md-help",
-                    browse::reader_markdown_src("", i18n::markdown_help_body(lang), true),
+                .child(div().text_size(preview_px).child(crate::mermaid::install(
+                    TextView::markdown(
+                        "md-help",
+                        browse::reader_markdown_src("", i18n::markdown_help_body(lang), true),
+                    ),
+                    dark,
                 )))
         });
     }
@@ -4350,7 +4399,7 @@ impl AppShell {
     /// Issue 19: wrap the selection (or insert at cursor) with `prefix` /
     /// `suffix` markdown markup. Uses the public selection API: select the
     /// target range, then `replace()` swaps it (undo-able, cursor at end).
-    fn insert_around(
+    pub(crate) fn insert_around(
         &mut self,
         prefix: &str,
         suffix: &str,
@@ -4377,6 +4426,24 @@ impl AppShell {
         self.schedule_autosave(cx);
     }
 
+    /// 斜杠面板「图片」项：打开文件选择器并附加到笔记
+    /// （原 md-toolbar 图标按钮逻辑，面板取代工具栏后迁到这里）。
+    pub(crate) fn pick_images(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: None,
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                _ = this.update_in(cx, |this, window, cx| {
+                    this.attach_images(paths, window, cx);
+                });
+            }
+        })
+        .detach();
+    }
     /// Issue 21 需求9: store each image locally (24-hex id) and insert
     /// `![name](leanote://file/getImage?fileId=<id>)` at the cursor.
     fn attach_images(
@@ -4503,6 +4570,18 @@ impl AppShell {
         hit
     }
 
+    /// 光标前一字符是否为 `c`（斜杠面板触发防误触用）。
+    fn char_before_caret_is(&self, c: char, cx: &mut gpui_kit::App) -> bool {
+        let Some(ed) = &self.editing else {
+            return false;
+        };
+        let editor = ed.content.clone();
+        editor.update(cx, |state, _| {
+            let range = state.selected_range();
+            let caret = range.start.min(range.end);
+            caret > 0 && state.value().as_ref().chars().nth(caret - 1) == Some(c)
+        })
+    }
     /// Issue 21 需求5: Tab/Shift-Tab on a list line indents the line
     /// start; other lines keep the kit default. Returns true when
     /// consumed.
@@ -5127,7 +5206,7 @@ impl AppShell {
             // parse options; `.scrollable` keeps the whole pane from
             // scrolling away under the toolbar.
             .child(
-                TextView::markdown("reader", src)
+                crate::mermaid::install(TextView::markdown("reader", src), dark)
                     .scrollable(true)
                     .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
             );
@@ -5163,7 +5242,7 @@ impl AppShell {
         let title_entity = ed.title.clone();
         let content_entity = ed.content.clone();
         let preview = ed.preview;
-        let toolbar_on = self.editor_toolbar; // issue 23 #10
+        // issue 23 #10 工具栏已由斜杠面板（ADR-0011）取代。
         let saved_flash = ed.saved_flash;
 
         // Issue 19: title row = title input + ghost icon buttons; save runs
@@ -5231,78 +5310,6 @@ impl AppShell {
         // Issue 21: no Done and no OS-fullscreen button — quitting edit is
         // selecting another note; fullscreen is the ⌘T in-app preview.
 
-        // Markdown insertion toolbar (issue 19): wraps selection or inserts
-        // at the cursor.
-        let insert = |prefix: &'static str, suffix: &'static str| {
-            cx.listener(move |this, _ev, window, cx| {
-                this.insert_around(prefix, suffix, window, cx);
-            })
-        };
-        let md_btn =
-            |id: &'static str, icon: AssetIcon, prefix: &'static str, suffix: &'static str| {
-                Button::new(id)
-                    .icon(icon)
-                    .ghost()
-                    .xsmall()
-                    .on_click(insert(prefix, suffix))
-            };
-        let md_toolbar = gpui_kit::base::h_flex()
-            .gap_1()
-            .child(md_btn("md-h1", AssetIcon::Heading1, "# ", ""))
-            .child(md_btn("md-h2", AssetIcon::Heading2, "## ", ""))
-            .child(md_btn("md-h3", AssetIcon::Heading3, "### ", ""))
-            .child(md_btn("md-bold", AssetIcon::Bold, "**", "**"))
-            .child(md_btn("md-italic", AssetIcon::Italic, "*", "*"))
-            .child(md_btn("md-strike", AssetIcon::Strikethrough, "~~", "~~"))
-            .child(md_btn("md-code", AssetIcon::Code, "`", "`"))
-            .child(md_btn(
-                "md-codeblock",
-                AssetIcon::CodeXml,
-                "\n```\n",
-                "\n```\n",
-            ))
-            .child(md_btn("md-link", AssetIcon::Link, "[", "](url)"))
-            .child(md_btn("md-list", AssetIcon::List, "- ", ""))
-            .child(md_btn("md-olist", AssetIcon::ListOrdered, "1. ", ""))
-            .child(md_btn("md-quote", AssetIcon::Quote, "> ", ""))
-            .child(md_btn(
-                "md-table",
-                AssetIcon::Table,
-                "\n| a | b |\n|---|---|\n| ",
-                " |\n",
-            ))
-            .child(md_btn("md-hr", AssetIcon::Minus, "\n---\n", ""))
-            .child(
-                // Issue 21 需求9: pick images, store locally, insert links.
-                Button::new("md-image")
-                    .icon(AssetIcon::Image)
-                    .ghost()
-                    .xsmall()
-                    .on_click(cx.listener(|_this, _ev, window, cx| {
-                        let rx = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
-                            files: true,
-                            directories: false,
-                            multiple: true,
-                            prompt: None,
-                        });
-                        cx.spawn_in(window, async move |this, cx| {
-                            if let Ok(Ok(Some(paths))) = rx.await {
-                                _ = this.update_in(cx, |this, window, cx| {
-                                    this.attach_images(paths, window, cx);
-                                });
-                            }
-                        })
-                        .detach();
-                    })),
-            )
-            .child(
-                Button::new("md-help")
-                    .icon(AssetIcon::MessageCircleQuestionMark)
-                    .ghost()
-                    .xsmall()
-                    .on_click(cx.listener(|this, _ev, window, cx| this.open_md_help(window, cx))),
-            );
-
         // Body: preview via TextView, source via kit Editor. Title input
         // lives in the title row; only the content scrolls.
         let body = if preview {
@@ -5320,16 +5327,19 @@ impl AppShell {
                     prefs.zoom,
                 )))
                 .child(
-                    TextView::markdown(
-                        "editor-preview",
-                        browse::reader_markdown_src(
-                            &title_txt,
-                            &self
-                                .store()
-                                .map(|s| browse::resolve_note_images(&src, &s))
-                                .unwrap_or_else(|| src.clone()),
-                            true,
+                    crate::mermaid::install(
+                        TextView::markdown(
+                            "editor-preview",
+                            browse::reader_markdown_src(
+                                &title_txt,
+                                &self
+                                    .store()
+                                    .map(|s| browse::resolve_note_images(&src, &s))
+                                    .unwrap_or_else(|| src.clone()),
+                                true,
+                            ),
                         ),
+                        dark,
                     )
                     .scrollable(true)
                     .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
@@ -5420,8 +5430,18 @@ impl AppShell {
             .pb(px(5.))
             .h_full()
             .child(title_row)
+            .when_some(self.slash_panel.as_ref(), |el, p| {
+                // Issue 37: 格子点击执行、hover 同步选中 —— 处理闭包在
+                // slash_panel::render 内经 shell 实体回写。
+                el.children(crate::slash_panel::render(
+                    &content_entity,
+                    p,
+                    self.dark(cx),
+                    self.lang,
+                    cx.entity(),
+                ))
+            })
             .when_some(status_bar, |el, bar| el.child(bar))
-            .when(!preview && toolbar_on, |el| el.child(md_toolbar))
             .child(body)
             .on_drop::<gpui_kit::ExternalPaths>(cx.listener(
                 |this, paths: &gpui_kit::ExternalPaths, window, cx| {
@@ -5448,6 +5468,46 @@ impl AppShell {
                 },
             ))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                // 斜杠面板打开时优先消费按键（ADR-0011）。必须在
+                // ⌘S/vim/配对处理之前。Enter/Tab/方向键在 kit 层是
+                // 动作（Enter/IndentInline/Move*），不走 key_down ——
+                // 由各自 capture_action 的面板分支执行。
+                if this.slash_panel.is_some() {
+                    let lang = this.lang;
+                    let mut panel = this.slash_panel.clone().unwrap();
+                    // Esc 关闭时把触发串 `/`+query 写回编辑器（用户
+                    // 需求 3）：触发时本键已被吃掉，不回填则 `/` 无法
+                    // 正常输入。backspace 到头/过滤空关闭不回填。
+                    let restore = ev.keystroke.key == "escape";
+                    match crate::slash_panel::key(&mut panel, ev, lang) {
+                        None => {
+                            this.slash_panel = None;
+                            if restore {
+                                let text = format!("/{}", panel.query);
+                                if let Some(ed) = &this.editing {
+                                    if !ed.preview {
+                                        let editor = ed.content.clone();
+                                        editor.update(cx, |state, cx| {
+                                            let range = state.selected_range();
+                                            let caret = range.start.min(range.end);
+                                            state.set_selected_range(caret..caret, cx);
+                                            state.replace(&text, window, cx);
+                                            let end = caret + text.chars().count();
+                                            state.set_selected_range(end..end, cx);
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        Some(false) => {}
+                        Some(true) => {
+                            this.slash_panel = Some(panel);
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 // ⌘S / Ctrl+S save + push (IME-safe: key_char is None for
                 // cmd combos, so composition is never touched). Save marks
                 // the row IsDirty=1; sync_now pushes it.
@@ -5491,6 +5551,24 @@ impl AppShell {
                 // mode only (vim normal/visual consumed above), IME-safe
                 // (key_char present, no modifiers), kit defaults for the
                 // pairs are disabled at startup.
+                // 斜杠面板触发（ADR-0011）：插入态键入 `/` 且前一字符
+                // 不是 `/`（避免路径/URL）→ 打开面板，吃掉本键。
+                let is_slash = ev
+                    .keystroke
+                    .key_char
+                    .as_deref()
+                    .and_then(|s| s.chars().next())
+                    == Some('/');
+                if is_slash
+                    && this.slash_panel.is_none()
+                    && this.editor_insert_focused(window, cx)
+                    && !this.char_before_caret_is('/', cx)
+                {
+                    this.slash_panel = Some(crate::slash_panel::SlashPanel::default());
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 let m2 = &ev.keystroke.modifiers;
                 if !m2.platform && !m2.control && !m2.alt && !m2.shift {
                     if let Some(ch) = ev
@@ -5508,7 +5586,33 @@ impl AppShell {
                     }
                 }
             }))
+            // 方向键在 kit 层是 Move* 动作（key_down 看不到）——斜杠
+            // 面板打开时截下来做网格导航，否则落到编辑器移动光标
+            // （用户需求 2）。
+            .capture_action::<MoveUp>(cx.listener(move |this, _: &MoveUp, _, cx| {
+                this.slash_move("up", cx);
+            }))
+            .capture_action::<MoveDown>(cx.listener(move |this, _: &MoveDown, _, cx| {
+                this.slash_move("down", cx);
+            }))
+            .capture_action::<MoveLeft>(cx.listener(move |this, _: &MoveLeft, _, cx| {
+                this.slash_move("left", cx);
+            }))
+            .capture_action::<MoveRight>(cx.listener(move |this, _: &MoveRight, _, cx| {
+                this.slash_move("right", cx);
+            }))
             .capture_action::<Enter>(cx.listener(move |this, _: &Enter, window, cx| {
+                // Slash panel first: Enter is an action (never reaches
+                // capture_key_down), so without this branch the selected
+                // command never runs (user report 1).
+                if this.slash_panel.is_some() {
+                    let selected = this.slash_panel.as_ref().unwrap().selected;
+                    crate::slash_panel::execute(this, selected, window, cx);
+                    this.slash_panel = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 // Normal-mode enter / cmdline execute first; insert mode
                 // (or vim off) falls to the list continuation, then to
                 // the kit's plain enter.
@@ -5541,6 +5645,16 @@ impl AppShell {
             }))
             .capture_action::<IndentInline>(cx.listener(
                 move |this, _: &IndentInline, window, cx| {
+                    // Slash panel first — Tab is an action like Enter
+                    // (user report 1).
+                    if this.slash_panel.is_some() {
+                        let selected = this.slash_panel.as_ref().unwrap().selected;
+                        crate::slash_panel::execute(this, selected, window, cx);
+                        this.slash_panel = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
                     // Issue 21 需求5: list lines indent at line start; other
                     // lines keep the kit default (2-space at cursor).
                     if this.editor_insert_focused(window, cx) && this.md_indent(false, window, cx) {
@@ -5767,6 +5881,95 @@ mod tests {
                 "hXllo world",
                 "i→type→esc→x pipeline"
             );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Slash panel end-to-end: `/` opens the panel (key never lands in the
+    /// buffer), filter narrows, Enter executes at the caret — no phantom
+    /// deletion before it (user report 3).
+    #[gpui_kit::test]
+    fn slash_panel_inserts_at_caret(cx: &mut gpui_kit::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("leanote-slashtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = leanote_core::Store::open(dir.clone(), "user1".to_string()).unwrap();
+        let note = store
+            .add_note(leanote_core::NewNote {
+                title: "t".into(),
+                content: "line one\nline two".into(),
+                tags: vec![],
+                notebook_title: "nb".into(),
+                is_markdown: true,
+            })
+            .unwrap();
+
+        cx.update(gpui_kit::init);
+        let mut shell_entity: Option<gpui_kit::Entity<AppShell>> = None;
+        let window = cx
+            .update(|cx| {
+                cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+                    let shell = cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true,
+                            Some("user1".into()),
+                            None,
+                            None,
+                        )
+                    });
+                    shell_entity = Some(shell.clone());
+                    shell
+                })
+            })
+            .unwrap();
+        let shell_entity = shell_entity.unwrap();
+        let note_id = note.note_id.clone();
+        window
+            .update(cx, |shell, window, cx| {
+                shell.select_note(note_id, window, cx);
+                if shell.vim_enabled {
+                    shell.vim_enabled = false;
+                    shell.vim.reset();
+                }
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.background_executor.allow_parking();
+        let mut cx = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let content = shell_entity.read_with(&cx, |shell, _| {
+            shell.editing.as_ref().unwrap().content.clone()
+        });
+
+        // Caret on line 2, mid-line; the `/` + filter never enter the buffer.
+        cx.update(|_, cx| {
+            content.update(cx, |s, cx| s.set_selected_range(14..14, cx));
+        });
+        cx.simulate_keystrokes("/");
+        cx.update(|_, cx| {
+            assert!(
+                shell_entity.read(cx).slash_panel.is_some(),
+                "`/` opens the panel"
+            );
+            assert_eq!(content.read(cx).value(), "line one\nline two");
+        });
+        // Filter to the heading command, then run it.
+        cx.simulate_keystrokes("h e a d enter");
+        cx.update(|_, cx| {
+            let shell = shell_entity.read(cx);
+            assert!(shell.slash_panel.is_none(), "panel closes on execute");
+            drop(shell);
+            assert_eq!(
+                content.read(cx).value(),
+                "line one\nline # two",
+                "command inserts at the caret without deleting before it"
+            );
+            let r = content.read(cx).selected_range();
+            assert_eq!(r, 16..16, "caret after the inserted prefix");
         });
         let _ = std::fs::remove_dir_all(&dir);
     }
