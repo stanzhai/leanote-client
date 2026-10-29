@@ -93,7 +93,7 @@ keys! {
     // Ticket 10: editor toolbar + history.
     NewNote => ("新建笔记", "New note"),
     EditorPreview => ("预览", "Preview"),
-    EditorSource => ("源码", "Source"),
+    EditorSource => ("编辑", "Edit"),
     History => ("历史版本", "History"),
     RestoreVersion => ("恢复此版本", "Restore this version"),
     HistoryEmpty => ("暂无历史版本", "No history yet"),
@@ -131,12 +131,15 @@ keys! {
     // Issue 18: note-row context menu.
     MoveNoteTo => ("移动笔记到…", "Move note to…"),
     DeleteNote => ("删除笔记", "Delete note"),
+    MoreActions => ("更多操作", "More actions"),
     Confirm => ("确定", "OK"),
     Cancel => ("取消", "Cancel"),
     // Ticket 15: export actions + PDF-fallback reason.
     ExportHtml => ("导出 HTML", "Export HTML"),
     ExportMarkdown => ("导出 Markdown", "Export Markdown"),
     ExportPdf => ("导出 PDF", "Export PDF"),
+    ExportWord => ("导出 Word", "Export Word"),
+    ExportAs => ("导出为…", "Export as…"),
     // Issue 21: row context-menu items.
     StarNote => ("星标", "Star"),
     UnstarNote => ("取消星标", "Unstar"),
@@ -166,11 +169,10 @@ keys! {
     AttachmentsEmpty => ("此笔记没有附件", "No attachments"),
     Download => ("下载", "Download"),
     DownloadFailed => ("下载失败", "Download failed"),
-    MarkdownHelpTitle => ("Markdown 语法", "Markdown syntax"),
+    MarkdownHelpTitle => ("使用帮助", "Usage help"),
     AccentColor => ("强调色", "Accent color"),
     // Issue 23: settings + editor status bar.
     InterfaceZoom => ("界面缩放", "Interface zoom"),
-    EditorToolbar => ("编辑器工具栏", "Editor toolbar"),
     VimMode => ("Vim 模式", "Vim mode"),
     AddTagPlaceholder => ("添加标签…", "Add tag…"),
     GlassEffect => ("透明效果", "Transparency"),
@@ -205,29 +207,78 @@ keys! {
         "本地缓存将保留，重新登录后会重新同步。",
         "Local cache is kept; signing back in will re-sync."
     ),
+    // Image context menu in markdown previews: copy bytes / save to file.
+    CopyImage => ("复制图片", "Copy image"),
+    SaveImageAs => ("另存为…", "Save as…"),
+    ImageSaved => ("图片已保存", "Image saved"),
+    ImageSaveFailed => ("图片保存失败", "Failed to save image"),
 }
 
-/// Issue 19: Markdown cheat-sheet (multi-line raw strings — kept out of the
-/// single-line `keys!` table).
+/// 使用帮助正文（纯文本，不经过 markdown 渲染——渲染在对话框里
+/// 显示有问题；见 open_md_help）。两节：Markdown 语法 + `/` 面板。
 pub fn markdown_help_body(lang: Lang) -> &'static str {
     match lang {
         Lang::Zh => {
-            r"# 标题 1  …  ###### 标题 6
-**粗体**  *斜体*  ~~删除线~~
-`行内代码` 与 ``` 代码块
-- 列表 / 1. 有序列表
-> 引用
-[链接](url)  ![图片](url)
---- 分隔线"
+            r"一、Markdown 语法速查
+
+标题      # 一级标题   ## 二级标题   ### 三级标题（至 ###### 六级）
+强调      **粗体**    *斜体*    ~~删除线~~    ==高亮==（部分实现支持）
+列表      - 无序列表    * 或 + 开头亦可    1. 有序列表    子项缩进 2/4 空格
+引用      > 引用一行    >>> 连续三段（可留空行断开）
+代码      `行内代码`    三反引号 ``` 围栏代码块（可标注语言，如 ```rust）
+链接      [链接文字](https://example.com)
+图片      ![替代文字](图片地址)   也可直接粘贴/选择本地图片
+分隔线    单独一行 --- 或 ***
+表格      | 列一 | 列二 |    第二行 |---|---| 分隔表头（两侧竖线可省）
+任务      - [ ] 未完成    - [x] 已完成
+脚注      正文[^1]…    文末 [^1]: 脚注内容
+转义      反斜杠转义特殊字符，如 \* 显示为 *
+
+二、`/` 快捷菜单
+
+编辑器内任意位置键入 / 呼出命令面板：
+  · 直接输入文字按名称过滤（中/英文均可）
+  · 方向键 ↑↓←→ 移动选中，Enter 或 Tab 执行，Esc 关闭
+  · 面板提供标题、粗斜体、删除线、代码、列表、引用、表格、
+    分隔线等插入命令，以及图片选择（本地文件）
+  · Backspace 删完过滤字符后再按一次即关闭面板
+
+三、其他提示
+
+  · ⌘S 或自动保存写盘；标题栏「预览」切换编辑/预览
+  · 支持 Mermaid 图表：代码块标注 mermaid 即渲染（flowchart、
+    sequence、gantt 等），右键图表可复制/另存为"
         }
         Lang::En => {
-            r"# Heading 1  …  ###### Heading 6
-**bold**  *italic*  ~~strike~~
-`inline code` and ``` fenced block
-- list / 1. ordered
-> quote
-[link](url)  ![image](url)
---- rule"
+            r"1. Markdown syntax quick reference
+
+Heading     # H1   ## H2   ### H3 (up to ###### H6)
+Emphasis    **bold**   *italic*   ~~strike~~   ==highlight== (some flavors)
+List        - bullet (* or + also work)   1. ordered; indent 2/4 spaces to nest
+Quote       > one line   >>> three lines (blank line ends it)
+Code        `inline code`   ``` fenced block (optionally tag the language: ```rust)
+Link        [link text](https://example.com)
+Image       ![alt text](image-url)   or paste/pick a local file
+Rule        a line with --- or ***
+Table       | Col A | Col B |   second row |---|---| marks the header
+Task        - [ ] todo   - [x] done
+Footnote    body[^1]... then [^1]: note text at the bottom
+Escape      backslash before a special char, e.g. \* renders *
+
+2. The `/` quick menu
+
+Type / anywhere in the editor to open the command palette:
+  - keep typing to filter by name (Chinese or English)
+  - arrows move the selection, Enter or Tab runs it, Esc closes
+  - offers headings, bold/italic, strike, code, lists, quote, table,
+    rule inserts, and local image picking
+  - Backspace past the filter characters closes the panel
+
+3. Other tips
+
+  - Cmd+S or autosave writes the note; toolbar Preview toggles edit/preview
+  - Mermaid diagrams: tag a fenced block with mermaid to render it
+    (flowchart, sequence, gantt...); right-click a diagram to copy/save"
         }
     }
 }
@@ -309,6 +360,8 @@ mod tests {
         Key::ExportHtml,
         Key::ExportMarkdown,
         Key::ExportPdf,
+        Key::ExportWord,
+        Key::ExportAs,
         Key::StarNote,
         Key::UnstarNote,
         Key::PublishBlog,
@@ -334,6 +387,7 @@ mod tests {
         Key::DeleteTag,
         Key::MoveNoteTo,
         Key::DeleteNote,
+        Key::MoreActions,
         Key::Confirm,
         Key::Cancel,
         Key::SearchPlaceholder,
@@ -361,8 +415,6 @@ mod tests {
         Key::DownloadFailed,
         Key::MarkdownHelpTitle,
         Key::AccentColor,
-        Key::InterfaceZoom,
-        Key::EditorToolbar,
         Key::VimMode,
         Key::SectionAppearance,
         Key::SectionEditor,
@@ -389,5 +441,9 @@ mod tests {
         Key::GlassWeak,
         Key::GlassMedium,
         Key::GlassStrong,
+        Key::CopyImage,
+        Key::SaveImageAs,
+        Key::ImageSaved,
+        Key::ImageSaveFailed,
     ];
 }

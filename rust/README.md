@@ -67,3 +67,22 @@ app stays resident with its dock icon (platform default) — use the tray
   centered dialog: appearance follow/light/dark, editor palette, language,
   Vim default, account info + logout), username (menu with logout →
   confirmation dialog). Settings persist as local JSON.
+
+## Export (issue 18/21)
+
+Note context menu / title-bar ⋯ menu → 导出为… submenu: Markdown, HTML,
+PDF, Word. All run locally (no server round-trip): PDF via embedded typst,
+`.docx` via knit-md-docx (pulldown-cmark + docx-rs — headings, emphasis,
+links, images, lists, task lists, code blocks, quotes, GFM tables,
+footnotes; rich-text notes go through the same HTML→Markdown bridge as
+PDF). The save panel starts in the remembered export directory
+(`~/Downloads` first time) and remembers the chosen dir in `prefs.json`.
+Library-wide backup: `.leanote` JSON, same shape as the JS export plugin.
+
+## Window drag
+
+The nav header (44px), reader strip (28px), editor strip (10px), and the
+editor title row all drag the window: Windows via OS-native HTCAPTION
+(`window_control_area(Drag)`), Linux via `start_window_move`, macOS via
+AppKit's titlebar drag. The title input keeps its own mouse handling —
+text selection is unaffected.

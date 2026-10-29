@@ -77,6 +77,17 @@ impl WindowState {
                 w: s.w,
                 h: s.h,
             }
+        } else if let Some(d) = displays.first() {
+            // Display gone (e.g. second monitor unplugged): center the
+            // window on the primary display instead of stranding it.
+            let x = d.origin.x.as_f32() + (d.size.width.as_f32() - s.w).max(0.) / 2.;
+            let y = d.origin.y.as_f32() + (d.size.height.as_f32() - s.h).max(0.) / 2.;
+            Self {
+                x,
+                y,
+                w: s.w,
+                h: s.h,
+            }
         } else {
             Self::default_centered()
         }
@@ -128,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn display_gone_falls_back_to_default() {
+    fn display_gone_centers_on_remaining_display() {
         let s = WindowState {
             x: 5000.,
             y: 5000.,
@@ -136,8 +147,24 @@ mod tests {
             h: 800.,
         };
         let out = s.clamped(&[display(0., 0., 1512., 982.)]);
-        assert_eq!(out.w, DEFAULT_W);
-        assert_eq!(out.h, DEFAULT_H);
+        assert_eq!(out.x, (1512. - 1280.) / 2.);
+        assert_eq!(out.y, (982. - 800.) / 2.);
+        assert_eq!((out.w, out.h), (1280., 800.));
+    }
+
+    #[test]
+    fn display_gone_centers_on_origin_of_second_display() {
+        // Saved on the right monitor (global x=1512), that monitor is now
+        // gone: center on the remaining one, not on the dead coordinates.
+        let s = WindowState {
+            x: 1800.,
+            y: 100.,
+            w: 1000.,
+            h: 700.,
+        };
+        let out = s.clamped(&[display(0., 0., 1512., 982.)]);
+        assert_eq!(out.x, (1512. - 1000.) / 2.);
+        assert_eq!(out.y, (982. - 700.) / 2.);
     }
 
     #[test]

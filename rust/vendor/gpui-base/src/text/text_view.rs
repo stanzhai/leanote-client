@@ -99,6 +99,13 @@ pub(crate) type ImageSourceFn = dyn Fn(&gpui::SharedUri) -> gpui::ImageSource + 
 pub(crate) type LinkClickHandlerFn =
     dyn Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync;
 
+/// Handler for clicks on document images, including right-clicks (macOS
+/// delivers them as normal clicks with `up: Button::Right`). Receives the
+/// image's URL and the resolved source so callers can copy/save without a
+/// second fetch.
+pub(crate) type ImageClickHandlerFn =
+    dyn Fn(&gpui::SharedUri, &gpui::ImageSource, &ClickEvent, &mut Window, &mut App) + Send + Sync;
+
 /// Kept by the element only, so unlike the handlers the state carries, it
 /// may hold a `ScrollHandle`.
 pub(crate) type RevealHandlerFn = dyn Fn(Bounds<Pixels>, &mut Window, &mut App);
@@ -156,6 +163,7 @@ pub struct TextView {
     table_actions: Option<Arc<TableActionsFn>>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
     image_source: Option<Arc<ImageSourceFn>>,
+    image_click_handler: Option<Arc<ImageClickHandlerFn>>,
     reveal_handler: Option<Rc<RevealHandlerFn>>,
     markdown_extensions: Arc<MarkdownExtensions>,
     motion: Option<TextViewMotion>,
@@ -170,11 +178,12 @@ impl<P> TextViewPlugin for P
 where
     P: MarkdownPlugin,
 {
-    fn setup(self, mut text_view: TextView) -> TextView {
-        let extensions = Arc::make_mut(&mut text_view.markdown_extensions);
+    fn setup(self, text_view: TextView) -> TextView {
+        let mut configure = self.configure(text_view.clone());
+        let extensions = Arc::make_mut(&mut configure.markdown_extensions);
         let current = std::mem::take(extensions);
         *extensions = current.plugin(self);
-        text_view
+        configure
     }
 }
 
@@ -202,6 +211,7 @@ impl TextView {
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
+            image_click_handler: None,
             image_source: None,
             reveal_handler: None,
             markdown_extensions: Arc::default(),
@@ -226,6 +236,7 @@ impl TextView {
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
+            image_click_handler: None,
             image_source: None,
             reveal_handler: None,
             markdown_extensions: Arc::default(),
@@ -250,6 +261,7 @@ impl TextView {
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
+            image_click_handler: None,
             image_source: None,
             reveal_handler: None,
             markdown_extensions: Arc::default(),
@@ -402,6 +414,23 @@ impl TextView {
         self
     }
 
+    /// Handle pointer events on rendered images.
+    ///
+    /// The handler receives the image's URL and the resolved source (data
+    /// URLs are decoded by default), plus the original GPUI click event.
+    /// Right-clicks reach it as normal clicks with `up: Button::Right` on
+    /// macOS — check `ClickEvent::is_right_click` to open a context menu.
+    pub fn on_image_click<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&gpui::SharedUri, &gpui::ImageSource, &ClickEvent, &mut Window, &mut App)
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.image_click_handler = Some(Arc::new(handler));
+        self
+    }
+
     /// Scroll a container that does not follow scroll requests to the line
     /// of [`TextViewState::reveal_range`].
     ///
@@ -420,6 +449,22 @@ impl TextView {
 
     /// Replace the Markdown extension registry.
     pub fn markdown_extensions(mut self, extensions: MarkdownExtensions) -> Self {
+        self.markdown_extensions = Arc::new(extensions);
+        self
+    }
+
+    /// Set the handler invoked when a standard document image is clicked
+    /// (right-clicks included). Unlike [`Self::markdown_extensions`] this
+    /// does not replace any registered parsers or renderers.
+    pub fn image_context_menu<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&gpui::SharedUri, &gpui::ImageSource, &ClickEvent, &mut Window, &mut App)
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut extensions = (*self.markdown_extensions).clone();
+        extensions.set_image_context_menu(handler);
         self.markdown_extensions = Arc::new(extensions);
         self
     }
@@ -686,6 +731,7 @@ impl Element for TextView {
             state.table_actions = self.table_actions.clone();
             state.link_click_handler = self.link_click_handler.clone();
             state.image_source = self.image_source.clone();
+            state.image_click_handler = self.image_click_handler.clone();
             state.set_markdown_extensions(self.markdown_extensions.clone(), cx);
             if let Some(motion) = &self.motion {
                 state.set_motion(motion.clone());

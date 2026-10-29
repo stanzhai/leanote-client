@@ -10,8 +10,9 @@ use gpui::{
     AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, DefiniteLength, Element, ElementId,
     GlobalElementId, Hsla, ImageSource, InspectorElementId, InteractiveElement as _, IntoElement,
     LayoutId, LineFragment as WrapLineFragment, ObjectFit, Pixels, Refineable as _, ShapedLine,
-    SharedString, Size, StatefulInteractiveElement as _, Styled, StyledImage as _, TextRun,
-    TextStyle, WhiteSpace, Window, img, point, prelude::FluentBuilder as _, px, relative, size,
+    SharedString, SharedUri, Size, StatefulInteractiveElement as _, Styled, StyledImage as _,
+    TextRun, TextStyle, WhiteSpace, Window, img, point, prelude::FluentBuilder as _, px, relative,
+    size,
 };
 
 use crate::text::text_view::{LinkClickHandlerFn, handle_link_click};
@@ -30,6 +31,7 @@ pub(super) struct InlineFlow {
     id: ElementId,
     items: Vec<InlineFlowItem>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    image_click_handler: Option<Arc<super::text_view::ImageClickHandlerFn>>,
 }
 
 pub(super) type InlineRenderer = dyn Fn(&super::InlineRenderContext, &mut Window, &mut App) -> Option<super::InlineElement>
@@ -58,6 +60,7 @@ pub(super) enum InlineFlowItem {
         reveal: Option<RevealAt>,
     },
     Image {
+        url: SharedUri,
         source: ImageSource,
         link: Option<LinkMark>,
         title: String,
@@ -246,28 +249,47 @@ impl InlineFlow {
         id: impl Into<ElementId>,
         items: Vec<InlineFlowItem>,
         link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+        image_click_handler: Option<Arc<super::text_view::ImageClickHandlerFn>>,
     ) -> Self {
         Self {
             id: id.into(),
             items,
             link_click_handler,
+            image_click_handler,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn image_element(
         ix: usize,
+        url: &SharedUri,
         source: &ImageSource,
         link: &Option<LinkMark>,
         _title: &str,
         size: Size<Pixels>,
         link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+        image_click_handler: Option<Arc<super::text_view::ImageClickHandlerFn>>,
     ) -> AnyElement {
+        // The image click handler runs for every button (right-clicks arrive
+        // as normal clicks on macOS); it decides by event, unlike the link
+        // handler which only follows left/aux clicks on linked images.
+        let on_image_click = image_click_handler.map(|handler| {
+            let url = url.clone();
+            let source = source.clone();
+            move |event: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+                handler(&url, &source, event, window, cx);
+            }
+        });
+        let image_click = on_image_click.clone();
         img(source.clone())
             .id(ix)
             .object_fit(ObjectFit::Contain)
             .max_w(relative(1.))
             .w(size.width)
             .h(size.height)
+            .when_some(on_image_click, |this, on_click| {
+                this.on_click(move |event, window, cx| on_click(event, window, cx))
+            })
             .when_some(link.clone(), |this, link| {
                 let aux_link = link.clone();
                 let aux_link_click_handler = link_click_handler.clone();
@@ -294,6 +316,9 @@ impl InlineFlow {
                             cx,
                         );
                     })
+            })
+            .when_some(image_click, |this, on_click| {
+                this.on_click(move |event, window, cx| on_click(event, window, cx))
             })
             .into_any_element()
     }
@@ -614,6 +639,7 @@ impl Element for InlineFlow {
                     size: fragment_size,
                 } => {
                     let InlineFlowItem::Image {
+                        url,
                         source,
                         link,
                         title,
@@ -625,11 +651,13 @@ impl Element for InlineFlow {
                     let (origin, fragment_size) = (*origin, *fragment_size);
                     let mut element = Self::image_element(
                         elements.len(),
+                        url,
                         source,
                         link,
                         title.as_str(),
                         fragment_size,
                         self.link_click_handler.clone(),
+                        self.image_click_handler.clone(),
                     );
                     element.prepaint_as_root(
                         bounds.origin + origin,

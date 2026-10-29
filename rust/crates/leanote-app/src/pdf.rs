@@ -60,6 +60,21 @@ fn blocks(children: &[Node], out: &mut String) {
                 out.push_str("\n\n");
             }
             Node::Code(c) => {
+                // ```mermaid fence: inline SVG via merman, embedded as raw
+                // bytes so no virtual file is needed. Parse failure falls
+                // through to the code block below (ADR-0011).
+                if c.lang.as_deref() == Some("mermaid") {
+                    match crate::mermaid::render_svg(&c.value, false) {
+                        Ok(svg) => {
+                            out.push_str(&format!(
+                                "#image(bytes(({})), format: \"svg\", width: 100%)\n\n",
+                                bytes_array(svg.as_bytes())
+                            ));
+                            continue;
+                        }
+                        Err(_) => {} // fall through to source block
+                    }
+                }
                 // ```lang fence: raw block with an optional language tag.
                 out.push_str("```");
                 if let Some(l) = &c.lang {
@@ -203,6 +218,13 @@ fn inlines(children: &[Node], out: &mut String) {
 /// ones that carry meaning; `-`/`+`/`/`/`=` only matter at line starts,
 /// where list markers and set rules would misparse — escaping them too
 /// costs nothing and removes a whole class of position bugs.
+fn bytes_array(b: &[u8]) -> String {
+    b.iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn escape_content(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -376,6 +398,24 @@ mod tests {
     /// Smoke test guarded on the environment having ANY usable font: CI
     /// without system fonts and without the embedded fallback would fail
     /// through no fault of the serializer, so skip rather than error there.
+    #[test]
+    fn mermaid_fence_becomes_embedded_svg() {
+        if FONTS.book().families().count() == 0 {
+            eprintln!("no fonts available; skipping pdf smoke test");
+            return;
+        }
+        let bytes = note_to_pdf_title("图", "```mermaid\nflowchart LR\n  A-->B\n```\n").unwrap();
+        assert!(bytes.starts_with(b"%PDF"), "not a pdf");
+        // typst compiles the bytes() literal into a rasterized image XObject
+        // (typst-pdf rasterizes SVGs; dict has no space: /Subtype/Image).
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains("/Subtype/Image"),
+            "no embedded image in first 4k: {:?}",
+            &s[..4000.min(s.len())]
+        );
+    }
+
     #[test]
     fn note_to_pdf_smoke_cjk() {
         // ponytail: skip when the font store is empty (stripped CI image);

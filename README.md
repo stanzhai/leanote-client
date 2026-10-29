@@ -1,37 +1,8 @@
 # Leanote Desktop App
 
-[![Gitter](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/leanote/desktop-app?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
+蚂蚁笔记客户端。默认markdown + vim编辑模式，Native高性能客户端。
 
-Use Electron(atom-shell) to create leanote desktop app.
-
-![preview.png](preview.png "")
-
-## Download
-Please see http://app.leanote.com
-
-## How to develop it
-
-Download this project, and run
-
-```shell
-nvm use v18
-
-# 1. install dependencies
-$> cd PATH-TO-LEANOTE-DESKTOP-APP
-$> ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm install
-
-# 2. build Less styles (gulp 已弃用，使用新的 npm 脚本)
-# Option A — 一次性构建
-$> npm install
-$> npm run less:build
-
-# Option B — 开发中监听并自动构建
-$> npm install
-$> npm run less:watch
-
-# 3. run with electron
-$> npm run dev
-```
+![](./preview.png)
 
 ## Rust 重写版（GPUI）
 
@@ -42,7 +13,7 @@ $> npm run dev
 ```sh
 cd rust
 cargo build --release            # 产出 target/release/Leanote（GUI）与 leanote（CLI）
-cargo test                       # 全工作区测试（145 个）
+cargo test                       # 全工作区测试（218 个）
 ./target/release/Leanote         # 直接运行桌面端
 
 # 冒烟（假服务器 + 自动登录，无需真实账号）：
@@ -50,6 +21,8 @@ LEANOTE_DATA=/tmp/smoke LEANOTE_FAKE_SERVER=1 LEANOTE_FAKE_AUTOSUBMIT=1 ./target
 ```
 
 数据目录：`~/Library/Application Support/leanote/`（win `%APPDATA%\leanote`、linux `~/.config/leanote`，可用 `LEANOTE_DATA` 覆盖）；与 Electron 遗留 NeDB（`nedb55/`）同目录共存但永不互读写（ADR-0008）。日志：`<数据目录>/logs/app.log`；`LEANOTE_MCP_DEBUG=1` 时追加 `~/leanote_mcp.log`（与 JS 版一致）。
+
+导出：笔记右键菜单 / 标题栏 ⋯ 菜单 →「导出为…」二级子菜单（Markdown / HTML / PDF / Word），全部本地转换（PDF 用内嵌 typst，Word 用 knit-md-docx 纯 Rust 链路）；另有全库 `.leanote` JSON 备份。保存面板记住上次导出目录（首次 `~/Downloads`）。窗口拖拽：导航头、阅读条、编辑条与编辑器标题行空白处均可拖动窗口（win HTCAPTION / linux start_window_move / mac AppKit）。
 
 ### 打包
 
@@ -153,10 +126,6 @@ npx @modelcontextprotocol/inspector
 ```
 
 仓库内附冒烟测试：`node tests/test_mcp_server.js`（需本机已有 Leanote 数据）。
-
-## Docs
-
-Please see https://github.com/leanote/desktop-app/wiki
 
 ## LICENSE
 

@@ -4,7 +4,7 @@ members = ["crates/leanote-core", "crates/leanote-cli", "crates/leanote-http", "
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "3.1.0"
 
 [workspace.dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -14,6 +14,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # forced to false so a CJK IME cannot swallow printable keys before GPUI dispatch
 # (breaks vim normal mode). Re-vendor on gpui-pre upgrade. See ADR-0005.
 gpui-pre = { path = "vendor/gpui-pre" }
-# leanote: vendored with one addition — block caret painting for vim normal
-# mode (set_block_cursor). Re-vendor on gpui-base upgrade. See ADR-0005.
+# leanote: vendored with additions — ① block caret painting for vim normal
+# mode (set_block_cursor); ② image click hook: MarkdownPlugin::configure +
+# TextView::image_context_menu so a component-layer TextView can attach an
+# image click handler (right-click menu in previews) through .plugin().
+# Re-vendor on gpui-base upgrade. See ADR-0005.
 gpui-base = { path = "vendor/gpui-base" }

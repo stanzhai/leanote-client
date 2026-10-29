@@ -71,6 +71,8 @@ Section "Install"
     CreateShortcut "$SMPROGRAMS\Leanote\Leanote.lnk" "$INSTDIR\Leanote.exe"
     CreateShortcut "$SMPROGRAMS\Leanote\Leanote CLI.lnk" "$INSTDIR\bin\leanote.exe"
 
+    # ADR-0011: desktop shortcut — main app only (CLI stays in Start Menu).
+    CreateShortcut "$DESKTOP\Leanote.lnk" "$INSTDIR\Leanote.exe"
     # PATH via the optional section below writes HKCU\Environment directly.
 
     WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -101,6 +103,7 @@ Section "un.Uninstall"
     Delete "$SMPROGRAMS\Leanote\Leanote.lnk"
     Delete "$SMPROGRAMS\Leanote\Leanote CLI.lnk"
     Delete "$SMPROGRAMS\Leanote\Uninstall Leanote.lnk"
+    Delete "$DESKTOP\Leanote.lnk"
     RMDir "$SMPROGRAMS\Leanote"
 SectionEnd
 '@.

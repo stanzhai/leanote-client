@@ -1,12 +1,12 @@
 //! 斜杠面板（ADR-0011）：编辑器内键入 `/` 弹出的 Notion 风格 4×4 命令格。
 //! 面板是唯一入口 —— 原 md_toolbar 与设置项 `editor_toolbar` 已删除。
 //!
-//! 16 项 = 14 个插入命令 + 图片 + 帮助。↑↓ 移动、Enter/Tab 执行、
+//! 15 项 = 14 个插入命令 + 图片（语法帮助已迁至标题栏工具栏）。
 //! Esc 关闭、继续键入过滤、Backspace 到头关闭。执行时先删除触发
 //! 范围（`/` + 已输入过滤串），再 `insert_around(prefix, suffix)`。
 
 use crate::app_shell::AppShell;
-use crate::i18n::{self, Lang};
+use crate::i18n::Lang;
 use gpui_base::input::EditorState;
 use gpui_kit::component::Sizable;
 use gpui_kit::prelude::*;
@@ -31,11 +31,10 @@ pub(crate) struct Cmd {
 enum Special {
     Insert,
     Image,
-    Help,
 }
 
-/// ADR-0011 定死的 16 项，4×4。
-pub(crate) const COMMANDS: [Cmd; 16] = [
+/// ADR-0011 的命令格；语法帮助已迁至标题栏工具栏（15 项，4×4）。
+pub(crate) const COMMANDS: [Cmd; 15] = [
     Cmd {
         icon: IconName::Heading1,
         zh: "一级标题",
@@ -156,14 +155,6 @@ pub(crate) const COMMANDS: [Cmd; 16] = [
         suffix: "",
         special: Special::Image,
     },
-    Cmd {
-        icon: IconName::MessageCircleQuestionMark,
-        zh: "语法帮助",
-        en: "Syntax help",
-        prefix: "",
-        suffix: "",
-        special: Special::Help,
-    },
 ];
 
 use gpui_kit::assets::IconName;
@@ -178,17 +169,13 @@ pub(crate) struct SlashPanel {
 
 impl SlashPanel {
     /// 过滤后的命令索引列表。
-    pub(crate) fn matches(&self, lang: Lang) -> Vec<usize> {
+    pub(crate) fn matches(&self, _lang: Lang) -> Vec<usize> {
         let q = self.query.to_lowercase();
         (0..COMMANDS.len())
             .filter(|&i| {
                 q.is_empty()
                     || COMMANDS[i].zh.contains(&self.query)
                     || COMMANDS[i].en.to_lowercase().contains(&q)
-                    || i18n::t(lang, i18n::Key::MarkdownHelpTitle)
-                        .to_lowercase()
-                        .contains(&q)
-                        && COMMANDS[i].special == Special::Help
             })
             .collect()
     }
@@ -272,7 +259,6 @@ pub(crate) fn execute(
     match cmd.special {
         Special::Insert => shell.insert_around(cmd.prefix, cmd.suffix, window, cx),
         Special::Image => shell.pick_images(window, cx),
-        Special::Help => shell.open_md_help(window, cx),
     }
     cx.notify();
 }

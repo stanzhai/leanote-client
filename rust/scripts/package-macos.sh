@@ -65,7 +65,67 @@ codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "    (codesign s
 
 echo "==> $DMG"
 rm -f "$DMG"
-hdiutil create -volname "$APP_NAME" -srcfolder "$APP" -ov -format UDZO "$DMG" >/dev/null
+
+# ADR-0011: drag-to-Install layout — read-write staging volume with an
+# /Applications symlink, background PNG and icon positions applied via
+# AppleScript, then flattened to a compressed UDZO. Pillow renders the
+# background (a solid + arrow text); skip silently when unavailable
+# (plain UDZO still installs fine, just without the layout).
+STAGING="$OUT/.dmg-staging"
+rm -rf "$STAGING"
+mkdir -p "$STAGING"
+cp -R "$APP" "$STAGING/"
+ln -s /Applications "$STAGING/Applications"
+
+BG_SRC="$ROOT/logo/icon-black-white.png"
+BG="$STAGING/.background.png"
+python3 - "$BG_SRC" "$BG" 660 <<'PY' 2>/dev/null || true
+import sys
+from PIL import Image, ImageDraw
+src, dst, size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+bg = Image.new("RGB", (size, size), (245, 245, 248))
+icon = Image.open(src).convert("RGBA")
+icon.thumbnail((size // 3, size // 3))
+bg.paste(icon, (size // 8, (size - icon.height) // 2), icon)
+d = ImageDraw.Draw(bg)
+d.text((size // 8 + icon.width + 24, size // 2 + 44), "拖到 Applications 安装",
+       fill=(120, 120, 130))
+bg.save(dst, "PNG")
+PY
+if [ -f "$BG" ]; then
+  mkdir -p "$STAGING/.background"
+  mv "$BG" "$STAGING/.background/background.png"
+fi
+
+hdiutil create -volname "$APP_NAME" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
+rm -rf "$STAGING"
+
+# Re-apply icon positions + background on the finished image (Symlink and
+# view options survive UDZO; positions need the AppleScript pass).
+if command -v osascript >/dev/null 2>&1; then
+  MOUNT=$(hdiutil attach -readwrite -nobrowse -mountpoint /tmp/leanote-dmg "$DMG" 2>/dev/null | head -1) || MOUNT=""
+  if [ -n "$MOUNT" ]; then
+    osascript <<OSA 2>/dev/null || true
+tell application "Finder"
+  tell disk "$APP_NAME"
+    open
+    set current view of container window to icon view
+    set toolbar visible of container window to false
+    set statusbar visible of container window to false
+    set the bounds of container window to {0, 0, 660, 660}
+    set arrangement of icon view options of container window to not arranged
+    set icon size of icon view options of container window to 128
+    set background picture of icon view options of container window to file ".background:background.png"
+    set position of item "$APP_NAME" of container window to {180, 330}
+    set position of item "Applications" of container window to {480, 330}
+    update container window
+    close
+  end tell
+end tell
+OSA
+    hdiutil detach /tmp/leanote-dmg >/dev/null 2>&1 || true
+  fi
+fi
 
 # Local convenience only (not part of CI output): point the shim at the
 # packaged CLI so `leanote` keeps working after target/ cleanups.

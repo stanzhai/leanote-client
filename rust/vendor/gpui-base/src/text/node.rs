@@ -2330,6 +2330,7 @@ pub(crate) struct NodeContext {
     pub(crate) table_actions: Option<Arc<TableActionsFn>>,
     pub(crate) image_source: Option<Arc<super::text_view::ImageSourceFn>>,
     pub(crate) link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    pub(crate) image_click_handler: Option<Arc<super::text_view::ImageClickHandlerFn>>,
     pub(crate) markdown_extensions: Arc<MarkdownExtensions>,
     /// This frame's streamed fade-in, when any text is still fading.
     pub(crate) stream_fade: Option<Arc<StreamFadeFrame>>,
@@ -2470,6 +2471,10 @@ impl Paragraph {
                 leaf_element_id(fade_key),
                 self.inline_flow_items(fade_key, fades, backgrounds, node_cx, cx),
                 node_cx.link_click_handler.clone(),
+                node_cx
+                    .image_click_handler
+                    .clone()
+                    .or_else(|| node_cx.markdown_extensions.image_click_handler()),
             )
             .into_any_element();
         }
@@ -2545,8 +2550,14 @@ impl Paragraph {
                     );
                 }
                 let link_click_handler = node_cx.link_click_handler.clone();
+                let image_click_handler = node_cx
+                    .image_click_handler
+                    .clone()
+                    .or_else(|| node_cx.markdown_extensions.image_click_handler());
+                let source = node_cx.image_source(image);
+                let url = image.url.clone();
                 child_nodes.push(
-                    img(node_cx.image_source(image))
+                    img(source.clone())
                         .id(ix)
                         .object_fit(ObjectFit::Contain)
                         .max_w(relative(1.))
@@ -2579,6 +2590,14 @@ impl Paragraph {
                                     );
                                 })
                         })
+                        .when_some(
+                            image_click_handler.map(|h| (h, source.clone(), url.clone())),
+                            |this, (handler, source, url)| {
+                                this.on_click(move |event, window, cx| {
+                                    handler(&url, &source, event, window, cx);
+                                })
+                            },
+                        )
                         .into_any_element(),
                 );
 
@@ -2757,6 +2776,7 @@ impl Paragraph {
                 }
 
                 items.push(InlineFlowItem::Image {
+                    url: image.url.clone(),
                     source: node_cx.image_source(image),
                     link: image.link.clone(),
                     title: image.title(),

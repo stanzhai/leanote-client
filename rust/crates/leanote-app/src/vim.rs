@@ -1081,10 +1081,17 @@ fn delete_range_for(op: DeleteOp, text: &Rope, caret: usize) -> Option<std::ops:
     let (line_start, line_end) = line_range(text, row_of(text, caret));
     Some(match op {
         DeleteOp::Char => {
+            // `x` at the line end (block caret sits past the last char)
+            // deletes leftward, as in vim; an empty line deletes nothing.
             if caret >= line_end {
-                return None;
+                if line_end > line_start {
+                    prev_char(text, line_end)..line_end
+                } else {
+                    return None;
+                }
+            } else {
+                caret..next_char(text, caret).min(line_end)
             }
-            caret..next_char(text, caret).min(line_end)
         }
         // `dw`: vim's exclusive-motion rule — never eat past this line's
         // end, so deleting the last word never eats the newline.
@@ -1507,5 +1514,17 @@ mod tests {
         assert_eq!(delete_range_for(DeleteOp::ToNextWord, &last, 0), Some(0..2));
         // de deletes through the end of the next word (inclusive).
         assert_eq!(delete_range_for(DeleteOp::ToWordEnd, &text, 0), Some(0..3));
+    }
+
+    #[test]
+    fn x_at_line_end_deletes_leftward() {
+        // `x` with the caret past the last char deletes that char.
+        let text: Rope = "abc".into();
+        assert_eq!(delete_range_for(DeleteOp::Char, &text, 3), Some(2..3));
+        // On an empty line there is nothing to delete.
+        let empty: Rope = "".into();
+        assert_eq!(delete_range_for(DeleteOp::Char, &empty, 0), None);
+        // Mid-line deletes forward as usual.
+        assert_eq!(delete_range_for(DeleteOp::Char, &text, 1), Some(1..2));
     }
 }

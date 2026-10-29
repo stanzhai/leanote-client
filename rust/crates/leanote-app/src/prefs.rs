@@ -53,12 +53,14 @@ pub struct Prefs {
     /// "medium" = 16px, "large" = 18px. Scaled by the UI zoom at apply time.
     #[serde(default)]
     pub editor_font_size: String,
-    /// Issue 23 #10: markdown insertion toolbar in the editor (default off).
-    #[serde(default)]
-    pub editor_toolbar: bool,
     /// Issue 19 Q14: left-nav selection + fold states, restored on launch.
     #[serde(default)]
     pub nav: NavStatePref,
+    /// Last directory accepted in an export/save panel (absolute path).
+    /// "" (fresh install) resolves to ~/Downloads at use time; a stale
+    /// path (unmounted/removable) falls back to ~/Downloads too.
+    #[serde(default)]
+    pub export_dir: String,
 }
 
 impl Default for Prefs {
@@ -75,8 +77,8 @@ impl Default for Prefs {
             glass: default_glass(),
             font: String::new(),
             editor_font_size: String::new(),
-            editor_toolbar: false,
             nav: NavStatePref::default(),
+            export_dir: String::new(),
         }
     }
 }
@@ -177,13 +179,13 @@ mod tests {
             glass: "weak".into(),
             font: "wenkai-mono".into(),
             editor_font_size: "medium".into(),
-            editor_toolbar: true,
             nav: NavStatePref {
                 selection: Some(("notebook".into(), "n1".into())),
                 notebooks_open: false,
                 tags_open: true,
                 last_note: Some("note9".into()),
             },
+            export_dir: "/tmp".into(),
         };
         let dir = std::env::temp_dir().join(format!("lnprefs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -199,6 +201,7 @@ mod tests {
         let old = Prefs::load(&dir);
         assert_eq!(old.pane_widths, PaneWidths::default());
         assert_eq!(old.accent, "");
+        assert_eq!(old.export_dir, "");
         assert_eq!(old.nav, NavStatePref::default());
         // Round 5: files predating the glass pref get "medium".
         assert_eq!(old.glass, "medium");
@@ -236,6 +239,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(Prefs::load(&dir).ui_theme, "warm");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Export dir memory: an old file (no export_dir) defaults to "", a
+    /// saved value round-trips verbatim — the save panel's start dir.
+    #[test]
+    fn export_dir_round_trip() {
+        let dir = std::env::temp_dir().join(format!("lnprefs-exp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(FILE),
+            r#"{"appearance":"Follow","lang":"Follow","recents":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(Prefs::load(&dir).export_dir, "");
+        let mut p = Prefs::load(&dir);
+        p.export_dir = "/Users/x/Downloads".into();
+        p.save(&dir);
+        assert_eq!(Prefs::load(&dir).export_dir, "/Users/x/Downloads");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

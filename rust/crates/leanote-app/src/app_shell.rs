@@ -16,19 +16,21 @@ use gpui_kit::component::input::{
     InputState, MoveDown, MoveLeft, MoveRight, MoveUp, OutdentInline,
 };
 use gpui_kit::component::label::Label;
-use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::resizable_panel;
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::TextView;
+use gpui_kit::component::text::TextViewStyle;
 use gpui_kit::component::IndexPath;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, InteractiveElementExt, Sizable, WindowExt as _,
 };
 use gpui_kit::div;
 use gpui_kit::prelude::*;
+use gpui_kit::HighlightStyle;
 use gpui_kit::{
     px, rems, AnyElement, KeyDownEvent, MouseButton, SharedString, Task, UniformListScrollHandle,
     Window, WindowControlArea,
@@ -195,6 +197,12 @@ pub struct AppShell {
     /// Ticket 15: export outcome shown inline in the reader toolbar
     /// (e.g. PDF-fell-back-to-HTML reason). Cleared on selection change.
     export_status: Option<SharedString>,
+    /// Open image right-click menu (menu entity + window position).
+    /// Item 6 of the UI batch: 复制图片 / 另存为….
+    image_menu: Option<(
+        gpui_kit::Entity<gpui_kit::component::menu::PopupMenu>,
+        gpui_kit::Point<gpui_kit::Pixels>,
+    )>,
     /// Ticket 13: ⌘K search overlay (dialog-hosted palette + last rows).
     search: crate::search_overlay::SearchOverlay,
     search_rows: Vec<crate::search_overlay::ResultRow>,
@@ -365,6 +373,7 @@ impl AppShell {
             preview_focus: cx.focus_handle(),
             root_focus: cx.focus_handle(),
             export_status: None,
+            image_menu: None,
             search: crate::search_overlay::SearchOverlay::new(window, cx),
             search_rows: Vec::new(),
             search_query: String::new(),
@@ -1736,6 +1745,71 @@ impl AppShell {
         });
     }
 
+    /// Item 6: 另存为… for a preview image. Decode (fetch) → save panel →
+    /// background write → outcome in `export_status`.
+    fn save_image_as(
+        &mut self,
+        source: gpui_kit::ImageSource,
+        url: String,
+        _window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        let lang = self.lang;
+        let (name, ext) = image_file_name(&url);
+        let suggested = format!("{name}.{ext}");
+        // Extract the payload before spawning: ImageSource::Custom holds a
+        // non-Sync closure, which would make the background future !Send.
+        let payload = match &source {
+            gpui_kit::ImageSource::Image(image) => Some((**image).clone()),
+            _ => None,
+        };
+        let url_c = match &source {
+            gpui_kit::ImageSource::Resource(gpui_kit::Resource::Uri(uri)) => Some(uri.to_string()),
+            _ => None,
+        };
+        let rx = cx.prompt_for_new_path(&self.export_dir(), Some(&suggested));
+        self._task = Some(cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = rx.await else { return };
+            let shown = path.display().to_string();
+            let dir = path.parent().map(|p| p.to_path_buf());
+            let done = cx.background_spawn(async move {
+                let image = match payload {
+                    Some(image) => Ok(image),
+                    None => url_c
+                        .ok_or_else(|| "unsupported image".to_string())
+                        .and_then(|url| {
+                            let format = image_format_from_uri(&url).ok_or("unsupported image")?;
+                            let bytes = ureq::get(&url)
+                                .call()
+                                .and_then(|response| {
+                                    let mut bytes = Vec::new();
+                                    let mut reader =
+                                        std::io::BufReader::new(response.into_body().into_reader());
+                                    std::io::Read::read_to_end(&mut reader, &mut bytes)?;
+                                    Ok(bytes)
+                                })
+                                .map_err(|e| e.to_string())?;
+                            Ok(gpui_kit::Image::from_bytes(format, bytes))
+                        }),
+                };
+                image.and_then(|image| {
+                    std::fs::write(&path, image.bytes()).map_err(|e| e.to_string())
+                })
+            });
+            let status: SharedString = match done.await {
+                Ok(()) => shown.into(),
+                Err(_) => i18n::t(lang, i18n::Key::ImageSaveFailed).into(),
+            };
+            let _ = this.update(cx, |shell, cx| {
+                if let Some(dir) = &dir {
+                    shell.remember_export_dir(dir);
+                }
+                shell.export_status = Some(status);
+                cx.notify();
+            });
+        }));
+    }
+
     // --- Ticket 15: export HTML / Markdown / PDF / .leanote backup ---
 
     /// Native save panel → run `f` off the UI thread → outcome lands in
@@ -1746,19 +1820,50 @@ impl AppShell {
         cx: &mut gpui_kit::Context<Self>,
         f: impl FnOnce(std::path::PathBuf) -> Result<(), String> + Send + 'static,
     ) {
-        let rx = cx.prompt_for_new_path(&home_dir(), Some(&suggested));
+        let rx = cx.prompt_for_new_path(&self.export_dir(), Some(&suggested));
         self._task = Some(cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(path))) = rx.await else { return };
+            let dir = path.parent().map(|p| p.to_path_buf());
             let done = cx.background_spawn(async move { f(path.clone()).map(|()| path) });
             let status: SharedString = match done.await {
                 Ok(path) => path.display().to_string().into(),
                 Err(reason) => reason.into(),
             };
             let _ = this.update(cx, |shell, cx| {
+                if let Some(dir) = &dir {
+                    shell.remember_export_dir(dir);
+                }
                 shell.export_status = Some(status);
                 cx.notify();
             });
         }));
+    }
+
+    /// Save/export panel start directory: last accepted export dir, else
+    /// ~/Downloads, else home. Stale remembered dirs (unmounted volume)
+    /// collapse to ~/Downloads so the panel never opens on a dead path.
+    fn export_dir(&self) -> std::path::PathBuf {
+        let fallback = || {
+            let dl = home_dir().join("Downloads");
+            dl.is_dir().then_some(dl).unwrap_or_else(home_dir)
+        };
+        let remembered = crate::prefs::Prefs::load(&self.data_dir).export_dir;
+        let path = std::path::PathBuf::from(&remembered);
+        (remembered.is_empty() || !path.is_dir())
+            .then(fallback)
+            .unwrap_or(path)
+    }
+
+    /// Persist `dir` as the next save/export panel start directory.
+    fn remember_export_dir(&mut self, path: &std::path::Path) {
+        if let Some(dir) = path.parent() {
+            let mut p = crate::prefs::Prefs::load(&self.data_dir);
+            let d = dir.display().to_string();
+            if d != p.export_dir {
+                p.export_dir = d;
+                p.save(&self.data_dir);
+            }
+        }
     }
 
     /// One note (`id`) → HTML (`md=false`) or Markdown (`md=true`) file.
@@ -1806,6 +1911,22 @@ impl AppShell {
         let src = crate::browse::reader_markdown_src(&n.title, &n.content, n.is_markdown);
         self.export_with_panel(name, cx, move |path| {
             let bytes = crate::pdf::note_to_pdf_title(&title, &src)?;
+            std::fs::write(&path, bytes).map_err(|e| e.to_string())
+        });
+    }
+
+    /// One note (`id`) → Word `.docx` via knit-md-docx (pulldown-cmark +
+    /// docx-rs). Same HTML→Markdown bridge as PDF for rich-text notes.
+    fn export_note_docx(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
+        let Some(n) = self
+            .store()
+            .and_then(|s| s.get_note_any(&id).ok().flatten())
+        else {
+            return;
+        };
+        let name = format!("{}.docx", crate::export::safe_filename(&n.title));
+        self.export_with_panel(name, cx, move |path| {
+            let bytes = crate::export::note_to_docx(&n)?;
             std::fs::write(&path, bytes).map_err(|e| e.to_string())
         });
     }
@@ -2183,7 +2304,7 @@ fn note_list_row(
             let starred = n.star;
             let is_blog = n.is_blog;
             let lang = crate::i18n::system_lang();
-            move |menu, _window, cx| {
+            move |menu, window, cx| {
                 // Feature 3: batch menu when the live multi-selection
                 // covers this row; otherwise the per-note menu.
                 let batch = shell
@@ -2197,7 +2318,7 @@ fn note_list_row(
                         .unwrap_or(0);
                     note_row_menu_batch(menu, &shell, lang, count)
                 } else {
-                    note_row_menu(menu, &shell, &id, lang, starred, is_blog)
+                    note_row_menu(menu, &shell, &id, lang, starred, is_blog, window, cx)
                 }
             }
         })
@@ -2269,20 +2390,18 @@ fn note_row_menu(
     lang: Lang,
     starred: bool,
     is_blog: bool,
+    window: &mut gpui_kit::Window,
+    cx: &mut gpui_kit::Context<gpui_kit::component::menu::PopupMenu>,
 ) -> gpui_kit::component::menu::PopupMenu {
+    let shell = shell.clone();
+    let id = id.clone();
     let shell_mv = shell.clone();
     let shell_del = shell.clone();
     let shell_star = shell.clone();
     let shell_blog = shell.clone();
-    let shell_html = shell.clone();
-    let shell_md = shell.clone();
-    let shell_pdf = shell.clone();
     let id_mv = id.clone();
     let id_del = id.clone();
     let id_star = id.clone();
-    let id_html = id.clone();
-    let id_md = id.clone();
-    let id_pdf = id.clone();
     let id_blog = id.clone();
     menu.item(
         PopupMenuItem::new(i18n::t(lang, i18n::Key::MoveNoteTo)).on_click(
@@ -2317,30 +2436,56 @@ fn note_row_menu(
             });
         }),
     )
-    .item(
-        PopupMenuItem::new(i18n::t(lang, i18n::Key::ExportHtml)).on_click(
-            move |_ev, _window, cx| {
-                let _ = shell_html.update(cx, |this, cx| {
-                    this.export_note_file(id_html.clone(), false, cx)
-                });
-            },
-        ),
-    )
-    .item(
-        PopupMenuItem::new(i18n::t(lang, i18n::Key::ExportMarkdown)).on_click(
-            move |_ev, _window, cx| {
-                let _ = shell_md.update(cx, |this, cx| {
-                    this.export_note_file(id_md.clone(), true, cx)
-                });
-            },
-        ),
-    )
-    .item(
-        PopupMenuItem::new(i18n::t(lang, i18n::Key::ExportPdf)).on_click(
-            move |_ev, _window, cx| {
-                let _ = shell_pdf.update(cx, |this, cx| this.export_note_pdf(id_pdf.clone(), cx));
-            },
-        ),
+    // Exports live one level down (Markdown / HTML / PDF / Word): four
+    // flat items dominated the menu and buried delete.
+    .submenu(
+        i18n::t(lang, i18n::Key::ExportAs),
+        window,
+        cx,
+        move |menu: gpui_kit::component::menu::PopupMenu, _w, _cx| {
+            let shell_md = shell.clone();
+            let shell_html = shell.clone();
+            let shell_pdf = shell.clone();
+            let shell_docx = shell.clone();
+            let id_md = id.clone();
+            let id_html = id.clone();
+            let id_pdf = id.clone();
+            let id_docx = id.clone();
+            menu.item(
+                PopupMenuItem::new(i18n::t(lang, i18n::Key::ExportMarkdown)).on_click(
+                    move |_ev, _window, cx| {
+                        let _ = shell_md.update(cx, |this, cx| {
+                            this.export_note_file(id_md.clone(), true, cx)
+                        });
+                    },
+                ),
+            )
+            .item(
+                PopupMenuItem::new(i18n::t(lang, i18n::Key::ExportHtml)).on_click(
+                    move |_ev, _window, cx| {
+                        let _ = shell_html.update(cx, |this, cx| {
+                            this.export_note_file(id_html.clone(), false, cx)
+                        });
+                    },
+                ),
+            )
+            .item(
+                PopupMenuItem::new(i18n::t(lang, i18n::Key::ExportPdf)).on_click(
+                    move |_ev, _window, cx| {
+                        let _ = shell_pdf
+                            .update(cx, |this, cx| this.export_note_pdf(id_pdf.clone(), cx));
+                    },
+                ),
+            )
+            .item(
+                PopupMenuItem::new(i18n::t(lang, i18n::Key::ExportWord)).on_click(
+                    move |_ev, _window, cx| {
+                        let _ = shell_docx
+                            .update(cx, |this, cx| this.export_note_docx(id_docx.clone(), cx));
+                    },
+                ),
+            )
+        },
     )
     .separator()
     .item(
@@ -2651,6 +2796,9 @@ impl Render for AppShell {
                         .track_focus(&self.preview_focus)
                         .debug_selector(|| "full-preview".into())
                         .size_full()
+                        // Opaque surface: without it the window's blurred
+                        // NSVisualEffectView shows through the preview.
+                        .bg(theme::material(Material::Background, dark))
                         .pt(px(24.))
                         .pb(px(48.))
                         .px(px(48.))
@@ -2670,10 +2818,12 @@ impl Render for AppShell {
                             ),
                         )
                         .child(
-                            crate::mermaid::install(
+                            crate::mermaid::install_full(
                                 TextView::markdown("full-preview", content),
                                 dark,
+                                Some(cx.entity().downgrade()),
                             )
+                            .style(markdown_view_style())
                             .scrollable(true)
                             .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
                         );
@@ -2731,6 +2881,19 @@ impl Render for AppShell {
             }
         }
 
+        // Item 6: right-click image menu, drawn above everything else.
+        let root = match self.image_menu.clone() {
+            Some((menu, position)) => root.child(
+                gpui_kit::deferred(
+                    gpui_kit::anchored()
+                        .position(position)
+                        .snap_to_window_with_margin(gpui_kit::px(8.))
+                        .child(menu),
+                )
+                .with_priority(gpui_kit::base::POPUP_PRIORITY),
+            ),
+            None => root,
+        };
         root.child(body)
     }
 }
@@ -3930,7 +4093,14 @@ impl AppShell {
                                     .rounded_full()
                                     .bg(gpui_kit::rgb(*hex))
                                     .when(selected, |el| {
-                                        el.border_1().border_color(theme::foreground(dark))
+                                        // macOS accent-pick style: a check
+                                        // glyph inside the circle; a ring
+                                        // reads as hover, not as the pick.
+                                        el.child(
+                                            Icon::new(AssetIcon::Check)
+                                                .size(px(18.))
+                                                .text_color(theme::accent_foreground()),
+                                        )
                                     });
                                 sw = sw.on_click(move |_, _window, cx| {
                                     let _ = shell.update(cx, |this, cx| {
@@ -4157,12 +4327,21 @@ impl AppShell {
                 }
             }
 
-            // Left nav: three section buttons.
-            let mut nav = gpui_kit::base::v_flex().gap_1().w(theme::ui(110.));
-            for (ix, label) in [
-                i18n::Key::SectionAppearance,
-                i18n::Key::SectionEditor,
-                i18n::Key::SectionData,
+            // Left nav: macOS System Settings style — icon + left-aligned
+            // label in a pill with real inner padding, selected row
+            // painted with the user accent (`.primary()` baked black).
+            // Same row construction as the main window's nav (nav_row).
+            let nav_fg = theme::foreground(dark);
+            let nav_muted = theme::muted_foreground(dark);
+            let sel_fg = theme::accent_foreground();
+            let mut nav = gpui_kit::base::v_flex()
+                .gap_1()
+                .w(theme::ui(148.))
+                .flex_shrink_0();
+            for (ix, (label, icon)) in [
+                (i18n::Key::SectionAppearance, AssetIcon::Palette),
+                (i18n::Key::SectionEditor, AssetIcon::FileText),
+                (i18n::Key::SectionData, AssetIcon::Database),
             ]
             .into_iter()
             .enumerate()
@@ -4170,22 +4349,43 @@ impl AppShell {
                 let section = section.clone();
                 let active = section.get() == ix;
                 nav = nav.child(
-                    Button::new(SharedString::from(format!("set-section-{ix}")))
-                        .label(t(label).to_owned())
-                        .when(active, |b| b.primary())
-                        .when(!active, |b| b.ghost())
-                        .xsmall()
+                    gpui_kit::base::h_flex()
+                        .id(SharedString::from(format!("set-section-{ix}")))
                         .w_full()
-                        .on_click(move |_, _window, _cx| {
+                        .h_8()
+                        .gap_2()
+                        .px_3()
+                        .rounded(px(theme::RADIUS_SELECTION))
+                        .when(active, |el| el.bg(theme::accent()))
+                        .on_click(move |_ev, _window, _cx| {
                             section.set(ix);
-                        }),
+                        })
+                        .child(Icon::new(icon).small().text_color(if active {
+                            sel_fg
+                        } else {
+                            nav_muted
+                        }))
+                        .child(
+                            Label::new(t(label))
+                                .text_size(theme::ui(13.))
+                                .text_color(if active { sel_fg } else { nav_fg }),
+                        ),
                 );
             }
+
+            // Vertical divider between the two columns, like the main
+            // window's pane split.
+            let divider = gpui_kit::div()
+                .w(theme::ui(1.))
+                .self_stretch()
+                .bg(theme::border(dark));
 
             let content = gpui_kit::base::h_flex()
                 .gap_4()
                 .items_start()
+                .self_stretch()
                 .child(nav)
+                .child(divider)
                 .child(right);
 
             // Round 3: kit paints the dialog panel from tokens.background,
@@ -4244,7 +4444,14 @@ impl AppShell {
                         }),
                 );
             }
-            dialog.w(px(440.)).title(t(i18n::Key::History)).child(rows)
+            // Same glass fix as settings (see open_settings): kit paints the
+            // panel from tokens.background, forced transparent by
+            // apply_wake_theme for the frosted window.
+            dialog
+                .w(px(440.))
+                .title(t(i18n::Key::History))
+                .bg(theme::material(Material::Popover, dark))
+                .child(rows)
         });
     }
 
@@ -4261,18 +4468,23 @@ impl AppShell {
         let dark = self.dark(cx);
         let t = move |k: i18n::Key| i18n::t(lang, k);
         let shell = cx.entity();
-        let prefs = crate::prefs::Prefs::load(&self.data_dir);
-        let _preview_px = px(theme::preview_font_px(&prefs.editor_font_size, prefs.zoom));
+        let md_style = markdown_view_style();
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let shell_c = shell.clone();
             let src = browse::reader_markdown_src(&title, &content, true);
             dialog
                 .w(px(560.))
                 .title(t(i18n::Key::History))
+                .bg(theme::material(Material::Popover, dark))
                 .child(
-                    crate::mermaid::install(TextView::markdown("history-preview", src), dark)
-                        .scrollable(true)
-                        .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
+                    crate::mermaid::install_full(
+                        TextView::markdown("history-preview", src),
+                        dark,
+                        Some(shell_c.downgrade()),
+                    )
+                    .style(md_style.clone())
+                    .scrollable(true)
+                    .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
                 )
                 .child(
                     Button::new("history-restore")
@@ -4292,24 +4504,32 @@ impl AppShell {
         });
     }
 
-    /// Issue 19: Markdown cheat-sheet dialog.
+    /// 使用帮助对话框（原 Issue 19 markdown cheat-sheet）。正文为纯
+    /// 文本——此前经 markdown 渲染，速查表里的语法示例本身被解析、
+    /// 显示混乱（需求 2）。div + line_height 直接排版，等宽对齐两栏。
     pub(crate) fn open_md_help(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
         let dark = self.dark(cx);
         let lang = self.lang;
         let t = move |k: i18n::Key| i18n::t(lang, k);
         let prefs = crate::prefs::Prefs::load(&self.data_dir);
-        let preview_px = px(theme::preview_font_px(&prefs.editor_font_size, prefs.zoom));
+        let body_px = px(theme::preview_font_px(&prefs.editor_font_size, prefs.zoom));
         window.open_dialog(cx, move |dialog, _window, _cx| {
             dialog
-                .w(px(440.))
+                .w(px(520.))
                 .title(t(i18n::Key::MarkdownHelpTitle))
-                .child(div().text_size(preview_px).child(crate::mermaid::install(
-                    TextView::markdown(
-                        "md-help",
-                        browse::reader_markdown_src("", i18n::markdown_help_body(lang), true),
-                    ),
-                    dark,
-                )))
+                .bg(theme::material(Material::Popover, dark))
+                .child(
+                    div()
+                        .id("md-help-scroll")
+                        .max_h(px(420.))
+                        .overflow_y_scroll()
+                        .p_3()
+                        .text_size(body_px)
+                        .line_height(rems(1.5))
+                        .text_color(theme::foreground(dark))
+                        .font_family("monospace")
+                        .child(i18n::markdown_help_body(lang)),
+                )
         });
     }
 
@@ -4372,6 +4592,7 @@ impl AppShell {
             dialog
                 .w(px(440.))
                 .title(t(i18n::Key::Attachments))
+                .bg(theme::material(Material::Popover, dark))
                 .child(list)
         });
     }
@@ -5206,9 +5427,14 @@ impl AppShell {
             // parse options; `.scrollable` keeps the whole pane from
             // scrolling away under the toolbar.
             .child(
-                crate::mermaid::install(TextView::markdown("reader", src), dark)
-                    .scrollable(true)
-                    .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
+                crate::mermaid::install_full(
+                    TextView::markdown("reader", src),
+                    dark,
+                    Some(cx.entity().downgrade()),
+                )
+                .style(markdown_view_style())
+                .scrollable(true)
+                .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
             );
         pane.child(col)
     }
@@ -5248,25 +5474,33 @@ impl AppShell {
         // Issue 19: title row = title input + ghost icon buttons; save runs
         // via autosave/⌘S with a transient "Saved" flash, so no Save button.
         let (toggle_key, toggle_icon) = if preview {
-            (i18n::Key::EditorSource, AssetIcon::Code)
+            (i18n::Key::EditorSource, AssetIcon::SquarePen)
         } else {
             (i18n::Key::EditorPreview, AssetIcon::Eye)
         };
-        let icon_btn = |id: &'static str,
-                        icon: AssetIcon,
-                        tip: &'static str,
-                        on_click: Box<
-            dyn Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App),
-        >| {
-            Button::new(id)
-                .icon(icon)
-                .ghost()
-                .small()
-                .tooltip(tip)
-                .on_click(on_click)
-        };
+        let drag_state = window.use_state(cx, |_, _| DragHeaderState { should_move: false });
         let title_row = gpui_kit::base::h_flex()
             .gap_2()
+            // Window drag: the row's empty padding (not the title input
+            // itself — it must keep text selection) moves the window on
+            // Windows (HTCAPTION via window_control_area) and Linux
+            // (start_window_move); macOS keeps AppKit's titlebar drag.
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down_out(window.listener_for(&drag_state, |s, _, _, _| s.should_move = false))
+            .on_mouse_down(
+                MouseButton::Left,
+                window.listener_for(&drag_state, |s, _, _, _| s.should_move = true),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                window.listener_for(&drag_state, |s, _, _, _| s.should_move = false),
+            )
+            .on_mouse_move(window.listener_for(&drag_state, |s, _, window, _| {
+                if s.should_move {
+                    s.should_move = false;
+                    window.start_window_move();
+                }
+            }))
             .child(
                 // Issue 21 / UI round 10: title = 1.25rem — scales with the
                 // interface zoom. 32px row at 100% (28px text + descender
@@ -5295,18 +5529,67 @@ impl AppShell {
                         cx.notify();
                     })),
             )
-            .child(icon_btn(
-                "open-attachments",
-                AssetIcon::Paperclip,
-                t(i18n::Key::Attachments),
-                Box::new(cx.listener(|this, _ev, window, cx| this.open_attachments(window, cx))),
-            ))
-            .child(icon_btn(
-                "open-history",
-                AssetIcon::Clock,
-                t(i18n::Key::History),
-                Box::new(cx.listener(|this, _ev, window, cx| this.open_history(window, cx))),
-            ));
+            // Syntax help moved off the slash panel (round 2): one always
+            // reachable toolbar entry beside Preview, plain-text cheat
+            // sheet covering markdown syntax AND the `/` panel itself.
+            .child(
+                Button::new("md-help")
+                    .icon(AssetIcon::CircleQuestionMark)
+                    .ghost()
+                    .small()
+                    .tooltip(t(i18n::Key::MarkdownHelpTitle))
+                    .on_click(cx.listener(|this, _ev, window, cx| {
+                        this.open_md_help(window, cx);
+                    })),
+            )
+            // Feature: one "more" (⋯) dropdown carries the note-list
+            // right-click actions plus attachments/history — the title row
+            // stays three icons wide.
+            .child({
+                let shell = cx.entity().downgrade();
+                let note_id = ed.note_id.clone();
+                let (starred, is_blog) = self
+                    .store()
+                    .and_then(|s| s.get_note_any(&note_id).ok().flatten())
+                    .map(|n| (n.star, n.is_blog))
+                    .unwrap_or((false, false));
+                let lang = crate::i18n::system_lang();
+                Button::new("note-more")
+                    .icon(AssetIcon::Ellipsis)
+                    .ghost()
+                    .small()
+                    .tooltip(t(i18n::Key::MoreActions))
+                    .dropdown_menu_with_anchor(
+                        gpui_kit::Anchor::BottomRight,
+                        move |menu, _w, _cx| {
+                            let mut menu = note_row_menu(
+                                menu, &shell, &note_id, lang, starred, is_blog, _w, _cx,
+                            );
+                            // Attachments & history operate on the open
+                            // note; they were title-row buttons before
+                            // this menu. Both read self.editing, which is
+                            // the note this menu was opened from.
+                            let shell_a = shell.clone();
+                            let shell_h = shell.clone();
+                            menu = menu.separator().item(
+                                PopupMenuItem::new(crate::i18n::t(lang, i18n::Key::Attachments))
+                                    .on_click(move |_ev, window, cx| {
+                                        let _ = shell_a.update(cx, |this, cx| {
+                                            this.open_attachments(window, cx)
+                                        });
+                                    }),
+                            );
+                            menu = menu.item(
+                                PopupMenuItem::new(crate::i18n::t(lang, i18n::Key::History))
+                                    .on_click(move |_ev, window, cx| {
+                                        let _ = shell_h
+                                            .update(cx, |this, cx| this.open_history(window, cx));
+                                    }),
+                            );
+                            menu
+                        },
+                    )
+            });
         // Issue 21: no Done and no OS-fullscreen button — quitting edit is
         // selecting another note; fullscreen is the ⌘T in-app preview.
 
@@ -5327,7 +5610,7 @@ impl AppShell {
                     prefs.zoom,
                 )))
                 .child(
-                    crate::mermaid::install(
+                    crate::mermaid::install_full(
                         TextView::markdown(
                             "editor-preview",
                             browse::reader_markdown_src(
@@ -5340,7 +5623,9 @@ impl AppShell {
                             ),
                         ),
                         dark,
+                        Some(cx.entity().downgrade()),
                     )
+                    .style(markdown_view_style())
                     .scrollable(true)
                     .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
                 )
@@ -6862,4 +7147,138 @@ mod tests {
     }
 }
 
-// Window-state glue used by main.rs.
+/// Markdown `code` spans render with `theme.tokens.colors.accent` as a
+/// solid background (vendor `TextViewStyle::from_colors`) — the accent is
+/// too heavy for a text wash, making the span unreadable. Keep the accent
+/// hue but fade it to 10% alpha so body text stays legible on top.
+fn markdown_view_style() -> TextViewStyle {
+    TextViewStyle::default().inline_code(HighlightStyle {
+        background_color: Some(crate::theme::accent().opacity(0.1)),
+        ..Default::default()
+    })
+}
+
+/// Suggested `(stem, extension)` for saving `url`'s image.
+fn image_file_name(url: &str) -> (String, &'static str) {
+    let path = url.split('?').next().unwrap_or(url);
+    let stem = path
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.rsplit_once('.')
+                .map(|(stem, _)| stem.to_string())
+                .unwrap_or_else(|| s.to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "image".into());
+    let ext = image_format_from_uri(url)
+        .map(|f| match f {
+            gpui_kit::ImageFormat::Png => "png",
+            gpui_kit::ImageFormat::Jpeg => "jpg",
+            gpui_kit::ImageFormat::Gif => "gif",
+            gpui_kit::ImageFormat::Svg => "svg",
+            gpui_kit::ImageFormat::Webp => "webp",
+            gpui_kit::ImageFormat::Bmp => "bmp",
+            _ => "png",
+        })
+        .unwrap_or("png");
+    (stem, ext)
+}
+
+// --- Item 6: image right-click menu (复制图片 / 另存为…) ---
+
+/// Decode an `ImageSource` to in-memory bytes. Note images arrive as
+/// `data:` URLs resolved to `ImageSource::Image` before rendering, so the
+/// in-memory path is the norm; remote `https` images are fetched here.
+fn image_bytes(source: &gpui_kit::ImageSource) -> Result<gpui_kit::Image, String> {
+    use gpui_kit::ImageSource;
+    match source {
+        ImageSource::Image(image) => Ok((**image).clone()),
+        ImageSource::Resource(gpui_kit::Resource::Uri(uri)) => {
+            let url = uri.to_string();
+            let format = image_format_from_uri(&url).ok_or("unsupported image")?;
+            let bytes = ureq::get(&url)
+                .call()
+                .and_then(|response| {
+                    let mut bytes = Vec::new();
+                    let mut reader = std::io::BufReader::new(response.into_body().into_reader());
+                    std::io::Read::read_to_end(&mut reader, &mut bytes)?;
+                    Ok(bytes)
+                })
+                .map_err(|e| e.to_string())?;
+            Ok(gpui_kit::Image::from_bytes(format, bytes))
+        }
+        _ => Err("unsupported image".into()),
+    }
+}
+
+/// Infer the image format from a URL's file extension.
+fn image_format_from_uri(uri: &str) -> Option<gpui_kit::ImageFormat> {
+    let path = uri.split('?').next().unwrap_or(uri);
+    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => gpui_kit::ImageFormat::Png,
+        "jpg" | "jpeg" => gpui_kit::ImageFormat::Jpeg,
+        "gif" => gpui_kit::ImageFormat::Gif,
+        "svg" => gpui_kit::ImageFormat::Svg,
+        "webp" => gpui_kit::ImageFormat::Webp,
+        "bmp" => gpui_kit::ImageFormat::Bmp,
+        _ => return None,
+    })
+}
+
+/// Open the image context menu at the click position. The shell owns the
+/// surface so the menu closes on click-outside and on dismissal events.
+pub(crate) fn on_image_menu(
+    shell: gpui_kit::WeakEntity<AppShell>,
+    url: &gpui_kit::SharedUri,
+    source: &gpui_kit::ImageSource,
+    event: &gpui_kit::ClickEvent,
+    window: &mut gpui_kit::Window,
+    cx: &mut gpui_kit::App,
+) {
+    if !event.is_secondary() {
+        return;
+    }
+    let Some(shell_entity) = shell.upgrade() else {
+        return;
+    };
+    let position = event.position();
+    let url = url.to_string();
+    let source = source.clone();
+    let lang = shell_entity.read(cx).lang;
+    let menu = gpui_kit::component::menu::PopupMenu::build(window, cx, move |menu, _w, _cx| {
+        menu.item(
+            PopupMenuItem::new(i18n::t(lang, i18n::Key::CopyImage)).on_click({
+                let source = source.clone();
+                move |_, _, cx| match image_bytes(&source) {
+                    Ok(image) => cx.write_to_clipboard(gpui_kit::ClipboardItem::new_image(&image)),
+                    Err(_) => cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                        "copy failed".to_string(),
+                    )),
+                }
+            }),
+        )
+        .item(
+            PopupMenuItem::new(i18n::t(lang, i18n::Key::SaveImageAs)).on_click({
+                let source = source.clone();
+                let url = url.clone();
+                move |_, window, cx| {
+                    let _ = shell.update(cx, |this, cx| {
+                        this.save_image_as(source.clone(), url.clone(), window, cx)
+                    });
+                }
+            }),
+        )
+    });
+    // Draw the menu in the shell's tree; it clears itself on DismissEvent.
+    let _ = shell_entity.update(cx, |this, cx| {
+        let _subscription = cx.subscribe(&menu, |this, _, _: &gpui_kit::DismissEvent, cx| {
+            this.image_menu = None;
+            cx.notify();
+        });
+        this.image_menu = Some((menu, position));
+        cx.notify();
+    });
+}

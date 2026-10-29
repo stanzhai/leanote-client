@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use gpui::{AnyElement, App, IntoElement, SharedString, Window};
+use gpui::{AnyElement, App, ClickEvent, IntoElement, SharedString, Window};
 use markdown::{ParseOptions, mdast};
 
 use super::{InlineElement, InlineRenderContext};
@@ -71,6 +71,15 @@ pub trait MarkdownPlugin: Send + Sync + 'static {
         cx: &mut App,
     ) -> Option<InlineElement> {
         Some(InlineElement::new(self.render(node, window, cx)))
+    }
+
+    /// Configure the host [`crate::TextView`] beyond parsing/rendering.
+    ///
+    /// Default no-op. Used by wrapper layers (e.g. a component `TextView`)
+    /// whose own builder surface does not carry every Base hook: a plugin can
+    /// reach them through this method, which every layer forwards.
+    fn configure(&self, _text_view: crate::TextView) -> crate::TextView {
+        _text_view
     }
 }
 
@@ -250,6 +259,10 @@ pub struct MarkdownExtensions {
     block_renderers: HashMap<SharedString, Arc<MarkdownBlockRenderFn>>,
     inline_parsers: Vec<Arc<MarkdownInlineParserFn>>,
     inline_renderers: HashMap<SharedString, Arc<MarkdownInlineRenderFn>>,
+    /// Not a parser/renderer registration, but a hook the standard image
+    /// nodes consult; stored here because the extensions object is the one
+    /// piece of TextView configuration every wrapper layer already forwards.
+    image_context_menu: Option<Arc<crate::text::text_view::ImageClickHandlerFn>>,
     revision: u64,
     parser_revision: u64,
 }
@@ -283,6 +296,40 @@ impl MarkdownExtensions {
         self.enable_mdx = true;
         self.bump_revision();
         self
+    }
+
+    /// Set the handler invoked when a standard (non-plugin) document image is
+    /// clicked. Right-clicks reach it too (macOS delivers them as normal
+    /// clicks); the handler decides by inspecting the event.
+    pub fn image_context_menu<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&gpui::SharedUri, &gpui::ImageSource, &ClickEvent, &mut Window, &mut App)
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.image_context_menu = Some(Arc::new(handler));
+        self
+    }
+
+    /// The registered image click handler, if any.
+    pub(crate) fn image_click_handler(
+        &self,
+    ) -> Option<Arc<crate::text::text_view::ImageClickHandlerFn>> {
+        self.image_context_menu.clone()
+    }
+
+    /// Set the image click handler in place, preserving parser/renderer
+    /// registrations.
+    pub(crate) fn set_image_context_menu<F>(&mut self, handler: F)
+    where
+        F: Fn(&gpui::SharedUri, &gpui::ImageSource, &ClickEvent, &mut Window, &mut App)
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.image_context_menu = Some(Arc::new(handler));
+        self.bump_revision();
     }
 
     /// Register a parser for block-level Markdown AST nodes.

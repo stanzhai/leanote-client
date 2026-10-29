@@ -10,10 +10,12 @@ mod export;
 mod fonts;
 mod i18n;
 mod markdown_input;
+mod mermaid;
 mod pdf;
 mod prefs;
 mod search_overlay;
 mod single_instance;
+mod slash_panel;
 mod theme;
 mod theme_family;
 mod vim;
@@ -25,7 +27,7 @@ use gpui_kit::component::input::language_config::LanguageConfig;
 use gpui_kit::component::Theme;
 use gpui_kit::{px, AppContext as _, TitlebarOptions, WindowOptions};
 use std::path::PathBuf;
-
+gpui_kit::actions!(leanote, [QuitApp]);
 /// `LEANOTE_DATA` wins (CLI convention); else the core default.
 fn data_dir() -> PathBuf {
     std::env::var_os("LEANOTE_DATA")
@@ -239,6 +241,20 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            // ADR-0011: macOS 原生应用菜单 —— 系统服务入口 + ⌘Q 退出。
+            // Windows/Linux 无应用菜单，不适用。
+            #[cfg(target_os = "macos")]
+            {
+                use gpui_kit::{Menu, MenuItem, SystemMenuType};
+
+                cx.set_menus([Menu::new("Leanote").items([
+                    MenuItem::os_submenu("Services", SystemMenuType::Services),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Leanote", QuitApp),
+                ])]);
+                cx.bind_keys([gpui_kit::KeyBinding::new("cmd-q", QuitApp, None)]);
+                cx.on_action(|_: &QuitApp, cx| cx.quit());
+            }
 
             // Issue 21 需求5: markdown pair closing/fences are handled by
             // the shell's key capture (app_layer `markdown_input`) — turn
@@ -403,20 +419,26 @@ fn main() {
                 // on top of the already-correct same-frame switch. `Follow`
                 // is the only mode where the system can move under us.
                 let dir_for_observer = dir.clone();
-                let _ = window.observe_window_appearance(move |_window, cx| {
-                    let p = crate::prefs::Prefs::load(&dir_for_observer);
-                    if p.appearance != crate::prefs::AppearancePref::Follow {
-                        return;
-                    }
-                    Theme::sync_system_appearance(None, cx);
-                    let palette = p.ui_theme.clone();
-                    let font = p.font;
-                    let editor_size = p.editor_font_size.clone();
-                    let zoom = p.zoom;
-                    Theme::update(cx, move |theme| {
-                        apply_wake_theme(theme, &palette, &font, &editor_size, zoom)
-                    });
-                });
+                // Follow bug: `let _ =` dropped the Subscription right here,
+                // unsubscribing before the OS theme could ever change — the
+                // observer never fired while running. detach() keeps it
+                // alive for the window's lifetime.
+                window
+                    .observe_window_appearance(move |_window, cx| {
+                        let p = crate::prefs::Prefs::load(&dir_for_observer);
+                        if p.appearance != crate::prefs::AppearancePref::Follow {
+                            return;
+                        }
+                        Theme::sync_system_appearance(None, cx);
+                        let palette = p.ui_theme.clone();
+                        let font = p.font;
+                        let editor_size = p.editor_font_size.clone();
+                        let zoom = p.zoom;
+                        Theme::update(cx, move |theme| {
+                            apply_wake_theme(theme, &palette, &font, &editor_size, zoom)
+                        });
+                    })
+                    .detach();
                 // Persist size/position at close.
                 window.on_window_should_close(cx, move |window, _cx| {
                     if let gpui_kit::WindowBounds::Windowed(b) = window.window_bounds() {
@@ -496,6 +518,18 @@ pub(crate) fn apply_wake_theme(
     // the reader/preview selection after any accent pick in light mode.
     colors.accent = theme::accent();
     colors.primary = theme::accent();
+    // Selected segmented pills (settings rows) paint from the primary
+    // button tokens. Written on BOTH sides (colors + tokens): reconcile
+    // keeps a field only when the two agree — a token-only write survived
+    // same-mode replays but any mode/appearance switch changed
+    // colors.button_primary (kit per-mode default: neutral-900 light /
+    // neutral-50 dark) and reconcile stamped that near-black/near-white
+    // default back over the accent. Same trick as the transparent
+    // background below.
+    colors.button_primary = theme::accent();
+    colors.button_primary_hover = theme::accent().opacity(0.9);
+    colors.button_primary_active = theme::accent().opacity(0.8);
+    colors.button_primary_foreground = theme::accent_foreground();
     // White on the accent in BOTH modes: kit default (neutral-900/neutral-50)
     // put dark text on the mid-saturation wake accents — unreadable menu
     // hover / ⌘K selection / ghost-button hover in light mode.
@@ -611,6 +645,38 @@ mod glass_tests {
         assert!(
             t.a == 0.,
             "glass token must stay fully transparent after reconcile, got {t:?}"
+        );
+    }
+
+    /// The settings segmented pills paint from tokens.button_primary. A
+    /// token-only accent write was wiped by reconcile on every mode
+    /// switch (colors.button_primary carried the kit per-mode default —
+    /// near black in light, near WHITE in dark: the "sometimes white"
+    /// selected pill). Writing colors + tokens to one value keeps the
+    /// accent through reconcile, like the transparent background above.
+    #[test]
+    fn reconcile_keeps_accent_primary_button() {
+        let mut theme = gpui_kit::component::Theme::default();
+        apply_wake_theme(&mut theme, "", "", "", 1.0);
+        // Mode switch: kit loads the OTHER mode's table, changing
+        // colors.button_primary to its per-mode default, then our closure
+        // re-runs. Hand-roll reconcile's field loop for button_primary.
+        let colors_before = theme.colors;
+        let tokens_before = theme.tokens;
+        theme.colors.button_primary = gpui_kit::component::theme::ThemeColor::dark().button_primary;
+        apply_wake_theme(&mut theme, "", "", "", 1.0);
+        if theme.colors.button_primary != colors_before.button_primary {
+            if theme.tokens.button_primary.color != theme.colors.button_primary {
+                theme.tokens.button_primary = theme.colors.button_primary.into();
+            }
+        } else if theme.tokens.button_primary != tokens_before.button_primary {
+            theme.colors.button_primary = theme.tokens.button_primary.color;
+        }
+        let expected = crate::theme::accent();
+        let got = theme.tokens.button_primary.color;
+        assert_eq!(
+            got, expected,
+            "selected pill must stay the accent after a mode switch, got {got:?}"
         );
     }
 }

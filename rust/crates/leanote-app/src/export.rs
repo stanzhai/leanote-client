@@ -61,7 +61,43 @@ fn escape_html(s: &str) -> String {
 pub fn markdown_to_html(src: &str) -> String {
     // GFM: leanote notes use pipe tables; the JS plugin's html.tpl loads the
     // same dialect via marked.
-    markdown::to_html_with_options(src, &markdown::Options::gfm()).unwrap_or_default()
+    let html = markdown::to_html_with_options(src, &markdown::Options::gfm()).unwrap_or_default();
+    inline_mermaid(html)
+}
+
+/// Replace ```mermaid code fences with inline `<svg>` (ADR-0011). The fence
+/// renders as `<pre><code class="language-mermaid">…escaped source…</code></pre>`;
+/// the SVG's own text is plain-escaped before splicing. Parse failure leaves
+/// the code block (the in-app fallback contract).
+fn inline_mermaid(mut out: String) -> String {
+    loop {
+        let Some(start) = out.find("<code class=\"language-mermaid\">") else {
+            return out;
+        };
+        let Some(close) = out[start..].find("</code>") else {
+            return out;
+        };
+        let body = &out[start + 31..start + close];
+        let src = body
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'");
+        match crate::mermaid::render_svg(&src, false) {
+            Ok(svg) => {
+                // `max-width` keeps wide diagrams inside the article column.
+                let patched = svg.replacen("<svg ", "<svg style=\"max-width:100%\" ", 1);
+                out = format!(
+                    "{}{}{}",
+                    &out[..start - 5], // drops the `<pre>`
+                    patched,
+                    &out[start + close + 7 + 6..] // `</code></pre>`
+                );
+            }
+            Err(_) => return out,
+        }
+    }
 }
 
 /// Markdown note → Markdown file. Content as stored, byte-for-byte —
@@ -388,6 +424,21 @@ pub fn safe_filename(title: &str) -> String {
     }
 }
 
+/// One note → Word `.docx` bytes. knit-md-docx (pulldown-cmark + docx-rs)
+/// covers headings/emphasis/links/images/lists/task lists/code blocks/
+/// quotes/GFM tables/footnotes — the full set a note can carry. Rich-text
+/// notes go through the same HTML→Markdown bridge as the PDF export.
+pub fn note_to_docx(note: &Note) -> Result<Vec<u8>, String> {
+    let md = crate::browse::reader_markdown_src(&note.title, &note.content, note.is_markdown);
+    // The title becomes the document's H1 (every export format anchors on
+    // it). Angle brackets get backslash-escaped: as raw markdown they would
+    // parse as inline HTML tags and pulldown-cmark would drop them (a note
+    // titled `T & <title>` exported only `T &`).
+    let title = note.title.replace('<', "\\<").replace('>', "\\>");
+    let src = format!("# {}\n\n{}", title, md);
+    knit_md_docx::to_bytes(&src).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,4 +657,44 @@ mod tests {
         let _ = n;
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Word export: zip container, Word-openable, title + body carried.
+    /// python3 zipfile is the independent reader (no zip dep in the app).
+    #[test]
+    fn docx_export_carries_title_and_body() {
+        let n = note("# Head\n\n**bold** text\n", true);
+        let path = std::env::temp_dir().join("leanote-docx-smoke.docx");
+        std::fs::write(&path, note_to_docx(&n).unwrap()).unwrap();
+        // python3 zipfile: independent reader proves Word-openable structure
+        // (clean central directory, readable entries) without a zip dep.
+        let out = std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import zipfile,sys;z=zipfile.ZipFile(sys.argv[1]);print(z.testzip() or 'ok');x=z.read('word/document.xml').decode('utf-8');print('title' if 'T &amp; &lt;title&gt;' in x else 'NOTITLE');print('bold' if 'bold' in x else 'NOBOLD')")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            s.contains("ok"),
+            "zip corrupt: {s}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(s.contains("title"), "title missing: {s}");
+        assert!(s.contains("bold"), "body missing: {s}");
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// ADR-0011: HTML export inlines mermaid fences as `<svg>`; a broken
+/// diagram keeps the code block.
+#[test]
+fn mermaid_fence_inlines_svg_in_html() {
+    let h = markdown_to_html("```mermaid\nflowchart LR\n  A-->B\n```\n");
+    assert!(h.contains("<svg"), "svg missing: {h}");
+    assert!(!h.contains("language-mermaid"), "fence not replaced: {h}");
+    let bad = markdown_to_html("```mermaid\nflowchart LR\n  A-[>B\n```\n");
+    assert!(
+        bad.contains("language-mermaid"),
+        "bad source must keep code block"
+    );
 }
