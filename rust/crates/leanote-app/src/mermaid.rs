@@ -181,9 +181,61 @@ fn ink_viewbox(svg: &str, margin: f32) -> Option<(f32, f32, f32, f32)> {
     // fontdb, so every <text> is dropped and the bbox misses all labels
     // (gpui's own rasterizer loads system fonts — the two must agree or
     // the crop cuts text that the real render draws).
+    //
+    // Some hosts have no usable text fonts (GH Linux runners ship none —
+    // load_system_fonts() yields zero faces or only Noto Color Emoji),
+    // so usvg's font query misses, <text> vanishes, and the crop
+    // amputates every label the real renderer still draws (gpui's
+    // resolver falls back to any face). Seed the db with typst-kit's
+    // embedded fonts when that happens — they already ship in the binary
+    // for PDF export — then pin the generic families gpui also pins, so
+    // the crop bbox and the drawn glyphs agree on a fontless host.
     let mut opts = usvg::Options::default();
     let mut db = usvg::fontdb::Database::new();
     db.load_system_fonts();
+    let serif_resolves = db
+        .query(&usvg::fontdb::Query {
+            families: &[usvg::fontdb::Family::Serif],
+            ..Default::default()
+        })
+        .is_some();
+    if !serif_resolves {
+        let mut store = typst_kit::fonts::FontStore::new();
+        store.extend(typst_kit::fonts::embedded());
+        for i in 0.. {
+            let Some(font) = store.font(i) else { break };
+            db.load_font_data(font.data().as_slice().to_vec());
+        }
+        // Same pins as gpui's `fix_generic_font_families`: point every
+        // generic at a face the db actually holds, or queries miss again.
+        let name = db
+            .query(&usvg::fontdb::Query {
+                families: &[usvg::fontdb::Family::Name("Libertinus Serif")],
+                ..Default::default()
+            })
+            .and_then(|id| db.face(id))
+            .and_then(|f| f.families.first().map(|(n, _)| n.clone()))
+            .or_else(|| {
+                db.faces()
+                    .next()
+                    .and_then(|f| f.families.first().map(|(n, _)| n.clone()))
+            })
+            .unwrap_or_default();
+        if !name.is_empty() {
+            db.set_serif_family(&name);
+            db.set_sans_serif_family(&name);
+        }
+        let mono = db
+            .query(&usvg::fontdb::Query {
+                families: &[usvg::fontdb::Family::Name("DejaVu Sans Mono")],
+                ..Default::default()
+            })
+            .and_then(|id| db.face(id))
+            .and_then(|f| f.families.first().map(|(n, _)| n.clone()));
+        if let Some(mono) = mono {
+            db.set_monospace_family(&mono);
+        }
+    }
     opts.fontdb = std::sync::Arc::new(db);
     let tree = usvg::Tree::from_str(svg, &opts).ok()?;
     let (w, h) = (tree.size().width(), tree.size().height());
