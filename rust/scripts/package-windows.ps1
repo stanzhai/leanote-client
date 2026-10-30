@@ -35,6 +35,36 @@ New-Item -ItemType Directory -Force -Path (Join-Path $Staging 'bin') | Out-Null
 Copy-Item (Join-Path $BinDir 'Leanote.exe') (Join-Path $Staging 'Leanote.exe')
 Copy-Item (Join-Path $BinDir 'leanote-cli.exe') (Join-Path $Staging 'bin/leanote.exe')
 
+# Code signing (ADR-0012): with WINDOWS_CERT_PFX_BASE64 set (CI), sign the
+# exes and the installer so SmartScreen doesn't flag them as unknown
+# publisher. Unset (local builds) keeps the previous unsigned behavior.
+$CertPfx = $null
+$Signtool = $null
+if ($env:WINDOWS_CERT_PFX_BASE64 -and $env:WINDOWS_CERT_PASSWORD) {
+    $CertPfx = Join-Path $OutDir '.sign-cert.pfx'
+    [IO.File]::WriteAllBytes($CertPfx, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+    foreach ($pattern in @(
+        'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe',
+        'C:\Program Files (x86)\Windows Kits\10\bin\*\arm64\signtool.exe')) {
+        $Signtool = Get-ChildItem $pattern -ErrorAction SilentlyContinue |
+            Sort-Object FullName | Select-Object -Last 1
+        if ($Signtool) { break }
+    }
+    if (-not $Signtool) { $Signtool = Get-Command signtool -ErrorAction SilentlyContinue }
+    if (-not $Signtool) { throw 'signtool not found (install Windows SDK)' }
+}
+
+function Sign-File([string]$Path) {
+    Write-Host "==> sign $Path"
+    & $Signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $CertPfx /p $env:WINDOWS_CERT_PASSWORD $Path
+    if ($LASTEXITCODE -ne 0) { throw "signtool failed: $Path" }
+}
+
+if ($CertPfx) {
+    Sign-File (Join-Path $Staging 'Leanote.exe')
+    Sign-File (Join-Path $Staging 'bin\leanote.exe')
+}
+
 # Portable zip
 $Zip = Join-Path $OutDir "Leanote_${Version}_windows_${Arch}_portable.zip"
 if (Test-Path $Zip) { Remove-Item $Zip }
@@ -125,6 +155,11 @@ if (-not $Makensis) {
 
 & $Makensis $Nsi | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
+
+if ($CertPfx) {
+    Sign-File $SetupExe
+    Remove-Item $CertPfx -Force
+}
 
 Write-Host "done:"
 Write-Host "  $SetupExe"

@@ -1,6 +1,10 @@
 # 更新日志 / Changelog
 
 
+
+## 3.1.5（2026-10-30）
+
+- **发布产物签名与公证（CI secrets 门控）**：GitHub Releases 的 mac 包此前仅 ad-hoc 签名，浏览器下载后带隔离属性，Gatekeeper 报「已损坏，应移到废纸篓」（macOS 15 起右键打开绕过也已移除）；Windows 安装器未签名触发 SmartScreen「Windows 已保护你的电脑」。两个打包脚本现支持正式签名：macOS 在 `MACOS_CERT_P12_BASE64`/`MACOS_CERT_PASSWORD`/`APPLE_ID`/`APPLE_APP_SPECIFIC_PASSWORD`/`APPLE_TEAM_ID` 齐备时，Developer ID + hardened runtime 签名 → notarization → staple（.app 与 DMG 各自公证装订；Info.plist 版本号剥离 tag 前缀 `v` 满足公证纯数字要求；keychain 创建幂等，失败重跑不再卡死）；Windows 在 `WINDOWS_CERT_PFX_BASE64`/`WINDOWS_CERT_PASSWORD` 存在时用 signtool 对两个 exe（打 zip 前签名，便携包内同为签名件）与 NSIS setup 做 SHA-256 + RFC3161 时间戳签名。secrets 未配置时行为与从前完全一致；证书已配但 Apple 凭据缺失直接失败，不静默回退未签名发版。生效需购置 Apple Developer Program（$99/年）与 Windows 代码签名证书，详见 ADR-0012。
 ## 3.1.3（2026-10-29）
 
 - **导出 Word（.docx）+ 导出二级菜单**：笔记右键菜单与编辑器「更多 (⋯)」菜单中，原先平铺的导出 HTML / Markdown / PDF 三项折叠为「导出为…」二级子菜单（Markdown / HTML / PDF / Word 四项），并新增 **导出 Word**：本地纯 Rust 转换（knit-md-docx：pulldown-cmark 解析 + docx-rs 生成），支持标题/粗斜体/链接/图片/列表/任务列表/代码块/引用/GFM 表格/脚注；富文本笔记走与 PDF 相同的 HTML→Markdown 桥。标题中的尖括号会被转义后再拼接，避免被 markdown 解析器当作内联 HTML 吞掉（`T & <title>` 之类标题此前导出只剩 `T &`）。

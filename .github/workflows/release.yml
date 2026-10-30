@@ -83,6 +83,14 @@ jobs:
           # macOS runners: free disk before hdiutil (package-macos.sh drops
           # target/ once the binaries are in the .app).
           LEANOTE_CI_CLEAN: "1"
+          # Signing (ADR-0012) — unset secrets fall back to ad-hoc/unsigned.
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: |
           cd rust
           rustup target add ${{ matrix.target }}

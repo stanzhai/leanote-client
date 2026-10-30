@@ -17,6 +17,8 @@ OUT=${2:-"$ROOT/dist"}
 VERSION=${3:-$(grep -A1 '^version' "$ROOT/rust/Cargo.toml" | grep -m1 '"' | sed 's/.*"\(.*\)".*/\1/')}
 TARGET="$ARCH-apple-darwin"
 APP_NAME=Leanote
+# Notarization requires numeric CFBundleVersion; tag prefix "v" is stripped.
+PLIST_VERSION=${VERSION#v}
 BUNDLE_ID=site.stanzhai.leanote.client
 APP="$OUT/$APP_NAME.app"
 DMG="$OUT/Leanote_${VERSION}_macos_${ARCH}.dmg"
@@ -50,8 +52,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleName</key><string>$APP_NAME</string>
     <key>CFBundleDisplayName</key><string>$APP_NAME</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>$VERSION</string>
-    <key>CFBundleVersion</key><string>$VERSION</string>
+    <key>CFBundleShortVersionString</key><string>$PLIST_VERSION</string>
+    <key>CFBundleVersion</key><string>$PLIST_VERSION</string>
     <key>CFBundleIconFile</key><string>app.icns</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>NSHighResolutionCapable</key><true/>
@@ -60,8 +62,49 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-# Gatekeeper-friendly quarantine-free local build: ad-hoc codesign.
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "    (codesign skipped)"
+# Signing (ADR-0012). Local builds: ad-hoc (launches fine without the
+# quarantine flag). CI with Developer ID + notary creds: full
+# sign → notarize → staple so downloaded builds pass Gatekeeper with the
+# benign "downloaded from the internet" prompt instead of "damaged".
+IDENTITY=""
+KC=""
+if [ -n "${MACOS_CERT_P12_BASE64:-}" ]; then
+  if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ]; then
+    echo "error: MACOS_CERT_P12_BASE64 set but APPLE_ID/APPLE_APP_SPECIFIC_PASSWORD/APPLE_TEAM_ID missing" >&2
+    exit 1
+  fi
+  KC_PASS=$(openssl rand -hex 16)
+  KC=leanote-build.keychain-db
+  CERT=$(mktemp)
+  printf '%s' "$MACOS_CERT_P12_BASE64" | base64 --decode >"$CERT"
+  # Idempotent: a previous failed run may have left the keychain behind.
+  security delete-keychain "$KC" >/dev/null 2>&1 || true
+  security create-keychain -p "$KC_PASS" "$KC"
+  security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed 's/^ *"//;s/" *$//' | tr '\n' ' ')
+  security import "$CERT" -k "$KC" -P "${MACOS_CERT_PASSWORD:-}" -T /usr/bin/codesign
+  security set-key-partition-list -S apple-tool:,apple: -k "$KC_PASS" "$KC"
+  rm -f "$CERT"
+  IDENTITY=$(security find-identity -v -p codesigning "$KC" | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -1)
+  if [ -z "$IDENTITY" ]; then
+    echo "error: no Developer ID Application identity in keychain" >&2
+    exit 1
+  fi
+  echo "==> codesign (Developer ID, hardened runtime): $IDENTITY"
+  for BIN in "$APP/Contents/MacOS/"*; do
+    codesign --force --timestamp --options runtime --sign "$IDENTITY" "$BIN"
+  done
+  codesign --force --timestamp --options runtime --sign "$IDENTITY" "$APP"
+  codesign --verify --deep --strict "$APP"
+  xcrun notarytool store-credentials leanote-notary \
+    --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID"
+  NOTARY_ZIP="$OUT/.notary.zip"
+  ditto -c -k --keepParent "$APP" "$NOTARY_ZIP"
+  xcrun notarytool submit "$NOTARY_ZIP" --keychain-profile leanote-notary --wait
+  rm -f "$NOTARY_ZIP"
+  xcrun stapler staple "$APP"
+else
+  codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "    (codesign skipped)"
+fi
 
 echo "==> $DMG"
 rm -f "$DMG"
@@ -125,6 +168,16 @@ end tell
 OSA
     hdiutil detach /tmp/leanote-dmg >/dev/null 2>&1 || true
   fi
+fi
+
+# Sign + notarize the finished DMG (ADR-0012). The stapled .app inside
+# covers launch-after-copy; the DMG needs its own ticket for first mount.
+if [ -n "${IDENTITY:-}" ]; then
+  echo "==> sign + notarize $DMG"
+  codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+  xcrun notarytool submit "$DMG" --keychain-profile leanote-notary --wait
+  xcrun stapler staple "$DMG"
+  security delete-keychain "$KC" >/dev/null 2>&1 || true
 fi
 
 # Local convenience only (not part of CI output): point the shim at the
