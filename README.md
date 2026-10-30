@@ -38,6 +38,31 @@ powershell rust/scripts/package-windows.ps1 -Arch x64   # 需 makensis (NSIS)
 
 验收脚本：`sh rust/scripts/acceptance-macos.sh`（CLI/HTTP/MCP/日志/打包产物，15 项）。
 
+### 发布签名（消除 Gatekeeper「已损坏」/ SmartScreen 拦截）
+
+不配置时 mac 为 ad-hoc 签名、win 未签名，产物从 Releases 下载后分别被 Gatekeeper（「已损坏，应移到废纸篓」）和 SmartScreen（「Windows 已保护你的电脑」）拦截。在 repo Settings → Secrets and variables → Actions 配好下列 secrets 后，下一个 `v*` tag 自动走正式签名 + 公证（详见 `docs/adr/0012`）；未配置则照旧发无签名版。
+
+**macOS（需 Apple Developer Program，$99/年）：**
+
+1. 在 developer.apple.com 后台创建 `Developer ID Application` 证书并安装到钥匙串；
+2. 钥匙串访问中把证书 + 私钥导出为 `.p12`（设密码），`base64 -i cert.p12 | pbcopy`；
+3. 在 appleid.apple.com 创建 App 专用密码（公证用）；
+4. 配 5 个 Secrets：
+
+| Secret | 值 |
+|---|---|
+| `MACOS_CERT_P12_BASE64` | p12 的 base64 |
+| `MACOS_CERT_PASSWORD` | p12 导出密码 |
+| `APPLE_ID` | Apple ID 邮箱 |
+| `APPLE_APP_SPECIFIC_PASSWORD` | App 专用密码 |
+| `APPLE_TEAM_ID` | 10 位 Team ID（会员后台 Membership 页） |
+
+**Windows（需代码签名证书）：**
+
+购买 OV/EV 证书并导出含私钥的 `.pfx`，base64 用 PowerShell：`[Convert]::ToBase64String([IO.File]::ReadAllBytes('cert.pfx'))`，配 2 个 Secrets：`WINDOWS_CERT_PFX_BASE64`、`WINDOWS_CERT_PASSWORD`。
+
+签名生效后 mac 首次启动显示「已从互联网下载」属预期（公证版正常提示）；Windows SmartScreen 信誉随下载量积累，EV 证书即时。（Azure Trusted Signing $9.99/月不走 PFX 路径，选用需改 `package-windows.ps1` 的签名调用。）
+
 ### CLI 与 MCP 对拍
 
 ```sh
