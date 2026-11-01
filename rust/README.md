@@ -79,10 +79,60 @@ PDF). The save panel starts in the remembered export directory
 (`~/Downloads` first time) and remembers the chosen dir in `prefs.json`.
 Library-wide backup: `.leanote` JSON, same shape as the JS export plugin.
 
-## Window drag
+## Window drag & caption buttons
 
-The nav header (44px), reader strip (28px), editor strip (10px), and the
-editor title row all drag the window: Windows via OS-native HTCAPTION
-(`window_control_area(Drag)`), Linux via `start_window_move`, macOS via
-AppKit's titlebar drag. The title input keeps its own mouse handling —
-text selection is unaffected.
+Drag regions: the nav header's empty strip, reader strip (28px), and editor
+strip (10px). Windows maps them to OS-native HTCAPTION
+(`window_control_area(Drag)`); Linux and macOS move via `start_window_move`
+listeners instead. A Drag region must never contain interactive children:
+on Windows every pixel of it answers NCHITTEST with HTCAPTION, which is how
+the editor title-row toolbar buttons died before this rule.
+
+The editor title row (including the note-title input) drags the window via
+press-and-move listeners with a 4px threshold: a click still places the
+caret and works the buttons, a drag moves the window. Windows has no
+`start_window_move`, so the handoff is `ReleaseCapture` +
+`WM_NCLBUTTONDOWN(HTCAPTION)` posted asynchronously (`PostMessageW` — a
+synchronous `SendMessageW` nests DefWindowProc's modal move loop inside
+gpui's in-flight mouse dispatch and blows the main thread's stack, exit
+code 0xC0000409; `main.rs win_dpi_resync::start_window_drag`);
+macOS/Linux keep `start_window_move`. Drag-selection inside the title input
+yields to the window drag (explicit product ruling).
+
+Min/max/close (Windows/Linux) are self-drawn in a root-level overlay flush
+to the window's top-right corner — present in every phase, including
+login/syncing where the nav is hidden — and each button `occlude()`s itself
+so the drag strips beneath cannot shadow it in the NCHITTEST stack
+(ADR-0011, amended 2026-10-31). macOS keeps native traffic lights.
+
+Windows/Linux nav header: the app icon + the "Leanote" name sit at the drag
+region's left end; macOS keeps the traffic-light inset with no name (issue
+20 Q7). The icon is a full-bleed LANCZOS downscale of the 1690px logo
+master — opaque black square, white ant glyph, grayscale anti-aliased edges
+(no thresholding; the binary-alpha rounds produced visible jaggies at
+taskbar sizes). `gen-icons.sh` emits both the exe's `packaging/icon.ico`
+and `assets/app-icon.png` from the same frames, byte-identical at 128px,
+so the taskbar icon and the in-app header icon always match.
+
+## Windows main-thread stack
+
+`main()` runs the whole app on a worker thread with a 64 MB stack on Windows
+(`main.rs`). The MSVC default 1 MB main stack sits within ~10% of the debug
+build's editor render depth (title row + tag chips + slash panel are gpui
+element subtrees built recursively); restoring a note at boot overflowed it
+(exit 0xC0000409). Stack pages commit on demand, so the reserve costs nothing
+until used.
+
+## Windows high-DPI viewport resync
+
+On some high-DPI Windows desktops (observed: 175%, DPI context flips
+96 ↔ monitor DPI during window creation), `gpui-pre-windows` records the
+client device size as the LOGICAL size — the layout viewport ends up
+`scale`-times larger than the visible window: the right portion of the UI
+painted outside the swapchain and was unreachable by the mouse (the
+original "toolbar buttons don't respond" report). `main.rs`
+`win_dpi_resync` measures the live client with Win32 after startup and,
+on mismatch, forces a WM_SIZE (±2px SetWindowPos, physical size
+unchanged) so the backend recomputes logical = device / scale; the
+close-time geometry save then switches to device pixels to keep the
+window at the same on-screen size across relaunches (ADR-0011).

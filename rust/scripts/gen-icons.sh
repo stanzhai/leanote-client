@@ -1,54 +1,52 @@
 #!/bin/sh
 # Regenerate the icon set from logo/icon-black-white.png (ADR-0011).
-# Run on macOS. Tools: sips + iconutil (stock) + rsvg-convert + Pillow.
+# Run on macOS. Tools: sips + iconutil (stock) + Pillow.
 # Outputs are committed so CI never needs a graphics toolchain:
-#   rust/packaging/icon.icns        macOS .app (squircle, neutral glyph)
-#   rust/packaging/icon.ico         Windows exe embedding (black bg, white glyph)
-#   rust/packaging/icons/128x128.png …  Linux AppImage/deb hicolor
+#   rust/packaging/icon.icns                 macOS .app (neutral glyph)
+#   rust/packaging/icon.ico                  Windows exe embedding (win tile)
+#   rust/packaging/icons/128x128.png …       Linux AppImage/deb hicolor
+#   rust/crates/leanote-app/assets/app-icon.png  Windows/Linux titlebar (win tile)
 #
-# Source: 1690×1690 8-bit grayscale (black glyph on white). macOS gets the
-# neutral black-on-transparent; Windows gets white-on-black inside a rounded
-# rect (Windows icons render on light taskbars).
+# Source: 1690×1690 grayscale, WHITE glyph on BLACK (glyph bbox ~396..1418).
+# macOS and Windows/Linux now share one look: a full-bleed LANCZOS downscale
+# of the source (opaque black square, white ant glyph, smooth edges — user
+# round 2026-11-01 rejected the earlier thresholded rounded tile as jagged).
+# The Windows exe icon (.ico) and the in-app titlebar icon (app-icon.png) come
+# from the same frames so both always match byte-for-byte at 128px.
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SRC="$ROOT/logo/icon-black-white.png"
 OUT="$ROOT/rust/packaging"
+TITLEBAR="$ROOT/rust/crates/leanote-app/assets"
 WORK=$(mktemp -d /tmp/leanote-icons.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
-mkdir -p "$OUT/icons" "$WORK/mac" "$WORK/win"
+mkdir -p "$OUT/icons" "$TITLEBAR" "$WORK/mac" "$WORK/win"
 
 # --- Derive the two glyph variants with Pillow -----------------------------
 python3 - "$SRC" "$WORK" <<'PY'
 import sys, os
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image
 
 src, work = sys.argv[1], sys.argv[2]
 base = Image.open(src).convert("L")
 
-def glyph(size):
-    g = base.resize((size, size), Image.LANCZOS)
-    return g
-
-# mac: black glyph on transparent, no padding (system applies the shape).
+# mac: neutral glyph, no tile (the system applies the app shape).
 for s in (16, 32, 64, 128, 256, 512, 1024):
-    glyph(s).convert("RGBA").save(os.path.join(work, "mac", f"{s}.png"))
+    base.resize((s, s), Image.LANCZOS).convert("RGBA").save(
+        os.path.join(work, "mac", f"{s}.png"))
 
-# win: white glyph on black rounded rect (22% margin, 22% corner radius).
+# win: full-bleed downscale of the source — opaque black square, white
+# glyph, the composition exactly as drawn in the source (user round
+# 2026-11-01: jaggies complaint). Anti-aliasing comes from LANCZOS over the
+# 1690px master (~140 gray steps at 32px); any thresholding or small-size
+# mask drawing re-introduces hard binary edges and was removed for that
+# reason. Identical math to the mac variant; kept as a separate output so
+# the two families can diverge again if the taskbar look changes.
 for s in (16, 32, 48, 64, 128, 256):
-    margin = int(s * 0.22)
-    radius = int(s * 0.22)
-    canvas = Image.new("RGBA", (s, s), (0, 0, 0, 255))
-    mask = Image.new("L", (s, s), 0)
-    ImageDraw.Draw(mask).rounded_rectangle([0, 0, s - 1, s - 1], radius=radius, fill=255)
-    black = Image.new("RGBA", (s, s), (0, 0, 0, 255))
-    canvas = Image.composite(black, Image.new("RGBA", (s, s), (0, 0, 0, 0)), mask)
-    g = ImageOps.invert(base.resize((s - 2 * margin, s - 2 * margin), Image.LANCZOS))
-    white = Image.new("RGBA", g.size, (255, 255, 255, 255))
-    white.putalpha(g)
-    canvas.alpha_composite(white, (margin, margin))
-    canvas.save(os.path.join(work, "win", f"{s}.png"))
+    base.resize((s, s), Image.LANCZOS).convert("RGBA").save(
+        os.path.join(work, "win", f"{s}.png"))
 PY
 
 # --- Linux hicolor (neutral set) --------------------------------------------
@@ -69,6 +67,11 @@ cp "$OUT/icons/256x256.png" "$ICONSET/icon_256x256.png"
 cp "$OUT/icons/512x512.png" "$ICONSET/icon_256x256@2x.png"
 cp "$OUT/icons/512x512.png" "$ICONSET/icon_512x512.png"
 iconutil -c icns "$ICONSET" -o "$OUT/icon.icns"
+
+# --- titlebar asset (same win tile the exe icon uses) -----------------------
+# The in-app Windows/Linux header icon must stay byte-identical to the exe
+# icon's 128px entry; both come from the same $WORK/win/128.png.
+cp "$WORK/win/128.png" "$TITLEBAR/app-icon.png"
 
 # --- .ico (PNG-embedded multi-size container) -------------------------------
 sizes="16 32 48 64 128 256"

@@ -28,6 +28,184 @@ use gpui_kit::component::Theme;
 use gpui_kit::{px, AppContext as _, TitlebarOptions, WindowOptions};
 use std::path::PathBuf;
 gpui_kit::actions!(leanote, [QuitApp]);
+
+/// Windows high-DPI viewport resync (ADR-0011 amendment, 2026-11-01).
+///
+/// `gpui-pre-windows` can end up with a layout viewport that disagrees with
+/// the on-screen window on high-DPI desktops: during window creation the
+/// OS DPI context can flip (96 ↔ monitor DPI, observed on a 175% remote
+/// desktop), and a WM_SIZE handled while the backend's scale factor was
+/// momentarily 1.0 records the CLIENT DEVICE size as the LOGICAL size. The
+/// window then reports `scale_factor() = 1.75` while its client is only
+/// `requested-logical` DEVICE pixels wide: the scene (logical × scale) is
+/// ~57% larger than the backbuffer, so everything past the visible area
+/// paints out of the window AND is unreachable by mouse hit-testing
+/// (mouse positions are divided by the window scale). First user-visible
+/// symptoms: caption buttons rendered mid-window, and the markdown
+/// title-row toolbar buttons ignored clicks.
+///
+/// Fix at startup: measure the live window (its class/title identify it
+/// uniquely in this single-instance app), and when
+/// `viewport × scale ≠ live client`, force a WM_SIZE by nudging the window
+/// ±2 device px. The backend recomputes the logical viewport with the
+/// CURRENT scale factor, making layout, rendering and hit-testing agree.
+/// `fixup_engaged()` then switches the close-time geometry save to device
+/// pixels, because the creation path on such desktops treats the requested
+/// LOGICAL size as DEVICE pixels — storing the live device size keeps the
+/// window at the same on-screen size across relaunches instead of
+/// shrinking by the scale factor each launch.
+#[cfg(target_os = "windows")]
+pub(crate) mod win_dpi_resync {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use gpui_kit::Pixels;
+    use windows::Win32::Foundation::HWND;
+
+    static ENGAGED: AtomicBool = AtomicBool::new(false);
+
+    /// Whether the startup resync had to correct the viewport.
+    pub fn fixup_engaged() -> bool {
+        ENGAGED.load(Ordering::Relaxed)
+    }
+
+    pub fn run(window: &mut gpui_kit::Window) {
+        ENGAGED.store(resync(window), Ordering::Relaxed);
+    }
+
+    fn resync(window: &mut gpui_kit::Window) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetClientRect, GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+        };
+
+        let scale = window.scale_factor();
+        if (scale - 1.0).abs() < 0.01 {
+            return false;
+        }
+        let Some(hwnd) = our_hwnd() else {
+            return false;
+        };
+        // Live client size in device pixels.
+        let mut client = windows::Win32::Foundation::RECT::default();
+        if !unsafe { GetClientRect(hwnd, &mut client) }.is_ok() {
+            return false;
+        }
+        let (live_w, live_h) = (
+            (client.right - client.left) as f32,
+            (client.bottom - client.top) as f32,
+        );
+        let vp = window.viewport_size();
+        let (expect_w, expect_h) = (vp.width * scale, vp.height * scale);
+        // Consistent when the layout viewport times the window scale
+        // equals the live client size (within a couple of frame pixels).
+        if (expect_w.as_f32() - live_w).abs() <= 2. && (expect_h.as_f32() - live_h).abs() <= 2. {
+            return false;
+        }
+        // Outer rect: SetWindowPos sizes the whole window incl. its frame.
+        let mut outer = windows::Win32::Foundation::RECT::default();
+        if !unsafe { GetWindowRect(hwnd, &mut outer) }.is_ok() {
+            return false;
+        }
+        let (w, h) = (outer.right - outer.left, outer.bottom - outer.top);
+        // Nudge ±2 device px so WM_SIZE fires with the CURRENT scale
+        // factor; the backend then recomputes logical = device / scale.
+        for (cw, ch) in [(w + 2, h + 2), (w, h)] {
+            let _ = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    cw,
+                    ch,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            };
+        }
+        true
+    }
+
+    /// Start an OS window drag from a client-area press. gpui's
+    /// `start_window_move` is a no-op on the Windows backend, where dragging
+    /// only works through HTCAPTION hit-testing — app_shell's title row (a
+    /// client area that must keep its clicks) calls this after a
+    /// press-and-move threshold: the classic `ReleaseCapture` +
+    /// `WM_NCLBUTTONDOWN(HTCAPTION)` handoff moves the press into the OS
+    /// caption drag loop without touching the window's NCHITTEST mapping.
+    ///
+    /// The handoff MUST be asynchronous (`PostMessageW`, never `SendMessageW`):
+    /// this runs from inside a gpui mouse-move listener, deep in gpui's
+    /// event dispatch, where App/dispatcher borrows are held. A synchronous
+    /// send starts DefWindowProc's MODAL move loop right there, pumping
+    /// messages reentrantly into that state — gpui panics (RefCell
+    /// double-borrow) and, with `windows_subsystem = "windows"`, the panic
+    /// aborts via failfast: exit code 0xC0000409 (the reported title-drag
+    /// crash). `PostMessageW` queues the press; the drag loop is entered at
+    /// message-loop level — exactly where a native HTCAPTION press enters
+    /// it, which gpui handles fine (native strip drags work this way).
+    pub fn start_window_drag() {
+        use windows::Win32::Foundation::{LPARAM, POINT, WPARAM};
+        use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetCursorPos, PostMessageW, HTCAPTION, WM_NCLBUTTONDOWN,
+        };
+
+        let _ = std::fs::write(
+            r"C:\Users\stanz\AppData\Local\Temp\leanote-drag-probe.log",
+            "handoff fired\n",
+        );
+        let Some(hwnd) = our_hwnd() else {
+            return;
+        };
+        let mut point = POINT::default();
+        if !unsafe { GetCursorPos(&mut point) }.is_ok() {
+            return;
+        }
+        let _ = unsafe { ReleaseCapture() };
+        let lparam = LPARAM(((point.y as isize) << 16) | ((point.x as isize) & 0xFFFF));
+        // Async on purpose — see the comment above.
+        let _ = unsafe {
+            PostMessageW(
+                Some(hwnd),
+                WM_NCLBUTTONDOWN,
+                WPARAM(HTCAPTION as usize),
+                lparam,
+            )
+        };
+    }
+
+    /// The app's own main window: gpui-pre-windows registers the
+    /// `Zed::Window` class; single-instance means at most one such window
+    /// titled "Leanote" exists in this process.
+    fn our_hwnd() -> Option<HWND> {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+        };
+
+        // FindWindowW returns Result<HWND> in windows 0.62.
+        let hwnd = unsafe { FindWindowW(w!("Zed::Window"), w!("Leanote")).ok()? };
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            return None;
+        }
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        if pid != std::process::id() || !unsafe { IsWindowVisible(hwnd).as_bool() } {
+            return None;
+        }
+        Some(hwnd)
+    }
+
+    /// Convert logical geometry to the device pixels the creation path on
+    /// mismatched-DPI desktops expects (see the module comment).
+    pub fn bounds_to_device(b: gpui_kit::Bounds<Pixels>, scale: f32) -> gpui_kit::Bounds<Pixels> {
+        let s = |v: Pixels| gpui_kit::px(v.as_f32() * scale);
+        gpui_kit::Bounds {
+            origin: gpui_kit::point(s(b.origin.x), s(b.origin.y)),
+            size: gpui_kit::size(s(b.size.width), s(b.size.height)),
+        }
+    }
+}
+
 /// `LEANOTE_DATA` wins (CLI convention); else the core default.
 fn data_dir() -> PathBuf {
     std::env::var_os("LEANOTE_DATA")
@@ -213,7 +391,30 @@ fn boot_fake_server() {
 }
 
 fn main() {
-    // Crashes land in logs/app.log before anything else can go wrong.
+    // Windows main thread: run on a big-stack thread. The MSVC default is a
+    // 1 MB main-thread stack, and the editor render path (title row + tag
+    // chips + slash panel, each a gpui element subtree built recursively)
+    // measures within ~10% of that ceiling on debug builds — the ADR-0011
+    // round added just enough element depth to overflow it at boot with a
+    // restored note (exit 0xC0000409, stack overflow inside
+    // render_editor's tag-chip children). 64 MB gives the debug-build
+    // element trees headroom; release builds are far shallower but pay
+    // nothing for the reserve. The OS commits stack pages on demand, so
+    // this costs no memory until used.
+    if cfg!(target_os = "windows") {
+        let child = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .name("main".into())
+            .spawn(leanote_main)
+            .expect("spawn main thread");
+        // Park the process main thread; gpui's dispatcher owns the UI.
+        let _ = child.join();
+        return;
+    }
+    leanote_main()
+}
+
+fn leanote_main() {
     leanote_core::logging::install_panic_hook();
     let dir = data_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -439,9 +640,19 @@ fn main() {
                         });
                     })
                     .detach();
-                // Persist size/position at close.
+                // Persist size/position at close. Windows DPI fixup: when
+                // the startup resync engaged (see win_dpi_resync), the
+                // creation path treats requested LOGICAL sizes as DEVICE
+                // pixels — store the live geometry in device pixels so the
+                // window reopens at the same on-screen size.
                 window.on_window_should_close(cx, move |window, _cx| {
                     if let gpui_kit::WindowBounds::Windowed(b) = window.window_bounds() {
+                        #[cfg(target_os = "windows")]
+                        let b = if win_dpi_resync::fixup_engaged() {
+                            win_dpi_resync::bounds_to_device(b, window.scale_factor())
+                        } else {
+                            b
+                        };
                         window_state::WindowState::from_bounds(&b).save(&dir_close);
                     }
                     true
@@ -462,6 +673,13 @@ fn main() {
                 })
             })
             .expect("open window");
+            // ADR-0011 amendment: re-sync the Windows layout viewport with
+            // the live window on high-DPI desktops (see win_dpi_resync).
+            #[cfg(target_os = "windows")]
+            handle
+                .update(cx, |_, window, _| win_dpi_resync::run(window))
+                .ok();
+
             single_instance::remember_window(handle);
             single_instance::listen(listener, cx);
 

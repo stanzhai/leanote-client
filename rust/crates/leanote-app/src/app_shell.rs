@@ -32,8 +32,8 @@ use gpui_kit::div;
 use gpui_kit::prelude::*;
 use gpui_kit::HighlightStyle;
 use gpui_kit::{
-    px, rems, AnyElement, KeyDownEvent, MouseButton, SharedString, Task, UniformListScrollHandle,
-    Window, WindowControlArea,
+    px, rems, AnyElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, SharedString,
+    Task, UniformListScrollHandle, Window, WindowControlArea,
 };
 use leanote_core::sync::{Api, NoProgress, SyncProgress, SyncStats};
 use std::sync::{Arc, Mutex};
@@ -57,6 +57,14 @@ const NOTE_ROW_DIVIDER_H: f32 = 1.;
 const RECENT_LIMIT: usize = 20;
 /// macOS transparent titlebar height, same material as the sidebar.
 const TITLEBAR_H: f32 = 44.;
+
+/// Self-drawn caption-button metrics (ADR-0011): three 44×32 buttons
+/// flush to the window's top-right corner on Windows/Linux.
+const WIN_CONTROL_W: f32 = 44.;
+const WIN_CONTROL_H: f32 = 32.;
+/// Total overlay width; the editor title row reserves it so the toolbar
+/// never slides under the caption band.
+const WIN_CONTROLS_W: f32 = WIN_CONTROL_W * 3.;
 
 pub enum Phase {
     Login,
@@ -2895,6 +2903,11 @@ impl Render for AppShell {
             None => root,
         };
         root.child(body)
+            // ADR-0011 amendment: caption controls overlay the top-right in
+            // every phase; painted after `body` so they stack above panes.
+            .when(cfg!(not(target_os = "macos")), |this| {
+                this.child(win_controls())
+            })
     }
 }
 
@@ -2938,10 +2951,18 @@ impl Render for NotebookDragGhost {
 }
 
 /// State for the manual window-drag region (mirrors kit TitleBar's TODO
-/// workaround for GPUI pre-0.2.3).
+/// workaround for GPUI pre-0.2.3). `press` anchors the drag threshold:
+/// the window only moves after the pointer travels DRAG_THRESHOLD from the
+/// press, so a click on an interactive child never jiggles the window
+/// (ADR-0011 amendment).
 struct DragHeaderState {
     should_move: bool,
+    press: Option<gpui_kit::Point<gpui_kit::Pixels>>,
 }
+
+/// Press-and-move threshold before a client-area press turns into a window
+/// drag (logical px, standard 4px UI drag slop).
+const DRAG_THRESHOLD: f32 = 4.;
 
 impl Render for DragHeaderState {
     fn render(&mut self, _: &mut Window, _: &mut gpui_kit::Context<Self>) -> impl IntoElement {
@@ -2950,12 +2971,29 @@ impl Render for DragHeaderState {
 }
 
 fn drag_header(
+    dark: bool,
     window: &mut Window,
     lang: i18n::Lang,
     cx: &mut gpui_kit::Context<AppShell>,
 ) -> impl IntoElement + use<> {
-    let state = window.use_state(cx, |_, _| DragHeaderState { should_move: false });
+    let state = window.use_state(cx, |_, _| DragHeaderState {
+        should_move: false,
+        press: None,
+    });
     let is_macos = cfg!(target_os = "macos");
+    // ADR-0011 amendment (2026-10-31/11-01): caption buttons live in a
+    // root-level top-right overlay (win_controls), so this header keeps the
+    // search entry only on macOS (issue 20 Q7: no app-name label there).
+    // Windows/Linux add the app icon + name at the drag region's left end
+    // (user round 2026-11-01: the search-only header read as empty). The
+    // drag region stays a SIBLING of the search button — never its parent:
+    // on Windows every pixel of a WindowControlArea::Drag hitbox answers
+    // NCHITTEST with HTCAPTION (the platform callback matches any
+    // window-control hitbox in the mouse stack, and a child cannot punch
+    // through its parent's hitbox), so an interactive element inside a drag
+    // region never receives clicks. The icon + name are non-interactive, so
+    // they live INSIDE the drag region: dragging by the app name is the
+    // Windows titlebar convention.
     gpui_kit::div()
         .id("nav-drag-header")
         .flex()
@@ -2963,74 +3001,140 @@ fn drag_header(
         .items_center()
         .h(theme::ui(TITLEBAR_H))
         .w_full()
-        .pl(px(if is_macos { 80. } else { 0. }))
-        .when(is_macos, |this| {
-            this.on_double_click(|_, window, _| window.titlebar_double_click())
-        })
-        .on_mouse_down_out(window.listener_for(&state, |s, _, _, _| s.should_move = false))
-        .on_mouse_down(
-            MouseButton::Left,
-            window.listener_for(&state, |s, _, _, _| s.should_move = true),
-        )
-        .on_mouse_up(
-            MouseButton::Left,
-            window.listener_for(&state, |s, _, _, _| s.should_move = false),
-        )
-        .on_mouse_move(window.listener_for(&state, |s, _, window, _| {
-            if s.should_move {
-                s.should_move = false;
-                window.start_window_move();
-            }
-        }))
-        .window_control_area(WindowControlArea::Drag)
-        // Issue 20: no app-name label — the strip stays a 44px drag region
-        // with the search button (user ruling Q7).
-        // Issue 19: search entry point in the header (opens the ⌘K overlay).
+        .when(is_macos, |this| this.pl(px(80.)))
         .child(
             gpui_kit::base::h_flex()
+                .id("nav-drag-region")
                 .flex_1()
-                .justify_end()
-                .pr_2()
-                .child(
-                    Button::new("header-search")
-                        .icon(AssetIcon::Search)
-                        .ghost()
-                        .small()
-                        .tooltip(i18n::t(lang, i18n::Key::TooltipSearch))
-                        .on_click(
-                            cx.listener(|this, _ev, window, cx| this.toggle_search(window, cx)),
-                        ),
-                ),
+                .min_w_0()
+                .h_full()
+                .debug_selector(|| "nav-drag-region".into())
+                .when(!is_macos, |this| {
+                    this.child(
+                        gpui_kit::base::h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .pl_1()
+                            .debug_selector(|| "nav-app-name".into())
+                            .child(gpui_kit::img(app_icon()).flex_none().size(theme::ui(16.)))
+                            .child(
+                                Label::new("Leanote")
+                                    .text_size(theme::ui(13.))
+                                    .text_color(theme::muted_foreground(dark)),
+                            ),
+                    )
+                })
+                .when(is_macos, |this| {
+                    this.on_double_click(|_, window, _| window.titlebar_double_click())
+                })
+                .on_mouse_down_out(window.listener_for(&state, |s, _, _, _| {
+                    s.should_move = false;
+                    s.press = None;
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    window.listener_for(&state, |s, ev: &MouseDownEvent, _, _| {
+                        s.should_move = true;
+                        s.press = Some(ev.position);
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    window.listener_for(&state, |s, _, _, _| {
+                        s.should_move = false;
+                        s.press = None;
+                    }),
+                )
+                .on_mouse_move(
+                    window.listener_for(&state, |s, ev: &MouseMoveEvent, window, _| {
+                        if s.should_move && drag_threshold_reached(s.press, ev.position) {
+                            s.should_move = false;
+                            s.press = None;
+                            begin_window_drag(window);
+                        }
+                    }),
+                )
+                .window_control_area(WindowControlArea::Drag),
         )
-        // ADR-0011: Windows/Linux 自绘窗口控制按钮（macOS 交通灯由系统
-        // 绘制）。每块区域带 WindowControlArea hitbox，平台层据此做
-        // NCHITTEST/原生点击；按钮 UI 只是视觉提示，点击不打事件。
-        .when(!is_macos, |this| {
-            this.child(
-                gpui_kit::base::h_flex()
-                    .flex_none()
-                    .items_center()
-                    .child(win_control_btn(
-                        "win-min",
-                        AssetIcon::Minus,
-                        WindowControlArea::Min,
-                    ))
-                    .child(win_control_btn(
-                        "win-max",
-                        AssetIcon::Square,
-                        WindowControlArea::Max,
-                    ))
-                    .child(win_control_btn(
-                        "win-close",
-                        AssetIcon::X,
-                        WindowControlArea::Close,
-                    )),
-            )
-        })
+        // Issue 19: search entry point in the header (opens the ⌘K
+        // overlay). Outside the drag region so Windows clicks reach it.
+        .child(
+            gpui_kit::base::h_flex().flex_none().pr_2().child(
+                Button::new("header-search")
+                    .icon(AssetIcon::Search)
+                    .ghost()
+                    .small()
+                    .tooltip(i18n::t(lang, i18n::Key::TooltipSearch))
+                    .on_click(cx.listener(|this, _ev, window, cx| this.toggle_search(window, cx))),
+            ),
+        )
 }
 
-/// ADR-0011: 一个自绘窗口控制按钮（Windows/Linux）。hitbox 交给平台
-/// 层处理，元素本身只提供 44×32 视觉区 + hover 反馈。
+/// The rounded app-icon tile (128×128 PNG downscaled from
+/// logo/icon-black-white.png at build-time asset generation; same source as
+/// the Windows packaging icon). White glyph on dark tile reads on both
+/// light and dark themes. Decoded once via the gpui image cache.
+fn app_icon() -> gpui_kit::ImageSource {
+    static ICON: std::sync::LazyLock<std::sync::Arc<gpui_kit::Image>> =
+        std::sync::LazyLock::new(|| {
+            std::sync::Arc::new(gpui_kit::Image::from_bytes(
+                gpui_kit::ImageFormat::Png,
+                include_bytes!("../assets/app-icon.png").to_vec(),
+            ))
+        });
+    gpui_kit::ImageSource::Image(ICON.clone())
+}
+
+/// Press + `DRAG_THRESHOLD` of travel = a window drag, not a click.
+fn drag_threshold_reached(
+    press: Option<gpui_kit::Point<gpui_kit::Pixels>>,
+    current: gpui_kit::Point<gpui_kit::Pixels>,
+) -> bool {
+    let Some(press) = press else {
+        return false;
+    };
+    let d = current - press;
+    let (dx, dy) = (d.x.as_f32(), d.y.as_f32());
+    dx * dx + dy * dy >= DRAG_THRESHOLD * DRAG_THRESHOLD
+}
+
+/// Test hook: counts begin_window_drag invocations (wiring proof for the
+/// title-row press-drag listeners; the drag itself is an OS handoff).
+#[cfg(test)]
+static BEGIN_DRAG_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn begin_drag_calls() -> usize {
+    BEGIN_DRAG_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Move the window from a client-area press. Windows has no
+/// `start_window_move` in its gpui backend (dragging works via HTCAPTION
+/// hit-testing, which client-area rows cannot use without eating their own
+/// clicks), so hand the press to the OS caption drag loop instead
+/// (main.rs win_dpi_resync::start_window_drag); macOS/Linux keep gpui's
+/// start_window_move.
+fn begin_window_drag(window: &mut Window) {
+    #[cfg(test)]
+    BEGIN_DRAG_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(target_os = "windows")]
+    {
+        crate::win_dpi_resync::start_window_drag();
+        let _ = window;
+    }
+    #[cfg(not(target_os = "windows"))]
+    window.start_window_move();
+}
+
+/// ADR-0011: 一个自绘窗口控制按钮（Windows/Linux）。hitbox 交给平台层
+/// 处理，元素本身只提供 44×32 视觉区 + hover 反馈；关闭钮 hover 红底
+/// 白 icon（Windows 惯例，ADR-0011 原裁决）。
+///
+/// `occlude()` 是 Windows 上按钮可用的前提：平台 hit-test 回调按鼠标
+/// 命中栈应答 NCHITTEST，occlude 的 BlockMouse hitbox 把下方 drag strip
+/// 的 Drag hitbox 截断——没有它，压在 drag strip 上方的按钮永远被判成
+/// HTCAPTION（点击只会拖动窗口）。
 fn win_control_btn(
     id: &'static str,
     icon: AssetIcon,
@@ -3042,11 +3146,50 @@ fn win_control_btn(
         .flex_none()
         .items_center()
         .justify_center()
-        .w(theme::ui(44.))
-        .h(theme::ui(32.))
-        .hover(|s| s.bg(gpui_kit::rgba(0x00000014)))
+        .w(theme::ui(WIN_CONTROL_W))
+        .h(theme::ui(WIN_CONTROL_H))
+        .when(area == WindowControlArea::Close, |this| {
+            this.hover(|s| {
+                s.bg(gpui_kit::rgba(0xC42B1CFF))
+                    .text_color(gpui_kit::rgba(0xFFFFFFFF))
+            })
+        })
+        .when(area != WindowControlArea::Close, |this| {
+            this.hover(|s| s.bg(gpui_kit::rgba(0x00000014)))
+        })
         .child(Icon::new(icon))
+        .occlude()
         .window_control_area(area)
+}
+
+/// ADR-0011 amendment (2026-10-31): the three caption buttons live in a
+/// root-level overlay flush to the window's top-right corner — where
+/// Windows/Linux users expect them — painted after (above) every pane so
+/// they exist in ALL phases: the old spot inside the nav header vanished
+/// with the hidden nav during login/syncing. macOS keeps native traffic
+/// lights and renders no overlay.
+fn win_controls() -> impl IntoElement {
+    gpui_kit::base::h_flex()
+        .absolute()
+        .top_0()
+        .right_0()
+        .items_center()
+        .debug_selector(|| "win-controls".into())
+        .child(win_control_btn(
+            "win-min",
+            AssetIcon::Minus,
+            WindowControlArea::Min,
+        ))
+        .child(win_control_btn(
+            "win-max",
+            AssetIcon::Square,
+            WindowControlArea::Max,
+        ))
+        .child(win_control_btn(
+            "win-close",
+            AssetIcon::X,
+            WindowControlArea::Close,
+        ))
 }
 
 /// Issue 17/21: transparent drag strip at the top of the right pane — drag
@@ -3057,7 +3200,10 @@ fn reader_drag_strip(
     window: &mut Window,
     cx: &mut gpui_kit::Context<AppShell>,
 ) -> impl IntoElement + use<> {
-    let state = window.use_state(cx, |_, _| DragHeaderState { should_move: false });
+    let state = window.use_state(cx, |_, _| DragHeaderState {
+        should_move: false,
+        press: None,
+    });
     let is_macos = cfg!(target_os = "macos");
     gpui_kit::div()
         .id("reader-drag-strip")
@@ -3475,7 +3621,7 @@ impl AppShell {
             .debug_selector(|| "nav-pane".into())
             .px_3()
             .gap_1()
-            .child(drag_header(window, lang, cx))
+            .child(drag_header(dark, window, lang, cx))
             // Issue 17 Q7: identity moved to the bottom trio (see the nav
             // footer below) — no duplicate under the header.
             .child(all_row)
@@ -5478,29 +5624,56 @@ impl AppShell {
         } else {
             (i18n::Key::EditorPreview, AssetIcon::Eye)
         };
-        let drag_state = window.use_state(cx, |_, _| DragHeaderState { should_move: false });
+        let drag_state = window.use_state(cx, |_, _| DragHeaderState {
+            should_move: false,
+            press: None,
+        });
         let title_row = gpui_kit::base::h_flex()
             .gap_2()
-            // Window drag: the row's empty padding (not the title input
-            // itself — it must keep text selection) moves the window on
-            // Windows (HTCAPTION via window_control_area) and Linux
-            // (start_window_move); macOS keeps AppKit's titlebar drag.
-            .window_control_area(WindowControlArea::Drag)
-            .on_mouse_down_out(window.listener_for(&drag_state, |s, _, _, _| s.should_move = false))
+            .debug_selector(|| "editor-title-row".into())
+            // NOT a WindowControlArea::Drag region. On Windows the whole
+            // area of a Drag hitbox answers NCHITTEST with HTCAPTION and
+            // clicks stop reaching the app — the title input and the
+            // toolbar buttons on this row were dead. The listeners below
+            // implement drag for the whole row instead — including the
+            // note-title input (user round 2026-11-01): a press that
+            // travels DRAG_THRESHOLD moves the window (Windows via the
+            // WM_NCLBUTTONDOWN handoff, macOS/Linux via start_window_move),
+            // while a plain click still places the caret and works the
+            // buttons. Press-and-drag text selection inside the input
+            // yields to the window drag.
+            .when(cfg!(not(target_os = "macos")), |el| {
+                // Keep the toolbar clear of the caption-button overlay,
+                // which paints above this row's right end.
+                el.pr(theme::ui(WIN_CONTROLS_W))
+            })
+            .on_mouse_down_out(window.listener_for(&drag_state, |s, _, _, _| {
+                s.should_move = false;
+                s.press = None;
+            }))
             .on_mouse_down(
                 MouseButton::Left,
-                window.listener_for(&drag_state, |s, _, _, _| s.should_move = true),
+                window.listener_for(&drag_state, |s, ev: &MouseDownEvent, _, _| {
+                    s.should_move = true;
+                    s.press = Some(ev.position);
+                }),
             )
             .on_mouse_up(
                 MouseButton::Left,
-                window.listener_for(&drag_state, |s, _, _, _| s.should_move = false),
-            )
-            .on_mouse_move(window.listener_for(&drag_state, |s, _, window, _| {
-                if s.should_move {
+                window.listener_for(&drag_state, |s, _, _, _| {
                     s.should_move = false;
-                    window.start_window_move();
-                }
-            }))
+                    s.press = None;
+                }),
+            )
+            .on_mouse_move(
+                window.listener_for(&drag_state, |s, ev: &MouseMoveEvent, window, _| {
+                    if s.should_move && drag_threshold_reached(s.press, ev.position) {
+                        s.should_move = false;
+                        s.press = None;
+                        begin_window_drag(window);
+                    }
+                }),
+            )
             .child(
                 // Issue 21 / UI round 10: title = 1.25rem — scales with the
                 // interface zoom. 32px row at 100% (28px text + descender
@@ -5558,6 +5731,9 @@ impl AppShell {
                     .icon(AssetIcon::Ellipsis)
                     .ghost()
                     .small()
+                    // Test probe: the rightmost toolbar control must stay
+                    // clear of the caption-button overlay (win_controls).
+                    .debug_selector(|| "note-more-btn".into())
                     .tooltip(t(i18n::Key::MoreActions))
                     .dropdown_menu_with_anchor(
                         gpui_kit::Anchor::BottomRight,
@@ -6961,8 +7137,325 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ADR-0011 amendment: the caption buttons (Windows/Linux) sit flush to
+    /// the window's top-right corner in EVERY phase — the old nav-header
+    /// spot was (a) mid-window, (b) shadowed by the header's own Drag
+    /// hitbox on Windows, and (c) gone entirely during login/syncing when
+    /// the nav is hidden. Also proves the editor title row reserves the
+    /// caption band: the toolbar must stay clear of it, or the overlay
+    /// (occluded hitboxes painted last) swallows toolbar clicks.
+    #[gpui_kit::test]
+    fn win_controls_overlay_top_right_in_all_phases(cx: &mut gpui_kit::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("leanote-winctrl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = leanote_core::Store::open(dir.clone(), "user1".to_string()).unwrap();
+        let note = store
+            .add_note(leanote_core::NewNote {
+                title: "t".into(),
+                content: "# hi".into(),
+                tags: vec![],
+                notebook_title: "nb".into(),
+                is_markdown: true,
+            })
+            .unwrap();
+
+        cx.update(gpui_kit::init);
+
+        // --- Login phase: controls must render even with the nav hidden.
+        let login_window = cx
+            .update(|cx| {
+                cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+                    cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            false,
+                            None,
+                            None,
+                            None,
+                        )
+                    })
+                })
+            })
+            .unwrap();
+        let mut login_cx = gpui_kit::VisualTestContext::from_window(login_window.into(), cx);
+        login_cx.update(|window, cx| window.draw(cx).clear(cx));
+        let overlay = login_cx.debug_bounds("win-controls");
+        if cfg!(target_os = "macos") {
+            assert!(
+                overlay.is_none(),
+                "macOS renders no self-drawn caption overlay"
+            );
+        } else {
+            let overlay = overlay.expect("caption overlay renders during login");
+            let window_w = login_cx.update(|window, _| window.bounds().size.width);
+            assert_eq!(
+                overlay.origin.y,
+                gpui_kit::px(0.),
+                "caption band touches the window top edge"
+            );
+            assert_eq!(
+                overlay.origin.x + overlay.size.width,
+                window_w,
+                "caption band is flush to the window's right edge, got {overlay:?} in {window_w:?}"
+            );
+        }
+
+        // --- Shell phase, editor open: same top-right corner, and the
+        // title-row toolbar must end left of the caption band.
+        let shell_window = cx
+            .update(|cx| {
+                cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+                    cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true,
+                            Some("user1".into()),
+                            None,
+                            None,
+                        )
+                    })
+                })
+            })
+            .unwrap();
+        let note_id = note.note_id.clone();
+        shell_window
+            .update(cx, |shell, window, cx| {
+                shell.select_note(note_id, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.background_executor.allow_parking();
+        let mut shell_cx = gpui_kit::VisualTestContext::from_window(shell_window.into(), cx);
+        shell_cx.update(|window, cx| window.draw(cx).clear(cx));
+        if !cfg!(target_os = "macos") {
+            let overlay = shell_cx
+                .debug_bounds("win-controls")
+                .expect("caption overlay renders in the editor shell");
+            let toolbar = shell_cx
+                .debug_bounds("note-more-btn")
+                .expect("editor title-row toolbar rendered");
+            let window_w = shell_cx.update(|window, _| window.bounds().size.width);
+            // Windows/Linux identity row: app icon + name at the nav
+            // header's left end (user round 2026-11-01).
+            let name_row = shell_cx
+                .debug_bounds("nav-app-name")
+                .expect("nav header renders icon + name");
+            let nav = shell_cx
+                .debug_bounds("nav-pane")
+                .expect("nav pane rendered");
+            assert!(
+                name_row.origin.x < nav.origin.x + nav.size.width / 2.,
+                "icon + name sit at the header's left end: name_row={name_row:?} nav={nav:?}"
+            );
+            assert!(
+                name_row.size.height <= px(TITLEBAR_H),
+                "icon + name fit the {TITLEBAR_H:?} header: {name_row:?}"
+            );
+            assert!(
+                toolbar.origin.x + toolbar.size.width <= overlay.origin.x,
+                "rightmost toolbar button must stay clear of the caption band: toolbar={toolbar:?} overlay={overlay:?}"
+            );
+            assert_eq!(
+                overlay.origin.x + overlay.size.width,
+                window_w,
+                "caption band stays flush right in the editor shell"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// User round 2026-11-01: pressing the note-title input and moving past
+    /// DRAG_THRESHOLD hands the press to the OS window drag; a sub-threshold
+    /// wiggle stays a plain click (caret placement) and never drags. Runs
+    /// through the kit's native pointer dispatch, so it also proves the
+    /// input does not swallow the row's press listeners.
+    #[gpui_kit::test]
+    fn title_input_press_drag_triggers_window_drag(cx: &mut gpui_kit::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("leanote-titledrag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = leanote_core::Store::open(dir.clone(), "user1".to_string()).unwrap();
+        let note = store
+            .add_note(leanote_core::NewNote {
+                title: "t".into(),
+                content: "# hi".into(),
+                tags: vec![],
+                notebook_title: "nb".into(),
+                is_markdown: true,
+            })
+            .unwrap();
+
+        cx.update(gpui_kit::init);
+        let window = cx
+            .update(|cx| {
+                cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+                    cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true,
+                            Some("user1".into()),
+                            None,
+                            None,
+                        )
+                    })
+                })
+            })
+            .unwrap();
+        let note_id = note.note_id.clone();
+        window
+            .update(cx, |shell, window, cx| {
+                shell.select_note(note_id, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.background_executor.allow_parking();
+        let mut vcx = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+        let row = vcx
+            .debug_bounds("editor-title-row")
+            .expect("editor title row rendered");
+        // Press inside the title input (the row's dominant child).
+        let press = gpui_kit::point(
+            row.origin.x + row.size.width * 0.3,
+            row.origin.y + row.size.height / 2.,
+        );
+
+        // Press + move through the platform input pipeline. This also
+        // proves the input does not swallow the row's press listeners.
+        fn press_drag_to(
+            vcx: &mut gpui_kit::VisualTestContext,
+            from: gpui_kit::Point<gpui_kit::Pixels>,
+            to: gpui_kit::Point<gpui_kit::Pixels>,
+        ) {
+            vcx.simulate_event(gpui_kit::MouseDownEvent {
+                button: gpui_kit::MouseButton::Left,
+                position: from,
+                ..Default::default()
+            });
+            for step in 1..=8 {
+                let f = step as f32 / 8.;
+                vcx.simulate_event(gpui_kit::MouseMoveEvent {
+                    position: gpui_kit::point(
+                        from.x + (to.x - from.x) * f,
+                        from.y + (to.y - from.y) * f,
+                    ),
+                    pressed_button: Some(gpui_kit::MouseButton::Left),
+                    ..Default::default()
+                });
+            }
+            vcx.simulate_event(gpui_kit::MouseUpEvent {
+                button: gpui_kit::MouseButton::Left,
+                position: to,
+                ..Default::default()
+            });
+        }
+
+        // Sub-threshold wiggle: still a click, never a window drag.
+        let before = begin_drag_calls();
+        press_drag_to(&mut vcx, press, gpui_kit::point(press.x + px(2.), press.y));
+        assert_eq!(
+            begin_drag_calls(),
+            before,
+            "a 2px wiggle on the title input must stay a click, not a window drag"
+        );
+
+        // Real drag: the row hands the press to the OS window drag exactly
+        // once (should_move resets on handoff).
+        let before = begin_drag_calls();
+        press_drag_to(
+            &mut vcx,
+            press,
+            gpui_kit::point(press.x + px(40.), press.y + px(6.)),
+        );
+        assert_eq!(
+            begin_drag_calls(),
+            before + 1,
+            "press + move on the title input must hand off to the window drag exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Ticket 11 follow-up: New Notebook opens a modal dialog; Enter
     /// confirms; the new notebook lands FIRST in its sibling group.
+    /// Regression (2026-11-01): booting with a restored last-note opens the
+    /// editor straight away. On the 1 MB Windows main stack that render
+    /// path overflowed (0xC0000409) once the ADR-0011 round deepened the
+    /// title row; main() now runs the app on a 64 MB stack, and this test
+    /// pins the restore semantics headless.
+    #[gpui_kit::test]
+    fn startup_restores_notebook_selection_and_last_note(cx: &mut gpui_kit::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("leanote-boot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = leanote_core::Store::open(dir.clone(), "user1".to_string()).unwrap();
+        store.create_notebook("nb", "").unwrap();
+        let nb2 = store.create_notebook("Work", "").unwrap();
+        let n3 = store
+            .add_note(leanote_core::NewNote {
+                title: "GPUI notes".into(),
+                content: "# GPUI notes
+Element tree, entities, contexts."
+                    .into(),
+                tags: vec!["rust".into(), "gpui".into()],
+                notebook_title: "Work".into(),
+                is_markdown: true,
+            })
+            .unwrap();
+        {
+            let mut p = crate::prefs::Prefs::load(&dir);
+            p.nav.selection = Some(("notebook".into(), nb2.notebook_id.to_string()));
+            p.nav.last_note = Some(n3.note_id.to_string());
+            p.save(&dir);
+        }
+        cx.update(gpui_kit::init);
+        let mut shell_entity: Option<gpui_kit::Entity<AppShell>> = None;
+        let window = cx
+            .update(|cx| {
+                cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+                    let shell = cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true,
+                            Some("user1".into()),
+                            None,
+                            None,
+                        )
+                    });
+                    shell_entity = Some(shell.clone());
+                    shell
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.background_executor.allow_parking();
+        let mut vcx = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+        vcx.update(|_, cx| {
+            let shell = shell_entity.as_ref().unwrap().read(cx);
+            assert_eq!(
+                shell.nav,
+                NavSelection::Notebook(nb2.notebook_id.to_string()),
+                "nav selection restored"
+            );
+            assert_eq!(shell.selected, Some(n3.note_id.clone()), "note restored");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[gpui_kit::test]
     fn notebook_dialog_creates_prepended(cx: &mut gpui_kit::TestAppContext) {
         let dir = std::env::temp_dir().join(format!("leanote-nbdialog-{}", std::process::id()));

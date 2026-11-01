@@ -4466,6 +4466,7 @@ dependencies = [
  "typst-pdf",
  "ureq 3.4.2",
  "usvg 0.46.0",
+ "windows 0.62.2",
  "winresource",
 ]
 

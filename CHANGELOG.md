@@ -1,6 +1,19 @@
 # 更新日志 / Changelog
 
 
+## 3.1.6（2026-11-01）
+
+- **修复：Windows 窗口控制按钮位置不对、点击失效（ADR-0011 修订）**：三层根因。① 自绘最小化/最大化/关闭按钮从左栏顶行右端（窗口左上角约 240px 处，违反 Windows 惯例）移到**根级 overlay，贴窗口最右上角**，登录/同步期（侧栏隐藏）也存在；每钮 `occlude()` 截断下方 Drag hitbox，点击恢复原生 `HTMINBUTTON`/`HTMAXBUTTON`/`HTCLOSE` 应答（旧布局按钮嵌在 Drag 区里被抢答成 HTCAPTION，点击只会拖窗口）。② 编辑器标题行整体曾是 Drag 区 → 标题输入与右侧工具钮（预览/帮助/更多）全部不可点；标题行改为纯 client 区，右端为 caption band 预留。③ **Windows 高 DPI 视口错位**（175% 实测）：创建窗口时 OS 的 DPI 上下文翻转（96↔168）使后端把物理像素尺寸记成逻辑尺寸——布局视口 1.75 倍于可见窗口，右 ~43% 界面画在窗外且鼠标永远点不到（工具钮「点击失效」的真实根因）。`main.rs win_dpi_resync` 启动时 Win32 实测 client 尺寸，`视口×scale ≠ 实际 client` 时以 ±2px `SetWindowPos` 强制 WM_SIZE 按当前 scale 重算（物理尺寸不变）；修复介入时退出几何按设备像素保存，跨启动窗口尺寸稳定。
+
+- **修复：拖动 markdown 标题栏直接崩溃退出（0xC0000409）**：标题行拖窗口的按压交接必须用**异步 `PostMessageW`**。首版同步 `SendMessageW(WM_NCLBUTTONDOWN)` 把 DefWindowProc 的模态移动循环嵌进 gpui 正在分发鼠标事件的 wndproc——消息泵持借重入（WER dump 实锤 `window_procedure → handle_nc_mouse_down_msg → draw_window → window_procedure` 循环）→ 主线程栈溢出 → `__fastfail`。`PostMessageW` 把按压排队，移动循环改在消息循环层进入（与原生 HTCAPTION 按压同层）。同轮修复偶发启动栈溢出：`main()` 在 Windows 上把应用搬到 64MB 栈工作线程运行（MSVC 默认 1MB 主栈被编辑器渲染深度击穿，抓栈定位在 `render_editor` 标签条，无循环、纯预算耗尽；栈页按需提交零常驻开销）。
+
+- **编辑器标题输入框支持拖动窗口**：按下后位移超过 4px 阈值即把按压交给系统拖拽（Windows 走上述异步交接，macOS/Linux 保持 `start_window_move`）；纯点击仍定位光标、按钮照常。侧栏顶行拖拽区同样加阈值，顺带消除「点按钮手抖 1px 拖走窗口」。
+
+- **左栏顶行补应用身份（Windows/Linux）**：拖拽区最左端新增应用图标 + 「Leanote」名称（非交互，可随 Drag 区拖动，Windows 标题栏惯例）；macOS 维持红绿灯让位原状。
+
+- **应用图标统一 + 去锯齿**：Windows exe 图标（`packaging/icon.ico`）与标题栏内嵌图标（`assets/app-icon.png`）改由 `gen-icons.sh` **同帧产出，128px 条目逐字节一致**；形态为不透明纯黑方块 + 白蚁形字标（用户裁决），边缘 LANCZOS 全灰阶抗锯齿（16px=68 级、32px=138 级灰度；此前阈值化 alpha 只有 0/255 二值边缘，小尺寸锯齿明显）。
+
+- 回归测试 +3：`win_controls_overlay_top_right_in_all_phases`（登录期/编辑期断言 overlay 贴右上角、工具钮避让 caption band、身份行在位，macOS 反断言）、`title_input_press_drag_triggers_window_drag`（2px 摆动不拖、40px 恰好交接一次、输入组件不吞监听）、`startup_restores_notebook_selection_and_last_note`（恢复语义）。leanote-app 102/102，ADR-0011 修订留痕。
 
 ## 3.1.5（2026-10-30）
 

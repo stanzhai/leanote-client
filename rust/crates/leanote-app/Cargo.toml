@@ -38,6 +38,18 @@ resvg = "0.46.0"
 usvg = { version = "0.46.0", default-features = false }
 knit-md-docx = "0.1.0"
 
+
+# Windows-only Win32 calls for the high-DPI viewport resync (main.rs
+# win_dpi_resync): FindWindow/GetClientRect/SetWindowPos. Same crate the
+# gpui Windows backend already links, so no new code in the tree.
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+]
+
 [dev-dependencies]
 gpui-pre = { version = "=0.3.9", package = "gpui-pre", features = [
   "test-support",
