@@ -309,6 +309,9 @@ fn toggle_star_flips_star_without_setting_isdirty() {
     });
     s.apply_sync_notes(&[clean_row], 0).unwrap();
     assert_eq!(s.raw_query_row("SELECT IsDirty FROM notes").unwrap(), 0);
+    // apply_sync_notes now adopts the server row's UpdatedTime (Recent must
+    // track the server); compare star-toggle against whatever it wrote.
+    let synced = s.get_note_any(&n.note_id).unwrap().unwrap().updated_time;
     let to = s.toggle_star(&n.note_id).unwrap().unwrap();
     assert!(to, "first toggle stars");
     let after = s.get_note_any(&n.note_id).unwrap().unwrap();
@@ -318,7 +321,7 @@ fn toggle_star_flips_star_without_setting_isdirty() {
         "JS Note.star sets Star only, never IsDirty"
     );
     assert_eq!(
-        after.updated_time, n.updated_time,
+        after.updated_time, synced,
         "starring must not bump UpdatedTime (Recent order is content-driven)"
     );
     let to2 = s.toggle_star(&n.note_id).unwrap().unwrap();

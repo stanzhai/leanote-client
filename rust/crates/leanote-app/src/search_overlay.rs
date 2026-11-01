@@ -36,7 +36,7 @@ gpui_kit::actions!(
 );
 // Issue 17 Q6 quick actions. (⌘A note-list select-all removed: the
 // app-scope binding stole ⌘A from the editor's select-all.)
-gpui_kit::actions!(leanote, [QuickNewNote, QuickSyncNow]);
+gpui_kit::actions!(leanote, [QuickNewNote, QuickSyncNow, QuickForceSync]);
 
 /// Fixed overlay width. ADR-0003 said 680, but on a 13–14" laptop that
 /// spans most of the window; 560 reads as a floating palette (round 31).
@@ -274,6 +274,10 @@ fn render_dialog(
                         Box::new(QuickSyncNow) as Box<dyn gpui_kit::Action>,
                         i18n::t(lang, i18n::Key::SyncNow),
                     ),
+                    (
+                        Box::new(QuickForceSync) as Box<dyn gpui_kit::Action>,
+                        i18n::t(lang, i18n::Key::SyncForceServer),
+                    ),
                 ]
                 .into_iter()
                 .map(|(act, label)| CommandItem::new().label(label).action(act)),
@@ -300,7 +304,16 @@ fn render_dialog(
         .margin_top(px(80.))
         .overlay(true)
         .keyboard(true)
-        .p_0()
+        // 内衬内边距：Command 调色板自带一层不透明 popover 方底
+        // （state.rs `.bg(popover)`），p_0 时方形内衬顶到外框四角、盖住
+        // 圆角弧线，整个面板看起来是矩形。缩进 > 半径弧深(≈3.5px)即可。
+        .p_3()
+        // 同设置/历史对话框：玻璃主题把 tokens.background 置透明，这里
+        // 显式给面板 popover 底色，圆角由 kit radius_lg(=RADIUS_PANEL) 提供。
+        .bg(theme::material(
+            crate::theme::Material::Popover,
+            shell.read(cx).dark(cx),
+        ))
         .child(palette)
 }
 

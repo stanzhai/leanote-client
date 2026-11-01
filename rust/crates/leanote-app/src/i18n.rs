@@ -97,6 +97,12 @@ keys! {
     History => ("历史版本", "History"),
     RestoreVersion => ("恢复此版本", "Restore this version"),
     HistoryEmpty => ("暂无历史版本", "No history yet"),
+    DiffVsCurrent => ("与当前版本对比", "Diff vs current"),
+    RestoreConfirmTitle => ("恢复此版本？", "Restore this version?"),
+    RestoreConfirmBody => (
+        "当前笔记内容将被该版本覆盖。",
+        "The current note will be overwritten by this version."
+    ),
     Saved => ("已保存", "Saved"),
     // Ticket 12: rich-text notes render read-only as converted Markdown.
     RichTextReadonly => ("富文本（只读）", "Rich text (read only)"),
@@ -150,6 +156,7 @@ keys! {
     SyncNow => ("立即同步", "Sync now"),
     Logout => ("登出", "Log out"),
     PendingSync => ("有更新待同步", "Changes waiting to sync"),
+    SyncForceServer => ("从服务端强制同步", "Force sync from server"),
     // Issue 17: ⌘K quick actions + recents.
     QuickActions => ("快捷操作", "Quick actions"),
     Recents => ("最近打开", "Recents"),
@@ -194,7 +201,6 @@ keys! {
     FontSizeLarge => ("大", "Large"),
     FontDownloading => ("正在下载霞鹜文楷等宽…", "Downloading LXGW WenKai Mono…"),
     FontInstallFailed => ("下载失败，已用系统默认字体", "Download failed, using system default"),
-    FontRestartHint => ("字体已安装，重启应用后生效", "Installed — restart to apply"),
     ExportBackupButton => ("导出备份…", "Export backup…"),
     // UI round 10: tooltips on previously bare icon buttons.
     TooltipSearch => ("搜索 (⌘K)", "Search (⌘K)"),
@@ -428,7 +434,6 @@ mod tests {
         Key::FontSizeLarge,
         Key::FontDownloading,
         Key::FontInstallFailed,
-        Key::FontRestartHint,
         Key::ExportBackupButton,
         Key::TooltipSearch,
         Key::TooltipSettings,

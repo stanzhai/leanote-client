@@ -1,12 +1,17 @@
-//! UI round 10 #6: LXGW WenKai Mono (霞鹜文楷等宽) installer.
+//! UI round 10 #6: LXGW WenKai Mono (霞鹜文楷等宽) loader.
 //!
-//! Downloads the official ttf from the LXGW GitHub release into
-//! ~/Library/Fonts so CoreText publishes the family on the next launch
-//! (CoreText scans font dirs at process start, not live — a restart is
-//! required, hence the settings hint text).
+//! Downloads the official ttf ONCE into the data dir, then registers it
+//! in-process via `TextSystem::add_fonts` (DirectWrite in-memory font
+//! reference / CoreText CGDataProvider / cosmic-text). The previous
+//! "~/Library/Fonts" install was macOS-only in effect: Windows scans no
+//! HOME-relative font dir, and per-user fonts there additionally need an
+//! HKCU `...\CurrentVersion\Fonts` registry entry nobody wrote — so the
+//! family never resolved. In-process registration is identical on every
+//! platform and takes effect in the SAME process: no restart, no OS dir,
+//! no registry.
 //!
-//! Runs on a plain background thread at boot: non-fatal by design. On
-//! failure the UI keeps the system font; the settings row can retry.
+//! Download runs on a background thread at boot: non-fatal by design. On
+//! failure the UI keeps the system font.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -17,36 +22,35 @@ const WENKAI_URL: &str =
 
 const FONT_FILE: &str = "LXGWWenKaiMono-Regular.ttf";
 
-/// Target path: the per-user font dir (created on demand).
-pub fn install_path() -> PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    PathBuf::from(&home)
-        .join("Library")
-        .join("Fonts")
-        .join(FONT_FILE)
+/// Cached ttf in the app data dir (download-once, shared with pdf.rs).
+pub fn font_path(dir: &std::path::Path) -> PathBuf {
+    dir.join(FONT_FILE)
 }
 
 /// Boot-install state for the settings row: 0 = download pending,
-/// 1 = installed (restart needed), 2 = failed. The row shows a hint only
-/// while a transition is still relevant — silent once settled.
+/// 1 = registered (live — nothing left to do), 2 = failed.
 pub static INSTALL_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Outcome surfaced to the settings row.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum InstallOutcome {
-    /// File already present (previous run or manual install).
-    AlreadyInstalled,
-    /// Fetched and written this call.
-    Installed,
+/// Register the cached ttf with the text system. True when the family is
+/// usable now. `add_fonts` invalidates cached font resolution and line
+/// layouts; repaint afterwards with `App::refresh_windows` when windows
+/// are already on screen.
+pub fn register(cx: &gpui_kit::App, dir: &std::path::Path) -> bool {
+    let Ok(bytes) = std::fs::read(font_path(dir)) else {
+        return false;
+    };
+    let ok = cx.text_system().add_fonts(vec![bytes.into()]).is_ok();
+    if ok {
+        INSTALL_STATE.store(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    ok
 }
 
-/// Blocking install. One retry on failure (flaky hotel Wi-Fi), then Err.
-/// Call off the UI thread.
-pub fn install_wenkai() -> std::io::Result<InstallOutcome> {
-    let dest = install_path();
+/// Blocking download (one retry on flaky Wi-Fi). Call off the UI thread.
+pub fn install_wenkai(dir: &std::path::Path) -> std::io::Result<()> {
+    let dest = font_path(dir);
     if dest.is_file() {
-        INSTALL_STATE.store(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(InstallOutcome::AlreadyInstalled);
+        return Ok(());
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -60,10 +64,7 @@ pub fn install_wenkai() -> std::io::Result<InstallOutcome> {
     let mut last_err: Option<std::io::Error> = None;
     for _ in 0..2 {
         match fetch(&agent, &dest) {
-            Ok(()) => {
-                INSTALL_STATE.store(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(InstallOutcome::Installed);
-            }
+            Ok(()) => return Ok(()),
             Err(e) => last_err = Some(e),
         }
     }
@@ -82,7 +83,7 @@ fn fetch(agent: &ureq::Agent, dest: &std::path::Path) -> std::io::Result<()> {
         return Err(std::io::Error::other(format!("http {status}")));
     }
     // Stream to a sibling temp file, then rename — a half-written ttf in
-    // the font dir would "install" garbage that CoreText then serves.
+    // the cache dir would "register" garbage on the next boot.
     let tmp = dest.with_extension("ttf.part");
     let mut reader = resp.into_body().into_reader();
     let mut file = std::fs::File::create(&tmp)?;

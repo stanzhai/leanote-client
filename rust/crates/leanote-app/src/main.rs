@@ -8,6 +8,7 @@ mod browse;
 mod conflict_bar;
 mod export;
 mod fonts;
+mod history_dialog;
 mod i18n;
 mod markdown_input;
 mod mermaid;
@@ -149,10 +150,6 @@ pub(crate) mod win_dpi_resync {
             GetCursorPos, PostMessageW, HTCAPTION, WM_NCLBUTTONDOWN,
         };
 
-        let _ = std::fs::write(
-            r"C:\Users\stanz\AppData\Local\Temp\leanote-drag-probe.log",
-            "handoff fired\n",
-        );
         let Some(hwnd) = our_hwnd() else {
             return;
         };
@@ -207,7 +204,7 @@ pub(crate) mod win_dpi_resync {
 }
 
 /// `LEANOTE_DATA` wins (CLI convention); else the core default.
-fn data_dir() -> PathBuf {
+pub(crate) fn data_dir() -> PathBuf {
     std::env::var_os("LEANOTE_DATA")
         .map(PathBuf::from)
         .unwrap_or_else(leanote_core::app_data_dir)
@@ -370,6 +367,14 @@ fn boot_fake_server() {
                     0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a,
                 ]),
             )]);
+            // 历史版本演示：n2 的两个旧版本（服务端 getHistories，最新在前）。
+            server.set_histories(
+                "n2",
+                vec![
+                    json!({"UpdatedTime": "2026-02-02T09:30:00Z", "Content": "# Rust workspace layout\n\ncrates/leanote-core, cli, http, app.\n\nUpcoming: crates/leanote-sync split."}),
+                    json!({"UpdatedTime": "2026-01-06T08:00:00Z", "Content": "# Rust workspace\n\ncore + cli, more coming."}),
+                ],
+            );
             server.set_tags(vec![
                 json!({"TagId":"t1","Tag":"rust","Usn":9,"IsDeleted":false}),
                 json!({"TagId":"t2","Tag":"gpui","Usn":10,"IsDeleted":false}),
@@ -499,7 +504,7 @@ fn leanote_main() {
                 gpui_kit::KeyBinding::new("secondary-,", search_overlay::OpenSettings, None),
                 // App-scope ⌘S sync / ⌘N new note. In the editor, ⌘S is
                 // captured earlier (save + sync) and never reaches these.
-                gpui_kit::KeyBinding::new("secondary-s", search_overlay::QuickSyncNow, None),
+                gpui_kit::KeyBinding::new("secondary-n", search_overlay::QuickNewNote, None),
             ]);
 
             let prefs = prefs::Prefs::load(&dir);
@@ -546,15 +551,28 @@ fn leanote_main() {
                 )
             });
 
-            // UI round 10 #6: fetch the WenKai ttf into ~/Library/Fonts on a
-            // background thread. Non-fatal: a failure keeps the system font;
-            // the settings row can retry. CoreText only sees the new file on
-            // the next launch.
-            std::thread::spawn(|| {
-                if let Err(e) = fonts::install_wenkai() {
-                    eprintln!("wenkai font install failed: {e}");
-                }
-            });
+            // UI round 10 #6 / Issue 39: register the cached WenKai ttf with
+            // the text system IN-PROCESS before the first layout (works on
+            // every platform, no restart — see fonts.rs). Missing file →
+            // one background download, then live register + repaint.
+            fonts::register(cx, &dir);
+            if !fonts::font_path(&dir).is_file() {
+                let dir_dl = dir.clone();
+                cx.spawn(async move |cx| {
+                    let d = dir_dl.clone();
+                    if smol::unblock(move || fonts::install_wenkai(&d))
+                        .await
+                        .is_ok()
+                    {
+                        cx.update(|cx| {
+                            if fonts::register(cx, &dir_dl) {
+                                cx.refresh_windows();
+                            }
+                        });
+                    }
+                })
+                .detach();
+            }
 
             let lang = match prefs.lang {
                 prefs::LangPref::Follow => i18n::system_lang(),
@@ -577,8 +595,15 @@ fn leanote_main() {
                     .and_then(|s| s.last_account().ok().flatten())
             };
 
-            let displays: Vec<gpui_kit::Bounds<gpui_kit::Pixels>> =
+            // Primary display FIRST: clamped()'s "saved display is gone"
+            // fallback re-centers on displays[0], which must be the primary
+            // (Issue 39 spec: 恢复到主屏幕居中).
+            let mut displays: Vec<gpui_kit::Bounds<gpui_kit::Pixels>> =
                 cx.displays().iter().map(|d| d.visible_bounds()).collect();
+            if let Some(primary) = cx.primary_display() {
+                let pb = primary.visible_bounds();
+                displays.sort_by_key(|b| *b != pb);
+            }
             let state = window_state::WindowState::load(&dir)
                 .map(|s| s.clamped(&displays))
                 .unwrap_or_else(|| {
@@ -587,12 +612,18 @@ fn leanote_main() {
                         gpui_kit::size(px(window_state::DEFAULT_W), px(window_state::DEFAULT_H)),
                         cx,
                     );
-                    window_state::WindowState::from_bounds(&b)
+                    window_state::WindowState::from_bounds(&b, false)
                 });
 
             let bounds = state.bounds();
             let options = WindowOptions {
-                window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)),
+                // Issue 39: reopen at the last geometry; maximized windows
+                // reopen maximized (bounds act as the restore size).
+                window_bounds: Some(if state.maximized {
+                    gpui_kit::WindowBounds::Maximized(bounds)
+                } else {
+                    gpui_kit::WindowBounds::Windowed(bounds)
+                }),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Leanote".into()),
                     appears_transparent: true,
@@ -646,19 +677,11 @@ fn leanote_main() {
                 // pixels — store the live geometry in device pixels so the
                 // window reopens at the same on-screen size.
                 window.on_window_should_close(cx, move |window, _cx| {
-                    if let gpui_kit::WindowBounds::Windowed(b) = window.window_bounds() {
-                        #[cfg(target_os = "windows")]
-                        let b = if win_dpi_resync::fixup_engaged() {
-                            win_dpi_resync::bounds_to_device(b, window.scale_factor())
-                        } else {
-                            b
-                        };
-                        window_state::WindowState::from_bounds(&b).save(&dir_close);
-                    }
+                    save_window_state(window, &dir_close);
                     true
                 });
                 cx.new(|cx| {
-                    AppShell::new(
+                    let shell = AppShell::new(
                         window,
                         cx,
                         dir_for_window.clone(),
@@ -669,7 +692,23 @@ fn leanote_main() {
                             .as_ref()
                             .map(|(h, e, p)| (h.as_str(), e.as_str(), p.as_str())),
                         remembered_for_window.clone(),
-                    )
+                    );
+                    // Issue 39: geometry persistence also on move/resize,
+                    // debounced. ⌘Q (cx.quit) and crashes never reach
+                    // on_window_should_close, so a close-only hook lost the
+                    // last position; ≤500ms staleness is invisible.
+                    let dir_bounds = dir_for_window.clone();
+                    let last_save = std::rc::Rc::new(std::cell::Cell::new(
+                        std::time::Instant::now() - GEOMETRY_SAVE_EVERY,
+                    ));
+                    cx.observe_window_bounds(window, move |_, window, _| {
+                        if last_save.get().elapsed() >= GEOMETRY_SAVE_EVERY {
+                            last_save.set(std::time::Instant::now());
+                            save_window_state(window, &dir_bounds);
+                        }
+                    })
+                    .detach();
+                    shell
                 })
             })
             .expect("open window");
@@ -701,6 +740,26 @@ fn leanote_main() {
                 .detach();
             }
         });
+}
+
+/// Debounce for move/resize persistence (see save_window_state).
+const GEOMETRY_SAVE_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Write the live window geometry to window-state.json. Windows DPI fixup:
+/// when the startup resync engaged (see win_dpi_resync), the creation path
+/// treats requested LOGICAL sizes as DEVICE pixels — store the live
+/// geometry in device pixels so the window reopens at the same on-screen
+/// size. Maximized/fullscreen both reopen maximized (bounds = restore size).
+fn save_window_state(window: &mut gpui_kit::Window, dir: &std::path::Path) {
+    let wb = window.window_bounds();
+    let maximized = !matches!(wb, gpui_kit::WindowBounds::Windowed(_));
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut b = wb.get_bounds();
+    #[cfg(target_os = "windows")]
+    if win_dpi_resync::fixup_engaged() {
+        b = win_dpi_resync::bounds_to_device(b, window.scale_factor());
+    }
+    window_state::WindowState::from_bounds(&b, maximized).save(dir);
 }
 
 /// Wake tokens on top of the kit theme (materials, radii, fonts).

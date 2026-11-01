@@ -1,5 +1,6 @@
 //! Window size/position persistence: JSON in the data dir, clamped to the
-//! current displays on load (display gone → default centered).
+//! current displays on load (display gone → re-centered on the first
+//! display, which callers pass primary-first).
 
 use gpui_kit::{Bounds, Pixels, Point, Size};
 
@@ -13,6 +14,10 @@ pub struct WindowState {
     pub y: f32,
     pub w: f32,
     pub h: f32,
+    /// Reopen maximized. `serde(default)` keeps pre-Issue-39 files (which
+    /// lack the field) loading as plain windowed state.
+    #[serde(default)]
+    pub maximized: bool,
 }
 
 impl WindowState {
@@ -23,6 +28,7 @@ impl WindowState {
             y: 100.,
             w: DEFAULT_W,
             h: DEFAULT_H,
+            maximized: false,
         }
     }
 
@@ -39,18 +45,21 @@ impl WindowState {
         }
     }
 
-    pub fn from_bounds(b: &Bounds<Pixels>) -> Self {
+    pub fn from_bounds(b: &Bounds<Pixels>, maximized: bool) -> Self {
         Self {
             x: b.origin.x.as_f32(),
             y: b.origin.y.as_f32(),
             w: b.size.width.as_f32(),
             h: b.size.height.as_f32(),
+            maximized,
         }
     }
 
     /// Clamp to `displays` (screen-coordinate union rects). A state that
-    /// intersects no display falls back to the default size — this is the
-    /// "monitor unplugged" path. A state merely sticking out is pulled in.
+    /// intersects no display falls back to default size centered on
+    /// `displays[0]` — this is the "monitor unplugged" path, so callers
+    /// must pass the primary display first. A state merely sticking out is
+    /// pulled in. The maximized flag passes through untouched.
     pub fn clamped(self, displays: &[Bounds<Pixels>]) -> Self {
         let mut s = self;
         // Sanitize degenerate sizes first.
@@ -76,10 +85,12 @@ impl WindowState {
                 y,
                 w: s.w,
                 h: s.h,
+                maximized: s.maximized,
             }
         } else if let Some(d) = displays.first() {
             // Display gone (e.g. second monitor unplugged): center the
-            // window on the primary display instead of stranding it.
+            // window on displays[0] (primary — see the call site) instead
+            // of stranding it.
             let x = d.origin.x.as_f32() + (d.size.width.as_f32() - s.w).max(0.) / 2.;
             let y = d.origin.y.as_f32() + (d.size.height.as_f32() - s.h).max(0.) / 2.;
             Self {
@@ -87,6 +98,7 @@ impl WindowState {
                 y,
                 w: s.w,
                 h: s.h,
+                maximized: s.maximized,
             }
         } else {
             Self::default_centered()
@@ -126,6 +138,7 @@ mod tests {
             y: -3.,
             w: 1280.,
             h: 800.,
+            maximized: true,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: WindowState = serde_json::from_str(&json).unwrap();
@@ -139,12 +152,41 @@ mod tests {
     }
 
     #[test]
+    fn pre_maximized_field_file_still_loads() {
+        let s: WindowState =
+            serde_json::from_str(r#"{"x":1.0,"y":2.0,"w":1280.0,"h":800.0}"#).unwrap();
+        assert_eq!(
+            s,
+            WindowState {
+                x: 1.,
+                y: 2.,
+                w: 1280.,
+                h: 800.,
+                maximized: false
+            }
+        );
+    }
+
+    #[test]
+    fn clamped_keeps_maximized_flag() {
+        let s = WindowState {
+            x: 5000.,
+            y: 5000.,
+            w: 1280.,
+            h: 800.,
+            maximized: true,
+        };
+        assert!(s.clamped(&[display(0., 0., 1512., 982.)]).maximized);
+    }
+
+    #[test]
     fn display_gone_centers_on_remaining_display() {
         let s = WindowState {
             x: 5000.,
             y: 5000.,
             w: 1280.,
             h: 800.,
+            maximized: false,
         };
         let out = s.clamped(&[display(0., 0., 1512., 982.)]);
         assert_eq!(out.x, (1512. - 1280.) / 2.);
@@ -161,6 +203,7 @@ mod tests {
             y: 100.,
             w: 1000.,
             h: 700.,
+            maximized: false,
         };
         let out = s.clamped(&[display(0., 0., 1512., 982.)]);
         assert_eq!(out.x, (1512. - 1000.) / 2.);
@@ -174,6 +217,7 @@ mod tests {
             y: 400.,
             w: 1280.,
             h: 800.,
+            maximized: false,
         };
         let out = s.clamped(&[display(0., 0., 1512., 982.)]);
         assert_eq!(out.x, 232.); // 1512 - 1280: pulled in, capped at display edge
@@ -188,6 +232,7 @@ mod tests {
             y: 10.,
             w: 0.,
             h: -5.,
+            maximized: false,
         };
         let out = s.clamped(&[display(0., 0., 1512., 982.)]);
         assert_eq!((out.w, out.h), (DEFAULT_W, DEFAULT_H));
@@ -200,6 +245,7 @@ mod tests {
             y: 100.,
             w: 1000.,
             h: 700.,
+            maximized: false,
         };
         assert_eq!(s.clamped(&[display(0., 0., 1512., 982.)]), s);
     }

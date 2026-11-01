@@ -9,6 +9,14 @@ use std::sync::OnceLock;
 pub const PORT: u16 = 59590;
 /// The one window handle we own; set at open_window time.
 pub(crate) static WINDOW: OnceLock<gpui_kit::AnyWindowHandle> = OnceLock::new();
+/// Default lock port; `LEANOTE_INSTANCE_PORT` overrides so a dev build can
+/// run beside the installed app.
+fn port() -> u16 {
+    std::env::var("LEANOTE_INSTANCE_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(PORT)
+}
 
 pub fn remember_window(handle: gpui_kit::AnyWindowHandle) {
     let _ = WINDOW.set(handle);
@@ -17,12 +25,12 @@ pub fn remember_window(handle: gpui_kit::AnyWindowHandle) {
 /// Bind → we are the first instance (listener kept alive by the caller).
 /// Bind failure → another instance is running: poke it and tell main to exit.
 pub fn acquire() -> Result<TcpListener, ()> {
-    match TcpListener::bind(("127.0.0.1", PORT)) {
+    match TcpListener::bind(("127.0.0.1", port())) {
         Ok(l) => Ok(l),
         Err(_) => {
             // Best-effort focus relay; failure just means the other instance
             // is shutting down — exit anyway, single instance is the contract.
-            if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", PORT)) {
+            if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port())) {
                 let _ = s.write_all(b"focus");
                 let _ = s.flush();
                 let _ = s.read(&mut [0u8; 1]); // wait for peer close

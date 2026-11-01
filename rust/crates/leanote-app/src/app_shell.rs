@@ -227,12 +227,8 @@ pub struct AppShell {
     // --- Ticket 10 editor state ---
     /// Edit mode for `selected` (only entered for live IsMarkdown notes).
     pub(crate) editing: Option<EditState>,
-    /// History popover open (only meaningful while editing).
-    history_open: bool,
     /// 斜杠面板（ADR-0011）：编辑器内 `/` 触发的 4×4 命令格；None = 关。
     pub(crate) slash_panel: Option<crate::slash_panel::SlashPanel>,
-    /// Which history row is previewed (None = list view).
-    history_preview: Option<leanote_core::Id>,
     /// List caches — invalidated by invalidate_lists() on any mutation
     /// (select/sync/save/nav edit/...). Avoids re-querying the DB every frame.
     cached_notebook_nodes: Option<Vec<NavNode>>,
@@ -389,9 +385,7 @@ impl AppShell {
             converted_note: None,
             nav_edit: None,
             editing: None,
-            history_open: false,
             slash_panel: None,
-            history_preview: None,
             cached_notebook_nodes: None,
             cached_tag_nodes: None,
             cached_notebook_names: None,
@@ -591,6 +585,46 @@ impl AppShell {
             let _ = this.update(cx, |shell, cx| {
                 match &result {
                     Ok(_) => {
+                        shell.sync_status = Some(Ok("sync ok".into()));
+                    }
+                    Err(e) => {
+                        leanote_core::logging::log("sync", e);
+                        shell.sync_status = Some(Err(e.clone().into()));
+                    }
+                }
+                shell.invalidate_lists();
+                cx.notify();
+            });
+        }));
+    }
+
+    /// 强制从服务端同步：先跑一次增量（把本地未推送的改动推上去，
+    /// 避免全量覆盖丢数据），成功后 `full_sync` 从 USN −1 重拉并重下
+    /// 所有正文（apply_sync_notes 在冲突时清空 Content，JS InitSync 语义）。
+    pub(crate) fn force_sync_now(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        let Some(acct) = self.store().and_then(|s| s.active_account().ok().flatten()) else {
+            return;
+        };
+        let dir = self.data_dir.clone();
+        let uid = acct.user_id.clone();
+        let work = cx.background_spawn(async move {
+            (|| {
+                let store = leanote_core::Store::open(dir, uid).map_err(|e| e.to_string())?;
+                let api = Api::for_account(&acct);
+                // push pending locals first; abort the force on failure so a
+                // dead server never clobbers un-pushed edits
+                leanote_core::sync::incr_sync(&api, &store, &NoProgress)
+                    .map_err(|e| e.to_string())?;
+                leanote_core::sync::full_sync(&api, &store, &NoProgress)
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(())
+            })()
+        });
+        self._task = Some(cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |shell, cx| {
+                match &result {
+                    Ok(()) => {
                         shell.sync_status = Some(Ok("sync ok".into()));
                     }
                     Err(e) => {
@@ -882,8 +916,6 @@ impl AppShell {
 
     fn close_editor(&mut self) {
         self.editing = None;
-        self.history_open = false;
-        self.history_preview = None;
     }
 
     /// Enter edit mode for the selected live markdown note. Buffer is seeded
@@ -972,8 +1004,6 @@ impl AppShell {
                 state.set_selected_range(0..0, cx);
             });
         }
-        self.history_open = false;
-        self.history_preview = None;
         cx.notify();
     }
 
@@ -1225,9 +1255,9 @@ impl AppShell {
         });
     }
 
-    /// UI round 10 #6: UI font pref → disk + live swap. WenKai only takes
-    /// effect after the ttf is installed (fonts.rs) and the app restarts —
-    /// CoreText scans ~/Library/Fonts at process start.
+    /// UI round 10 #6: UI font pref → disk + live swap. WenKai is
+    /// registered in-process from the data-dir ttf (fonts.rs); when the
+    /// boot download finishes later, the register path repaints windows.
     fn set_font_setting(&mut self, id: &str, cx: &mut gpui_kit::Context<Self>) {
         let dir = self.data_dir.clone();
         let mut p = crate::prefs::Prefs::load(&dir);
@@ -1462,23 +1492,35 @@ impl AppShell {
         cx.notify();
         self.start_editing(window, cx);
     }
-    fn restore_history_version(
+    /// History-dialog restore: local rows restore title+content via the
+    /// history id; server-sourced versions carry content only (the server
+    /// keeps no per-version title), so restore the body and keep the
+    /// current title.
+    pub(crate) fn restore_history_pick(
         &mut self,
-        history_id: leanote_core::Id,
+        note_id: &leanote_core::Id,
+        version: crate::history_dialog::HistoryVersion,
         window: &mut Window,
         cx: &mut gpui_kit::Context<Self>,
     ) {
-        let Some(ed) = &self.editing else { return };
-        let note_id = ed.note_id.clone();
         let Some(store) = self.store() else { return };
-        if store
-            .restore_history(&note_id, &history_id)
-            .ok()
-            .flatten()
-            .is_some()
-        {
+        let restored = match &version.local_id {
+            Some(hid) => store.restore_history(note_id, hid).ok().flatten().is_some(),
+            None => store
+                .save_note_with_history(
+                    note_id,
+                    leanote_core::NoteUpdate {
+                        content: Some(version.content.clone()),
+                        ..Default::default()
+                    },
+                )
+                .ok()
+                .flatten()
+                .is_some(),
+        };
+        if restored {
             self.close_editor();
-            self.selected = Some(note_id);
+            self.selected = Some(note_id.clone());
             self.invalidate_lists();
             self.start_editing(window, cx); // reopen seeded with restored content
         }
@@ -2637,6 +2679,12 @@ impl Render for AppShell {
                 |this, _: &crate::search_overlay::QuickSyncNow, window, cx| {
                     window.close_dialog(cx);
                     this.sync_now(cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::search_overlay::QuickForceSync, window, cx| {
+                    window.close_dialog(cx);
+                    this.force_sync_now(cx);
                 },
             ));
         // Issue 17: no separate titlebar strip. The left nav's 44px header
@@ -4029,12 +4077,30 @@ impl AppShell {
                 (None, _) => AssetIcon::Cloud,
             };
             let title = self.sync_status_label();
+            let menu_lang = self.lang;
             footer = footer.child(
                 Button::new("nav-sync")
                     .icon(icon)
                     .ghost()
                     .tooltip(title)
-                    .on_click(cx.listener(|this, _ev, _window, cx| this.sync_now(cx))),
+                    .on_click(cx.listener(|this, _ev, _window, cx| this.sync_now(cx)))
+                    // 右键：强制从服务端全量同步（增量推送 → 全量重拉）
+                    .context_menu({
+                        let shell = shell.clone();
+                        move |menu, _window, _cx| {
+                            let shell = shell.clone();
+                            menu.item(
+                                PopupMenuItem::new(i18n::t(menu_lang, i18n::Key::SyncForceServer))
+                                    .on_click({
+                                        let shell = shell.clone();
+                                        move |_ev, _window, cx| {
+                                            let _ = shell
+                                                .update(cx, |this, cx| this.force_sync_now(cx));
+                                        }
+                                    }),
+                            )
+                        }
+                    }),
             );
             // Account: username + menu (logout → confirm).
             let name: SharedString = if acct.username.is_empty() {
@@ -4329,26 +4395,24 @@ impl AppShell {
                             ),
                         ))
                         // Font hint shows only while it still matters:
-                        // downloading (state 0, file absent), just installed
-                        // this run (state 1 + file written this session), or
-                        // failed (state 2). Silent when WenKai isn't in use
-                        // or was installed by an earlier run.
+                        // downloading (state 0) or failed (state 2).
+                        // Registration is in-process and live — state 1
+                        // has nothing left to hint.
                         .when(
-                            prefs.font == "wenkai-mono"
-                                && crate::fonts::INSTALL_STATE
-                                    .load(std::sync::atomic::Ordering::Relaxed)
-                                    != 1
-                                || crate::fonts::INSTALL_STATE
-                                    .load(std::sync::atomic::Ordering::Relaxed)
-                                    == 2,
+                            {
+                                let st = crate::fonts::INSTALL_STATE
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                st == 2 || (st == 0 && prefs.font == "wenkai-mono")
+                            },
                             |el| {
                                 el.child(small_label(
-                                    match crate::fonts::INSTALL_STATE
+                                    if crate::fonts::INSTALL_STATE
                                         .load(std::sync::atomic::Ordering::Relaxed)
+                                        == 2
                                     {
-                                        2 => t(i18n::Key::FontInstallFailed),
-                                        1 => t(i18n::Key::FontRestartHint),
-                                        _ => t(i18n::Key::FontDownloading),
+                                        t(i18n::Key::FontInstallFailed)
+                                    } else {
+                                        t(i18n::Key::FontDownloading)
                                     },
                                     muted,
                                 ))
@@ -4545,109 +4609,91 @@ impl AppShell {
         });
     }
 
-    /// Issue 19: history as a centered dialog (was an inline block under the
-    /// editor). Clicking a row previews; Restore writes it back.
+    /// History dialog (issue 19 → 分栏改版): server-side version list first
+    /// (`note/getHistories`; stock leanote ships the handler commented out,
+    /// so fall back to local `note_history` rows), rendered as a split
+    /// view by [`crate::history_dialog::HistoryDialog`].
     fn open_history(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
-        let shell = cx.entity();
-        let lang = self.lang;
-        let note_id = self.editing.as_ref().map(|e| e.note_id.clone());
-        let history = self
+        let Some(ed) = self.editing.as_ref() else {
+            return;
+        };
+        let note_id = ed.note_id.clone();
+        let title: SharedString = ed.title.read(cx).value().to_string().into();
+        let current = ed.content.read(cx).value().to_string();
+        let server_note_id = self
             .store()
-            .and_then(|s| note_id.map(|id| s.list_history(&id).ok()))
-            .flatten()
+            .and_then(|s| s.note_server_id(&note_id.to_string()).ok().flatten())
             .unwrap_or_default();
-        let t = move |k: i18n::Key| i18n::t(lang, k);
-        window.open_dialog(cx, move |dialog, _window, cx| {
-            let shell_c = shell.clone();
-            let dark = shell.read(cx).dark(cx);
-            let muted = theme::muted_foreground(dark);
-            let mut rows = gpui_kit::base::v_flex().gap_1();
-            if history.is_empty() {
-                rows = rows.child(small_label(t(i18n::Key::HistoryEmpty), muted));
-            }
-            for h in &history {
-                rows = rows.child(
-                    Button::new(format!("history-row-{}", h.history_id.to_string()))
-                        .label(format!("{} · {}", h.title, fmt_time(h.created_time)))
-                        .ghost()
-                        .on_click({
-                            let shell = shell_c.clone();
-                            let content = h.content.clone();
-                            let title = h.title.clone();
-                            let hid = h.history_id.clone();
-                            move |_ev, window, cx| {
-                                window.close_dialog(cx);
-                                shell.update(cx, |this, cx| {
-                                    this.preview_history(
-                                        hid.clone(),
-                                        title.clone(),
-                                        content.clone(),
-                                        window,
-                                        cx,
-                                    )
-                                });
-                            }
-                        }),
-                );
-            }
-            // Same glass fix as settings (see open_settings): kit paints the
-            // panel from tokens.background, forced transparent by
-            // apply_wake_theme for the frosted window.
-            dialog
-                .w(px(440.))
-                .title(t(i18n::Key::History))
-                .bg(theme::material(Material::Popover, dark))
-                .child(rows)
-        });
-    }
-
-    /// Issue 19: history preview + restore, second dialog step.
-    fn preview_history(
-        &mut self,
-        history_id: leanote_core::Id,
-        title: String,
-        content: String,
-        window: &mut Window,
-        cx: &mut gpui_kit::Context<Self>,
-    ) {
+        let local: Vec<crate::history_dialog::HistoryVersion> = self
+            .store()
+            .and_then(|s| s.list_history(&note_id).ok())
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|h| crate::history_dialog::HistoryVersion {
+                        time: h.created_time,
+                        content: h.content,
+                        local_id: Some(h.history_id),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(acct) = self.store().and_then(|s| s.active_account().ok().flatten()) else {
+            return;
+        };
         let lang = self.lang;
-        let dark = self.dark(cx);
-        let t = move |k: i18n::Key| i18n::t(lang, k);
-        let shell = cx.entity();
-        let md_style = markdown_view_style();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
-            let shell_c = shell.clone();
-            let src = browse::reader_markdown_src(&title, &content, true);
-            dialog
-                .w(px(560.))
-                .title(t(i18n::Key::History))
-                .bg(theme::material(Material::Popover, dark))
-                .child(
-                    crate::mermaid::install_full(
-                        TextView::markdown("history-preview", src),
-                        dark,
-                        Some(shell_c.downgrade()),
-                    )
-                    .style(md_style.clone())
-                    .scrollable(true)
-                    .on_link_click(|url, _ev, _window, cx| cx.open_url(url)),
-                )
-                .child(
-                    Button::new("history-restore")
-                        .label(t(i18n::Key::RestoreVersion))
-                        .outline()
-                        .on_click({
-                            let shell = shell_c.clone();
-                            let hid = history_id.clone();
-                            move |_ev, window, cx| {
-                                window.close_dialog(cx);
-                                shell.update(cx, |this, cx| {
-                                    this.restore_history_version(hid.clone(), window, cx)
-                                });
-                            }
-                        }),
-                )
-        });
+        let wh = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            // Server first; any failure (disabled endpoint, offline) keeps
+            // the local snapshots so the dialog always opens.
+            let versions = if server_note_id.is_empty() {
+                local
+            } else {
+                let sid = server_note_id.clone();
+                cx.background_spawn(async move {
+                    Api::for_account(&acct)
+                        .get_note_histories(&sid)
+                        .map(|rows| {
+                            rows.into_iter()
+                                .map(|(time, content)| crate::history_dialog::HistoryVersion {
+                                    time,
+                                    content,
+                                    local_id: None,
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or(local)
+                })
+                .await
+            };
+            let _ = wh.update(cx, |_, window, cx| {
+                let _ = this.update(cx, |_shell, cx| {
+                    let shell_entity = cx.entity();
+                    let history = cx.new(|cx| {
+                        crate::history_dialog::HistoryDialog::new(
+                            note_id.clone(),
+                            title.clone(),
+                            current.clone(),
+                            versions,
+                            lang,
+                            shell_entity.clone(),
+                            cx,
+                        )
+                    });
+                    let shell_c = shell_entity;
+                    window.open_dialog(cx, move |dialog, _window, cx| {
+                        let dark = shell_c.read(cx).dark(cx);
+                        dialog
+                            .w(px(880.))
+                            .title(i18n::t(lang, i18n::Key::History))
+                            .bg(theme::material(Material::Popover, dark))
+                            // 不要 p_0：kit 标题栏需要对话框默认内边距，
+                            // p_0 会让「历史版本」标题贴住左上角。
+                            .child(history.clone())
+                    });
+                });
+            });
+        })
+        .detach();
     }
 
     /// 使用帮助对话框（原 Issue 19 markdown cheat-sheet）。正文为纯

@@ -70,6 +70,9 @@ struct Inner {
     /// Issue 21: `fileId -> (filename, mime, bytes)` served by
     /// `file/getImage` and filled by multipart `note/*` pushes.
     images: std::collections::HashMap<String, (String, String, Vec<u8>)>,
+    /// `noteId -> history rows` served by `note/getHistories` (each row
+    /// `{UpdatedTime, Content}`; upstream keeps them newest-first, ≤10).
+    histories: std::collections::HashMap<String, Vec<Value>>,
     /// login -> token; token -> valid.
     token: Option<String>,
     /// Next USN handed to push responses (>= max dataset USN).
@@ -160,6 +163,16 @@ impl FakeServer {
         self.inner.lock().unwrap().images = images.into_iter().collect();
     }
 
+    /// History rows `note/getHistories` serves for a note (upstream shape:
+    /// newest first, full content each).
+    pub fn set_histories(&self, note_id: &str, rows: Vec<Value>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .histories
+            .insert(note_id.to_string(), rows);
+    }
+
     /// Issue 21: images received by multipart note pushes, keyed by the
     /// server file id `file/getImage` serves.
     pub fn images(&self) -> std::collections::HashMap<String, (String, String, Vec<u8>)> {
@@ -202,6 +215,7 @@ pub async fn start() -> FakeServer {
         .route("/api/auth/logout", post(logout))
         .route("/api/user/getSyncState", get(get_sync_state))
         .route("/api/notebook/getSyncNotebooks", get(get_sync_notebooks))
+        .route("/api/note/getHistories", get(get_note_histories))
         .route("/api/note/getSyncNotes", get(get_sync_notes))
         .route("/api/note/getNoteContent", get(get_note_content))
         .route("/api/tag/getSyncTags", get(get_sync_tags))
@@ -498,6 +512,23 @@ async fn get_note_content(
     match i.contents.get(note_id) {
         Some(content) => json_response(json!({"Ok": true, "NoteId": note_id, "Content": content})),
         None => json_response(json!({"Ok": false, "Msg": "notExists"})),
+    }
+}
+
+/// `note/getHistories`: upstream renders `{Ok:true, Item: rows}` when the
+/// note has history rows and a bare `NewRe` (`Ok:false`) when it has none.
+async fn get_note_histories(
+    State(inner): State<Arc<Mutex<Inner>>>,
+    Query(query): Query<Map<String, Value>>,
+) -> Response {
+    let i = inner.lock().unwrap();
+    if let Some(r) = require_token(&query, &i) {
+        return r;
+    }
+    let note_id = query.get("noteId").and_then(|v| v.as_str()).unwrap_or("");
+    match i.histories.get(note_id) {
+        Some(rows) if !rows.is_empty() => json_response(json!({"Ok": true, "Item": rows})),
+        _ => json_response(json!({"Ok": false, "Msg": ""})),
     }
 }
 

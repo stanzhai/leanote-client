@@ -277,6 +277,41 @@ impl Api {
             .to_string())
     }
 
+    /// GET `note/getHistories` → server-side content history rows
+    /// `(epoch_ms, content)`, newest first (upstream
+    /// `NoteContentHistoryService.ListHistories`, ≤10 rows, full content
+    /// each). Stock leanote ships this handler commented out — callers
+    /// fall back to local history on `Err`.
+    pub fn get_note_histories(
+        &self,
+        server_note_id: &str,
+    ) -> Result<Vec<(i64, String)>, SyncError> {
+        let params = [("noteId", server_note_id.to_string())];
+        let v = Self::ok_or_api(
+            self.get("note/getHistories", &params)?,
+            "GET",
+            "note/getHistories",
+            &params,
+        )?;
+        // `{Ok:true, Item:[{UpdatedTime, Content}, ...]}`; tolerate a bare
+        // array for patched servers.
+        let list = v
+            .get("Item")
+            .and_then(Value::as_array)
+            .or_else(|| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let now = now_ms();
+        Ok(list
+            .into_iter()
+            .map(|h| {
+                let ms = go_now_ms(h.get("UpdatedTime"), now);
+                let content = h.get("Content").and_then(Value::as_str).unwrap_or("");
+                (ms, content.to_string())
+            })
+            .collect())
+    }
+
     /// GET `file/getImage` → `(mime, bytes)` (issue 21 需求9; JSON body
     /// means `{Ok:false}`).
     pub fn get_image(&self, file_id: &str) -> Result<(String, Vec<u8>), SyncError> {
@@ -1046,12 +1081,13 @@ pub fn incr_sync(
             }
             // Notes need conflict-aware apply.
             let mut usn = last;
+            let mut updated: Vec<(String, String)> = Vec::new();
             loop {
                 let rows = api.sync_chunk("note", usn)?;
                 if rows.is_empty() {
                     break;
                 }
-                apply_incr_notes(store, &rows, api, now)?;
+                updated.extend(apply_incr_notes(store, &rows, api, now)?);
                 stats.notes += rows.len();
                 progress.note(format!("notes: +{}", rows.len()));
                 if (rows.len() as i64) < MAX_ENTRY {
@@ -1059,29 +1095,45 @@ pub fn incr_sync(
                 }
                 usn = i64_field(rows.last().expect("non-empty"), "Usn");
             }
-            // JS reloads content for updated notes; here only notes still
-            // missing one (new rows land with Content='') get filled.
-            for (sid, title) in store.notes_needing_content().map_err(db_err)? {
-                match api.get_note_content(&sid) {
-                    Ok(content) => {
-                        store
-                            .set_note_content_by_server_id(&sid, &content)
-                            .map_err(db_err)?;
-                        stats.contents += 1;
-                    }
-                    Err(e) => {
-                        let msg = match e {
-                            SyncError::Api(msg) => format!("{msg}; note 「{title}」"),
-                            other => other.to_string(),
-                        };
-                        progress.note(format!("content failed: {msg}"));
-                        stats.content_failures.push(msg);
-                    }
-                }
+            // Content phase: new rows land with Content='' and updated rows
+            // need their body reloaded (JS `InitSync` via updateNoteForce).
+            // A sid can land in both lists — fetch each once.
+            for (sid, title) in content_targets(&updated, store)? {
+                fetch_content(store, sid, title, None, api, progress, &mut stats);
             }
             store
                 .set_last_sync_usn(api.get_sync_state()?)
                 .map_err(db_err)?;
+        }
+
+        // Stale-body repair when the cursor is already level: pre-fix pulls
+        // advanced a row's Usn without its body, and once the cursor caught
+        // up the delta never comes back. Re-scan the last LOOKBACK entries
+        // (server-side USN window) and re-fetch any row whose server
+        // UpdatedTime is newer than the local one.
+        if server_usn == last && !again {
+            // Scan from −1 (the whole history, paged) — with the cursor
+            // level there is no delta to lean on, and the lookback must
+            // reach old rows too. It is one getSyncNotes walk per startup
+            // (450 notes ≈ 3 pages against the fake; larger real accounts
+            // pay one extra page per 200 notes, then nothing once clean).
+            // ponytail: whole-history rescan per sync; narrow to a
+            // ContentUsn column if accounts get huge.
+            let mut usn: i64 = -1;
+            loop {
+                let rows = api.sync_chunk("note", usn)?;
+                if rows.is_empty() {
+                    break;
+                }
+                let targets = store.stale_bodies(&rows).map_err(db_err)?;
+                for (sid, title, ut) in targets {
+                    fetch_content(store, sid, title, Some(ut), api, progress, &mut stats);
+                }
+                if (rows.len() as i64) < MAX_ENTRY {
+                    break;
+                }
+                usn = i64_field(rows.last().expect("non-empty"), "Usn");
+            }
         }
 
         // Push phase (JS sendChanges): skipped on re-rounds.
@@ -1098,6 +1150,53 @@ pub fn incr_sync(
         again = true;
     }
     Ok(stats)
+}
+
+/// Content-phase targets: rows missing a body plus rows this round updated,
+/// deduped by server id.
+fn content_targets(
+    updated: &[(String, String)],
+    store: &Store,
+) -> Result<Vec<(String, String)>, SyncError> {
+    let mut targets = store.notes_needing_content().map_err(db_err)?;
+    for pair in updated {
+        if !targets.iter().any(|(sid, _)| sid == &pair.0) {
+            targets.push(pair.clone());
+        }
+    }
+    Ok(targets)
+}
+
+/// One getNoteContent + write-back, shared by both content paths.
+/// `updated_time` stamps the server row's UpdatedTime (repair path), so
+/// the refreshed row also moves in "Recent".
+fn fetch_content(
+    store: &Store,
+    sid: String,
+    title: String,
+    updated_time: Option<i64>,
+    api: &Api,
+    progress: &dyn SyncProgress,
+    stats: &mut SyncStats,
+) {
+    match api.get_note_content(&sid) {
+        Ok(content) => {
+            if store
+                .set_note_content_ut_by_server_id(&sid, &content, updated_time)
+                .is_ok()
+            {
+                stats.contents += 1;
+            }
+        }
+        Err(e) => {
+            let msg = match e {
+                SyncError::Api(msg) => format!("{msg}; note 「{title}」"),
+                other => other.to_string(),
+            };
+            progress.note(format!("content failed: {msg}"));
+            stats.content_failures.push(msg);
+        }
+    }
 }
 
 /// JS `Sync.sendNotebookChanges`.
@@ -1331,7 +1430,19 @@ fn usn_of(v: &Value) -> i64 {
 }
 
 /// JS `Sync._syncNoteToLocal` (incr pull side), conflict-aware.
-fn apply_incr_notes(store: &Store, rows: &[Value], api: &Api, now: i64) -> Result<(), SyncError> {
+///
+/// Returns `(ServerNoteId, Title)` pairs whose Usn advanced over a clean
+/// local row — the caller re-downloads their content. (JS `updateNoteForce`
+/// defaults `needReloadContent=true`, i.e. `InitSync`, which reloads the
+/// body; the Rust port used to keep the stale one, so server-side edits
+/// never arrived locally.)
+fn apply_incr_notes(
+    store: &Store,
+    rows: &[Value],
+    api: &Api,
+    now: i64,
+) -> Result<Vec<(String, String)>, SyncError> {
+    let mut updated = Vec::new();
     for row in rows {
         let server_id = str_field(row, "NoteId");
         let local = store.note_by_server_id(&server_id).map_err(db_err)?;
@@ -1350,10 +1461,8 @@ fn apply_incr_notes(store: &Store, rows: &[Value], api: &Api, now: i64) -> Resul
             continue;
         }
         let Some(n) = local else {
-            // new to us: insert with empty content; full_sync-style content
-            // fill covers it on the next full sync, and the pull below
-            // (Content='' row) is fetched by the content phase of a later
-            // full sync. ponytail: incr never downloads content here.
+            // new to us: insert with empty content; the content phase of
+            // this same incr round picks it up via notes_needing_content.
             store
                 .apply_sync_notes(std::slice::from_ref(row), now)
                 .map_err(db_err)?;
@@ -1380,9 +1489,10 @@ fn apply_incr_notes(store: &Store, rows: &[Value], api: &Api, now: i64) -> Resul
             }
         } else {
             store.apply_note_metadata(row, now).map_err(db_err)?;
+            updated.push((server_id, str_field(row, "Title")));
         }
     }
-    Ok(())
+    Ok(updated)
 }
 
 fn apply_notebooks(store: &Store, rows: &[Value], now: i64) -> rusqlite::Result<()> {
@@ -1470,8 +1580,12 @@ impl Store {
 
     /// One chunk of `note/getSyncNotes` rows, as `deleteNoteForce`/
     /// `addNoteForce`/`updateNoteForce`. Content stays empty here; the
-    /// content phase fills it (`InitSync` in JS). Update keeps the local
-    /// CreatedTime/UpdatedTime, like JS (`delete note['UpdatedTime']`).
+    /// content phase fills it (`InitSync` in JS). On update the local row
+    /// gets `Content=''` too — a full sync is a convergence tool (login and
+    /// force-from-server), so an existing body must be re-downloaded, not
+    /// kept (that kept server-side edits invisible until re-login).
+    /// UpdatedTime comes from the server row so "Recent" ordering matches
+    /// the server; CreatedTime stays local, like JS.
     pub fn apply_sync_notes(&self, rows: &[Value], now: i64) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for row in rows {
@@ -1507,7 +1621,8 @@ impl Store {
                     IsMarkdown=excluded.IsMarkdown, IsTrash=excluded.IsTrash,
                     IsBlog=excluded.IsBlog,
                     Usn=excluded.Usn, IsDirty=0, LocalIsNew=0, LocalIsDelete=0,
-                    ServerNoteId=excluded.ServerNoteId",
+                    ServerNoteId=excluded.ServerNoteId, Content='',
+                    UpdatedTime=excluded.UpdatedTime",
                 params![
                     server_id,
                     self.user_id,
@@ -1554,6 +1669,29 @@ impl Store {
         tx.commit()
     }
 
+    /// Stale-body repair: from a `getSyncNotes` chunk, the (sid, title)
+    /// pairs whose local row is clean (not dirty) but carries an older
+    /// UpdatedTime than the server row — the signature of the pre-fix
+    /// metadata-only pull. Usn equality is NOT enough: those rows got the
+    /// new Usn without the new body.
+    pub fn stale_bodies(&self, rows: &[Value]) -> rusqlite::Result<Vec<(String, String, i64)>> {
+        let mut out = Vec::new();
+        for row in rows {
+            let sid = str_field(row, "NoteId");
+            if sid.is_empty() || bool_field(row, "IsDeleted") {
+                continue;
+            }
+            let srv_upd = go_now_ms(row.get("UpdatedTime"), 0);
+            let Ok(Some(n)) = self.note_by_server_id(&sid) else {
+                continue;
+            };
+            if !n.is_dirty && n.updated_time < srv_upd {
+                out.push((sid, n.title, srv_upd));
+            }
+        }
+        Ok(out)
+    }
+
     /// Server note ids whose local row still has no content.
     pub fn notes_needing_content(&self) -> rusqlite::Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
@@ -1573,6 +1711,31 @@ impl Store {
     ) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE notes SET Content=?2, \"Desc\"=?3, Abstract=?4 WHERE ServerNoteId=?1",
+            params![
+                server_note_id,
+                content,
+                crate::plain_desc(content),
+                content.chars().take(500).collect::<String>(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// JS `updateNoteContentForce`, optionally stamping the server row's
+    /// UpdatedTime so a repaired row also moves in "Recent".
+    pub fn set_note_content_ut_by_server_id(
+        &self,
+        server_note_id: &str,
+        content: &str,
+        updated_time: Option<i64>,
+    ) -> rusqlite::Result<()> {
+        let ut = updated_time
+            .map(|v| format!(", UpdatedTime={v}"))
+            .unwrap_or_default();
+        self.conn.execute(
+            &format!(
+                "UPDATE notes SET Content=?2, \"Desc\"=?3, Abstract=?4{ut} WHERE ServerNoteId=?1"
+            ),
             params![
                 server_note_id,
                 content,
@@ -1905,7 +2068,9 @@ impl Store {
     }
 
     /// Metadata-only note update (JS `updateNoteForce(note, false)`), keeps
-    /// local Content/CreatedTime/UpdatedTime.
+    /// local Content/CreatedTime. UpdatedTime DOES come from the server row:
+    /// "Recent" is `ORDER BY UpdatedTime DESC`, so keeping the local stamp
+    /// left a server-edited note parked at its old position forever.
     pub fn apply_note_metadata(&self, row: &Value, now: i64) -> rusqlite::Result<()> {
         let tags = match row.get("Tags") {
             Some(Value::Array(a)) => a
@@ -1918,7 +2083,8 @@ impl Store {
         };
         self.conn.execute(
             "UPDATE notes SET NotebookId=?2, Title=?3, Tags=?4, IsMarkdown=?5, IsTrash=?6,
-                Usn=?7, IsDirty=0, LocalIsNew=0, LocalIsDelete=0, ServerNoteId=?8
+                Usn=?7, IsDirty=0, LocalIsNew=0, LocalIsDelete=0, ServerNoteId=?8,
+                UpdatedTime=?9
              WHERE ServerNoteId=?1",
             params![
                 str_field(row, "NoteId"),
@@ -1929,9 +2095,9 @@ impl Store {
                 bool_field(row, "IsTrash") as i64,
                 i64_field(row, "Usn"),
                 str_field(row, "NoteId"),
+                go_now_ms(row.get("UpdatedTime"), now),
             ],
         )?;
-        let _ = now;
         Ok(())
     }
 

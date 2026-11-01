@@ -280,11 +280,20 @@ impl World for NoteWorld<'_> {
     }
 }
 
-/// System fonts + typst-kit's embedded Libertinus/DejaVu fallback. `FontPath`
+/// WenKai (the UI font choice) + system fonts + typst-kit's embedded
+/// Libertinus/DejaVu fallback. The ttf lives in the data dir and is
+/// registered in-process for gpui (fonts.rs); Typst needs its own slot,
+/// pushed FIRST so the user's face wins per-glyph fallback. `FontPath`
 /// entries load lazily on first use, so the scan cost is paid once per
 /// process, not per font.
 static FONTS: LazyLock<typst_kit::fonts::FontStore> = LazyLock::new(|| {
     let mut store = typst_kit::fonts::FontStore::new();
+    if let Ok(bytes) = std::fs::read(crate::fonts::font_path(&crate::data_dir())) {
+        if let Some(f) = Font::new(Bytes::new(bytes), 0) {
+            let info = f.info().clone();
+            store.push((f, info));
+        }
+    }
     store.extend(typst_kit::fonts::system());
     store.extend(typst_kit::fonts::embedded());
     store

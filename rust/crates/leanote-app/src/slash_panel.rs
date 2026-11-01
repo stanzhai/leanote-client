@@ -11,7 +11,7 @@ use gpui_base::input::EditorState;
 use gpui_kit::component::Sizable;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    deferred, div, px, rgb, AnyElement, App, AvailableSpace, Bounds, Element, GlobalElementId,
+    deferred, div, px, AnyElement, App, AvailableSpace, Bounds, Element, GlobalElementId,
     InspectorElementId, IntoElement, KeyDownEvent, LayoutId, Pixels, Point, Size, Style,
     WeakEntity, Window,
 };
@@ -298,9 +298,10 @@ fn panel_div(
     viewport: Size<Pixels>,
     handlers: std::rc::Rc<SlashPanelHandlers>,
 ) -> AnyElement {
-    let border = if dark { rgb(0x333344) } else { rgb(0xd8dee4) };
-    let bg = if dark { rgb(0x1e1e2a) } else { rgb(0xffffff) };
-    let fg = if dark { rgb(0xe0e0ea) } else { rgb(0x1a1a1a) };
+    let border = crate::theme::border(dark);
+    // 与设置/历史对话框同一 popover 材质 + 圆角令牌（参考设置面板）
+    let bg = crate::theme::material(crate::theme::Material::Popover, dark);
+    let fg = crate::theme::foreground(dark);
     // 选中/hover 用强调色 + 白字，与常规菜单（MenuItem hover/selected）
     // 同一表现（用户需求 2）。
     let accent = crate::theme::accent();
@@ -346,7 +347,7 @@ fn panel_div(
     div()
         .w(px(w))
         .p(px(PAD))
-        .rounded(px(8.))
+        .rounded(px(crate::theme::RADIUS_PANEL))
         .bg(bg)
         .border_1()
         .border_color(border)

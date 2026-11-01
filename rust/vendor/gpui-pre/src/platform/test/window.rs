@@ -586,7 +586,8 @@ impl PlatformWindow for TestWindow {
     }
 
     fn start_window_move(&self) {
-        unimplemented!()
+        // Test windows have no OS drag loop; the app-side test hook counts
+        // the handoff, so a no-op keeps headless platforms from panicking.
     }
 
     fn can_start_external_drag(&self) -> bool {

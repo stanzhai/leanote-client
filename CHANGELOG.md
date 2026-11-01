@@ -1,6 +1,12 @@
 # 更新日志 / Changelog
 
 
+## 3.1.7（2026-11-01）
+
+- **修复：Windows 下霞鹜文楷等宽不生效（Issue 39）**：旧安装器把 ttf 写进 `~/Library/Fonts` —— 一个 Windows 根本不扫描的 macOS 路径（Windows 的用户字体需落 `%LOCALAPPDATA%\Microsoft\Windows\Fonts` 且在 HKCU `...\CurrentVersion\Fonts` 注册表登记，两者都没做）。根除而非补丁：ttf 下载一次进应用数据目录，启动时经 `TextSystem::add_fonts` **进程内注册**（DirectWrite 内存字体引用 / CoreText CGDataProvider / cosmic-text 三平台同构），当次启动即生效、无需重启，也不再触碰系统字体目录/注册表。首次运行后台下载完成后 live 注册并 `refresh_windows()` 重绘；本地 PDF 导出的 Typst 字体商店同步注入该 ttf（排在系统字体前，用户字体优先）。删除「重启后生效」提示（i18n `FontRestartHint`），设置页仅在下载中/失败时提示。
+
+- **窗口位置记忆完善（Issue 39）**：① 几何持久化不再只在窗口关闭钩子里 —— `observe_window_bounds`（移动/resize 均触发）防抖 500ms 落盘，⌘Q/崩溃/注销等不走 should-close 的退出路径不再丢最后一次位置；② 新增 `maximized` 字段，最大化关闭后下次启动恢复最大化（旧状态文件缺字段按普通窗口加载，serde default 兼容）；③ 显示器列表主屏排首：上次所在显示器已拔除时，`clamped()` 的回退居中落点固定为主屏幕（此前落 `displays.first()`，顺序无保证）。顺带清理 `start_window_drag` 里遗留的调试探针写入。
+
 ## 3.1.6（2026-11-01）
 
 - **修复：Windows 窗口控制按钮位置不对、点击失效（ADR-0011 修订）**：三层根因。① 自绘最小化/最大化/关闭按钮从左栏顶行右端（窗口左上角约 240px 处，违反 Windows 惯例）移到**根级 overlay，贴窗口最右上角**，登录/同步期（侧栏隐藏）也存在；每钮 `occlude()` 截断下方 Drag hitbox，点击恢复原生 `HTMINBUTTON`/`HTMAXBUTTON`/`HTCLOSE` 应答（旧布局按钮嵌在 Drag 区里被抢答成 HTCAPTION，点击只会拖窗口）。② 编辑器标题行整体曾是 Drag 区 → 标题输入与右侧工具钮（预览/帮助/更多）全部不可点；标题行改为纯 client 区，右端为 caption band 预留。③ **Windows 高 DPI 视口错位**（175% 实测）：创建窗口时 OS 的 DPI 上下文翻转（96↔168）使后端把物理像素尺寸记成逻辑尺寸——布局视口 1.75 倍于可见窗口，右 ~43% 界面画在窗外且鼠标永远点不到（工具钮「点击失效」的真实根因）。`main.rs win_dpi_resync` 启动时 Win32 实测 client 尺寸，`视口×scale ≠ 实际 client` 时以 ±2px `SetWindowPos` 强制 WM_SIZE 按当前 scale 重算（物理尺寸不变）；修复介入时退出几何按设备像素保存，跨启动窗口尺寸稳定。
@@ -14,6 +20,8 @@
 - **应用图标统一 + 去锯齿**：Windows exe 图标（`packaging/icon.ico`）与标题栏内嵌图标（`assets/app-icon.png`）改由 `gen-icons.sh` **同帧产出，128px 条目逐字节一致**；形态为不透明纯黑方块 + 白蚁形字标（用户裁决），边缘 LANCZOS 全灰阶抗锯齿（16px=68 级、32px=138 级灰度；此前阈值化 alpha 只有 0/255 二值边缘，小尺寸锯齿明显）。
 
 - 回归测试 +3：`win_controls_overlay_top_right_in_all_phases`（登录期/编辑期断言 overlay 贴右上角、工具钮避让 caption band、身份行在位，macOS 反断言）、`title_input_press_drag_triggers_window_drag`（2px 摆动不拖、40px 恰好交接一次、输入组件不吞监听）、`startup_restores_notebook_selection_and_last_note`（恢复语义）。leanote-app 102/102，ADR-0011 修订留痕。
+
+- **修复：Linux CI 测试崩溃（`title_input_press_drag_triggers_window_drag` panic "not implemented"）**：vendored `gpui-pre` 测试平台（`TestWindow`）的 `start_window_move` 是 `unimplemented!()`，而标题行拖拽测试在非 Windows 平台走 gpui 的 `start_window_move` 路径（macOS/Linux 无 WM_NCLBUTTONDOWN 交接）——macOS 本地同样复现，非 Linux 特有。改为无操作：headless 测试窗没有 OS 拖拽循环，计数由 app 侧 `BEGIN_DRAG_CALLS` 测试钩子完成，能证明「交接请求已发出」即可，真正的拖拽是 OS 手递手。
 
 ## 3.1.5（2026-10-30）
 

@@ -81,16 +81,16 @@ pub fn accent_foreground() -> Hsla {
 /// UI round 11 #2: no separate mono face — the editor binds to the UI
 /// font (sans_for) so the font pref applies everywhere at once.
 pub const SANS: &str = ".SystemUIFont";
-/// LXGW WenKai Mono (霞鹜文楷等宽): the user-installed CJK handwriting
-/// face. The family name CoreText publishes once the ttf lands in
-/// ~/Library/Fonts. Mono variant: CJK stays 2 cells wide, Latin/ASCII
-/// aligns — the right face for a note editor.
+/// LXGW WenKai Mono (霞鹜文楷等宽): the user-chosen CJK handwriting face,
+/// cached in the data dir and registered in-process by fonts.rs (all
+/// platforms). Mono variant: CJK stays 2 cells wide, Latin/ASCII aligns —
+/// the right face for a note editor.
 pub const WENKAI: &str = "LXGW WenKai Mono";
 
 /// UI font by prefs id: "" (default) → system sans, "wenkai-mono" →
 /// LXGW WenKai Mono ("wenkai" = the legacy non-mono id, still honored).
-/// Falls back to the system face when the ttf isn't installed yet — gpui
-/// resolves unknown families through the platform fallback chain.
+/// Falls back to the system face when the ttf hasn't been registered —
+/// gpui resolves unknown families through the platform fallback chain.
 pub fn sans_for(font_pref: &str) -> &'static str {
     if font_pref == "wenkai" || font_pref == "wenkai-mono" {
         WENKAI

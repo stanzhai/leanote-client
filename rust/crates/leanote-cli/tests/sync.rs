@@ -208,7 +208,10 @@ async fn rerun_is_idempotent_no_dup_rows_no_lost_content() {
     // re-run re-pulls everything but upserts in place
     assert_eq!(stats.notebooks, 4);
     assert_eq!(stats.notes, 451);
-    assert_eq!(stats.contents, 0, "content already present, not re-fetched");
+    assert_eq!(
+        stats.contents, 450,
+        "full re-sync re-downloads every body (JS InitSync)"
+    );
     let second = counts(&s);
     assert_eq!(first, second);
     let n = s
@@ -1371,4 +1374,145 @@ async fn content_fetch_500_names_note() {
         "endpoint+param: {err}"
     );
     assert!(err.contains("Note 100"), "note title: {err}");
+}
+
+// ---- server-side note edits must arrive locally (incr + forced full) ----
+
+/// Server edits a note (Usn+content+UpdatedTime advance) → the next incr
+/// sync pulls the new BODY and the server UpdatedTime, so the reader and
+/// the Recent ordering both match the server. This was the "本地显示同步
+/// 完成，服务端更新永不到达" bug: the pull used to rewrite metadata only.
+#[tokio::test(flavor = "multi_thread")]
+async fn incr_pull_brings_server_note_edits() {
+    let (srv, _dir, s, api) = synced("incr_server_edit").await;
+
+    let mut notes = srv.notes();
+    let row = notes
+        .iter_mut()
+        .find(|n| n["NoteId"].as_str().unwrap() == "note0042")
+        .unwrap();
+    row["Usn"] = json!(1002);
+    row["Title"] = json!("Note 42 (server edit)");
+    row["UpdatedTime"] = json!("2026-02-01T00:00:00Z");
+    srv.set_notes(notes);
+    let mut contents = srv.contents();
+    contents.insert("note0042".into(), json!("# Note 42\n\nserver rewrote this"));
+    srv.set_contents(contents);
+    srv.set_sync_usn(1002);
+
+    incr_sync(&api, &s, &NoProgress).unwrap();
+
+    let n = s
+        .note_by_server_id("note0042")
+        .unwrap()
+        .expect("row present");
+    assert_eq!(
+        n.content, "# Note 42\n\nserver rewrote this",
+        "body re-downloaded"
+    );
+    assert_eq!(n.title, "Note 42 (server edit)");
+    assert_eq!(n.usn, 1002);
+    // Server UpdatedTime adopted → the note leads the Recent list again.
+    assert_eq!(
+        s.list_notes_meta_recent(3).unwrap()[0].note_id,
+        leanote_core::Id(n.note_id.clone()),
+        "server-edited note is the most recent"
+    );
+}
+
+/// A re-run of full_sync is the "force from server" path: existing rows get
+/// their content reset by apply_sync_notes and re-downloaded even when the
+/// server Usn did NOT move again.
+#[tokio::test(flavor = "multi_thread")]
+async fn full_sync_redownloads_existing_note_bodies() {
+    let (srv, _dir, s, api) = synced("full_redownload").await;
+
+    let mut contents = srv.contents();
+    contents.insert(
+        "note0042".into(),
+        json!("# Note 42\n\nfresh full sync body"),
+    );
+    srv.set_contents(contents);
+
+    full_sync(&api, &s, &NoProgress).unwrap();
+
+    let n = s
+        .note_by_server_id("note0042")
+        .unwrap()
+        .expect("row present");
+    assert_eq!(n.content, "# Note 42\n\nfresh full sync body");
+    // Idempotent re-run stays converged.
+    full_sync(&api, &s, &NoProgress).unwrap();
+    let n = s.note_by_server_id("note0042").unwrap().unwrap();
+    assert_eq!(n.content, "# Note 42\n\nfresh full sync body");
+}
+
+/// `Api::get_note_histories`: server rows parse to (ms, content), and a
+/// server without history for the note answers `Ok:false` → Err (callers
+/// fall back to local history).
+#[tokio::test(flavor = "multi_thread")]
+async fn note_histories_from_server() {
+    let (srv, _dir, s, api) = synced("histories").await;
+    srv.set_histories(
+        "note0042",
+        vec![
+            json!({"UpdatedTime": "2026-03-01T10:00:00Z", "Content": "# v2"}),
+            json!({"UpdatedTime": "2026-03-01T09:00:00Z", "Content": "# v1"}),
+        ],
+    );
+    let rows = api.get_note_histories("note0042").unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].1, "# v2", "newest first");
+    assert_eq!(rows[0].0, days_from_civil_ms(2026, 3, 1) + 10 * 3_600_000);
+    // no history → Err (fake answers Ok:false like the upstream NewRe)
+    assert!(api.get_note_histories("notegone").is_err());
+    let _ = s; // store unused; keep the tuple destruct symmetric
+}
+
+fn days_from_civil_ms(y: i64, m: i64, d: i64) -> i64 {
+    // mirror of sync.rs days_from_civil (test-local, no pub export needed)
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe - 719_468) * 86_400_000
+}
+
+/// Stale-body repair: the cursor is level (server usn == local usn) but a
+/// row's body is old — the pre-fix client's signature. Startup incr sync
+/// must re-fetch it by rescanning the recent USN window, not report done.
+#[tokio::test(flavor = "multi_thread")]
+async fn incr_repairs_stale_bodies_when_cursor_level() {
+    let (srv, _dir, s, api) = synced("stale_repair").await;
+
+    // Simulate the legacy damage: advance the row's Usn to the server's but
+    // keep an OLD body and OLD UpdatedTime (metadata-only pull).
+    let mut notes = srv.notes();
+    let row = notes
+        .iter_mut()
+        .find(|n| n["NoteId"].as_str().unwrap() == "note0042")
+        .unwrap();
+    let srv_usn = row["Usn"].as_i64().unwrap();
+    s.raw_exec(&format!(
+        "UPDATE notes SET Content='# Note 42\n\nSTALE', UpdatedTime=1000, Usn={srv_usn}
+         WHERE NoteId='note0042'"))
+    .unwrap();
+    // Cursor level with the server: park both at the dataset max. The
+    // repair path must fire with server_usn == last.
+    let cursor = s.last_sync_usn().unwrap();
+    srv.set_sync_usn(cursor);
+    assert!(cursor >= srv_usn);
+
+    let stats = incr_sync(&api, &s, &NoProgress).unwrap();
+
+    let n = s.note_by_server_id("note0042").unwrap().expect("row present");
+    assert_eq!(n.content, "# Note 42\n\nbody 42", "stale body repaired");
+    assert!(
+        n.updated_time > 1000,
+        "server UpdatedTime adopted (Recent order), got {}",
+        n.updated_time
+    );
+    assert!(stats.contents >= 1, "repair fetched content, got {}", stats.contents);
 }

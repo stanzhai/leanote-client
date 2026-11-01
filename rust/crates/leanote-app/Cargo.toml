@@ -37,6 +37,9 @@ merman = { version = "0.9.2", default-features = false, features = ["all-diagram
 resvg = "0.46.0"
 usvg = { version = "0.46.0", default-features = false }
 knit-md-docx = "0.1.0"
+# History dialog: two-text unified patch for the kit Diff widget (same
+# version the kit itself vendors — already in Cargo.lock).
+similar = "2.7"
 
 
 # Windows-only Win32 calls for the high-DPI viewport resync (main.rs

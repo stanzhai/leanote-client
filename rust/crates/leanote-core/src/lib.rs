@@ -285,6 +285,11 @@ impl Store {
         self.conn.query_row(sql, [], |r| r.get(0))
     }
 
+    /// Raw statement exec for tests/tools.
+    pub fn raw_exec(&self, sql: &str) -> rusqlite::Result<usize> {
+        self.conn.execute(sql, [])
+    }
+
     /// All writes go through transactions — a kill mid-write leaves the
     /// previous state, never a torn one.
     pub fn add_note(&self, note: NewNote) -> rusqlite::Result<Note> {

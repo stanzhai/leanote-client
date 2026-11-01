@@ -46,7 +46,7 @@ pub struct Prefs {
     #[serde(default = "default_glass")]
     pub glass: String,
     /// UI font id: "" = system default, "wenkai-mono" = LXGW WenKai Mono
-    /// (needs the ttf installed into ~/Library/Fonts — see fonts.rs).
+    /// (ttf cached in the data dir, registered in-process — fonts.rs).
     #[serde(default)]
     pub font: String,
     /// Editor font size id (UI round 12): "" = regular (14px),
