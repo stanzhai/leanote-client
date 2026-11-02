@@ -385,6 +385,42 @@ fn set_note2blog_publishes_and_marks_dirty() {
 }
 
 #[test]
+fn incr_pull_metadata_carries_is_blog() {
+    let s = store("incrblog");
+    let n = add(&s, "A", "c", &[], "Inbox");
+    let clean_row = serde_json::json!({
+        "NoteId": n.note_id.to_string(),
+        "NotebookId": n.notebook_id.to_string(),
+        "Title": "A",
+        "Tags": [],
+        "IsMarkdown": true,
+        "IsTrash": false,
+        "IsDeleted": false,
+        "Usn": 1,
+    });
+    s.apply_sync_notes(&[clean_row], 0).unwrap();
+    // Server-side publish arrives via the incr-pull metadata path.
+    let published = serde_json::json!({
+        "NoteId": n.note_id.to_string(),
+        "NotebookId": n.notebook_id.to_string(),
+        "Title": "A",
+        "IsMarkdown": true,
+        "IsTrash": false,
+        "IsBlog": true,
+        "Usn": 2,
+        "UpdatedTime": {"$$date": 1774000000000i64},
+    });
+    s.apply_note_metadata(&published, 0).unwrap();
+    let meta = s
+        .list_notes_filtered(None, false)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.note_id == n.note_id)
+        .unwrap();
+    assert!(meta.is_blog);
+}
+
+#[test]
 fn trash_restore_hard_delete_and_empty() {
     let s = store("trashops");
     let keep = add(&s, "keep", "c", &[], "Inbox");

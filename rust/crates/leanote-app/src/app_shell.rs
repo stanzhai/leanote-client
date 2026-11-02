@@ -2088,9 +2088,14 @@ impl AppShell {
     fn logout_confirm_dialog(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
         let shell = cx.entity();
         let lang = self.lang;
+        // Dialog panels default to tokens.background, which the glass hack
+        // (apply_wake_theme) sets fully transparent — the card would show
+        // the window's frosted blur. Paint an opaque Popover surface here.
+        let dark = self.dark(cx);
         window.open_alert_dialog(cx, move |alert, _window, _cx| {
             let shell_ok = shell.clone();
             alert
+                .bg(theme::material(Material::Popover, dark))
                 .title(i18n::t(lang, i18n::Key::LogoutConfirmTitle))
                 .description(i18n::t(lang, i18n::Key::LogoutConfirmBody))
                 .show_cancel(true)
@@ -2896,7 +2901,17 @@ impl Render for AppShell {
                                 .size_range(px(MID_RANGE.0)..px(MID_RANGE.1))
                                 .visible(false),
                         )
-                        .child(resizable_panel().child(preview));
+                        // The 1120px preview column leaves gutters that
+                        // fall on the panel root — paint the full pane
+                        // opaque so the frosted window never shows through.
+                        .child(
+                            resizable_panel().child(
+                                gpui_kit::base::v_flex()
+                                    .size_full()
+                                    .bg(theme::material(Material::Background, dark))
+                                    .child(preview),
+                            ),
+                        );
                 } else {
                     self.full_preview = false;
                 }
@@ -6696,6 +6711,62 @@ mod tests {
                 "D deletes from the caret to the line end"
             );
             assert_eq!(content.read(cx).selected_range(), 2..2);
+        });
+
+        // I / A: insert at the first non-blank char / after the line's
+        // last char. Indented line 1 exercises the non-blank skip; the
+        // caret checks the entry offsets before anything is typed.
+        cx.update(|window, cx| {
+            content.update(cx, |state, cx| {
+                state.replace_all("  foo\n  bar", window, cx)
+            })
+        });
+        cx.update(|window, cx| {
+            shell_entity.update(cx, |shell, cx| {
+                shell.vim_key_down(&key("I"), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).selected_range(),
+                2..2,
+                "I enters insert at the first non-blank char"
+            );
+            assert!(!content.read(cx).block_cursor(), "I switches to insert");
+        });
+        cx.simulate_input("X");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).value(),
+                "  Xfoo\n  bar",
+                "I types at the first non-blank char"
+            );
+        });
+        cx.update(|window, cx| {
+            shell_entity.update(cx, |shell, cx| {
+                shell.vim_key_down(&key("A"), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).selected_range(),
+                6..6,
+                "A enters insert after the line's last char"
+            );
+        });
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                content.read(cx).value(),
+                "  Xfoo!\n  bar",
+                "A types at the line end"
+            );
         });
 
         // { / }: paragraph jumps between blank-line boundaries.

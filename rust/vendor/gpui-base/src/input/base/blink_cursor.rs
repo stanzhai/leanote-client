@@ -4,11 +4,11 @@ use instant::Duration;
 static INTERVAL: Duration = Duration::from_millis(500);
 static PAUSE_DELAY: Duration = Duration::from_millis(300);
 
-// On Windows, Linux, we should use integer to avoid blurry cursor.
-#[cfg(not(target_os = "macos"))]
+// leanote: Zed's bar caret — a flat 2 logical px on every platform, then
+// pixel-snapped to whole device pixels at paint (element.rs). The old
+// per-OS split (1.5 macOS / 2 Windows) rendered hairline-thin on macOS
+// and blurry-thick on Windows at fractional scales.
 pub(super) const CURSOR_WIDTH: Pixels = px(2.);
-#[cfg(target_os = "macos")]
-pub(super) const CURSOR_WIDTH: Pixels = px(1.5);
 
 /// To manage the Input cursor blinking.
 ///

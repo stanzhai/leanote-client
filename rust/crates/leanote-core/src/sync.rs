@@ -1129,6 +1129,9 @@ pub fn incr_sync(
                 for (sid, title, ut) in targets {
                     fetch_content(store, sid, title, Some(ut), api, progress, &mut stats);
                 }
+                // Same walk repairs blog flags the Usn delta never carries
+                // (server publish without a Usn bump).
+                repair_blog_flags(store, &rows, now_ms())?;
                 if (rows.len() as i64) < MAX_ENTRY {
                     break;
                 }
@@ -1469,6 +1472,11 @@ fn apply_incr_notes(
             continue;
         };
         if i64_field(row, "Usn") == n.usn {
+            // Blog publish on the server may not bump the note Usn; the
+            // flag must still converge instead of being skipped forever.
+            if !n.is_dirty && bool_field(row, "IsBlog") != n.is_blog {
+                store.apply_note_metadata(row, now).map_err(db_err)?;
+            }
             continue;
         }
         if n.is_dirty {
@@ -1492,7 +1500,24 @@ fn apply_incr_notes(
             updated.push((server_id, str_field(row, "Title")));
         }
     }
+
     Ok(updated)
+}
+
+/// Cursor-level repair pass: for clean local rows whose IsBlog disagrees
+/// with the server row, apply the server metadata. Publish without a Usn
+/// bump never enters the delta path, so this walk is the only carrier.
+fn repair_blog_flags(store: &Store, rows: &[Value], now: i64) -> Result<(), SyncError> {
+    for row in rows {
+        let sid = str_field(row, "NoteId");
+        let Ok(Some(n)) = store.note_by_server_id(&sid) else {
+            continue;
+        };
+        if !n.is_dirty && bool_field(row, "IsBlog") != n.is_blog {
+            store.apply_note_metadata(row, now).map_err(db_err)?;
+        }
+    }
+    Ok(())
 }
 
 fn apply_notebooks(store: &Store, rows: &[Value], now: i64) -> rusqlite::Result<()> {
@@ -2084,7 +2109,7 @@ impl Store {
         self.conn.execute(
             "UPDATE notes SET NotebookId=?2, Title=?3, Tags=?4, IsMarkdown=?5, IsTrash=?6,
                 Usn=?7, IsDirty=0, LocalIsNew=0, LocalIsDelete=0, ServerNoteId=?8,
-                UpdatedTime=?9
+                UpdatedTime=?9, IsBlog=?10
              WHERE ServerNoteId=?1",
             params![
                 str_field(row, "NoteId"),
@@ -2096,6 +2121,7 @@ impl Store {
                 i64_field(row, "Usn"),
                 str_field(row, "NoteId"),
                 go_now_ms(row.get("UpdatedTime"), now),
+                bool_field(row, "IsBlog") as i64,
             ],
         )?;
         Ok(())

@@ -3270,7 +3270,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 } else {
                     editor_style.caret
                 };
-                window.paint_quad(fill(cursor_info.bounds, color));
+                // leanote: Zed snaps the caret quad to whole device pixels —
+                // a fractional-scale unsnapped bar paints thin/blurry.
+                window.paint_quad(fill(window.pixel_snap_bounds(cursor_info.bounds), color));
             }
         }
 

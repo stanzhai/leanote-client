@@ -153,7 +153,9 @@ impl InputEditorStyle {
             background: or(self.background, colors.surface),
             border: or(self.border, colors.border),
             selection,
-            caret: or(self.caret, foreground),
+            // leanote: the caret paints in the accent (Zed-style), not ink —
+            // the app token carries the user accent (Wake blue default).
+            caret: or(self.caret, colors.accent),
             ..self.clone()
         }
     }
@@ -199,9 +201,8 @@ mod tests {
     fn an_unprojected_style_takes_its_ink_from_the_palette() {
         let tokens = dark();
         let resolved = InputEditorStyle::default().resolved(&tokens);
-
+        assert_eq!(resolved.caret, tokens.colors.accent);
         assert_eq!(resolved.foreground, tokens.colors.foreground);
-        assert_eq!(resolved.caret, tokens.colors.foreground);
         assert_eq!(resolved.muted_foreground, tokens.colors.muted_foreground);
         assert_eq!(resolved.background, tokens.colors.surface);
         assert_eq!(resolved.border, tokens.colors.border);

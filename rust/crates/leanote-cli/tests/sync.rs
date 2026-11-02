@@ -153,6 +153,34 @@ async fn login_sends_real_macaddr_and_version() {
     assert_eq!(v, leanote_core::sync::client_version());
 }
 
+/// Server publishes a note to the blog WITHOUT bumping its Usn (leanote
+/// setNote2Blog behavior). The delta path skips equal-Usn rows, so only the
+/// cursor-level repair walk converges the local IsBlog flag.
+#[tokio::test(flavor = "multi_thread")]
+async fn blog_flag_converges_without_usn_bump() {
+    let srv = seeded().await;
+    let dir = tmpdir("blogflag");
+    let s = store(&dir);
+    let acct = Api::login(&srv.url(), EMAIL, PWD, &s).unwrap();
+    full_sync(&Api::for_account(&acct), &s, &NoProgress).unwrap();
+    let is_blog = |s: &Store| {
+        s.raw_query_row("SELECT IsBlog FROM notes WHERE ServerNoteId='note0000'")
+            .unwrap()
+    };
+    assert_eq!(is_blog(&s), 0);
+
+    // Publish on the server: same Usn, same UpdatedTime — only IsBlog moves.
+    let (nb, mut n, t, c) = dataset();
+    n[0]["IsBlog"] = json!(true);
+    srv.set_notebooks(nb);
+    srv.set_notes(n);
+    srv.set_tags(t);
+    srv.set_contents(c);
+
+    leanote_core::sync::incr_sync(&Api::for_account(&acct), &s, &NoProgress).unwrap();
+    assert_eq!(is_blog(&s), 1, "blog flag must arrive without a Usn bump");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn full_sync_dataset_parity_and_last_sync_usn() {
     let srv = seeded().await;
@@ -1497,7 +1525,8 @@ async fn incr_repairs_stale_bodies_when_cursor_level() {
     let srv_usn = row["Usn"].as_i64().unwrap();
     s.raw_exec(&format!(
         "UPDATE notes SET Content='# Note 42\n\nSTALE', UpdatedTime=1000, Usn={srv_usn}
-         WHERE NoteId='note0042'"))
+         WHERE NoteId='note0042'"
+    ))
     .unwrap();
     // Cursor level with the server: park both at the dataset max. The
     // repair path must fire with server_usn == last.
@@ -1507,12 +1536,19 @@ async fn incr_repairs_stale_bodies_when_cursor_level() {
 
     let stats = incr_sync(&api, &s, &NoProgress).unwrap();
 
-    let n = s.note_by_server_id("note0042").unwrap().expect("row present");
+    let n = s
+        .note_by_server_id("note0042")
+        .unwrap()
+        .expect("row present");
     assert_eq!(n.content, "# Note 42\n\nbody 42", "stale body repaired");
     assert!(
         n.updated_time > 1000,
         "server UpdatedTime adopted (Recent order), got {}",
         n.updated_time
     );
-    assert!(stats.contents >= 1, "repair fetched content, got {}", stats.contents);
+    assert!(
+        stats.contents >= 1,
+        "repair fetched content, got {}",
+        stats.contents
+    );
 }

@@ -44,6 +44,8 @@ powershell rust/scripts/package-windows.ps1 -Arch x64   # 需 makensis (NSIS)
 
 **macOS（需 Apple Developer Program，$99/年）：**
 
+通过执行`.scratch/mac-signing/wizard.sh`完成以下处理配置。
+
 1. 在 developer.apple.com 后台创建 `Developer ID Application` 证书并安装到钥匙串；
 2. 钥匙串访问中把证书 + 私钥导出为 `.p12`（设密码），`base64 -i cert.p12 | pbcopy`；
 3. 在 appleid.apple.com 创建 App 专用密码（公证用）；

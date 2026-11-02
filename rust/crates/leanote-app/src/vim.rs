@@ -115,6 +115,22 @@ pub enum Op {
     Yank,
     Change,
 }
+/// Where `EnterInsert` starts typing (`i`/`a`/`o`/`O`/`I`/`A`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertAt {
+    /// `i` — at the caret.
+    Caret,
+    /// `a` — after the caret's char (line-end boundary stays put).
+    Append,
+    /// `o` — new line below.
+    OpenBelow,
+    /// `O` — new line above.
+    OpenAbove,
+    /// `I` — first non-blank char of the line (line start when blank).
+    FirstNonBlank,
+    /// `A` — after the line's last char.
+    LineEnd,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum VimAction {
@@ -125,11 +141,10 @@ pub enum VimAction {
     /// `dd`/`yy`/`cc`. `usize::MAX` = current line (the machine does not
     /// track the cursor; the executor does).
     LineOp(Op, usize),
-    EnterInsert {
-        append: bool,
-        open_below: bool,
-        open_above: bool,
-    },
+    /// `i`/`a`/`o`/`O`/`I`/`A` — where insert mode starts. `FirstNonBlank`
+    /// is `I` (first non-blank of the line, line start if all blank) and
+    /// `LineEnd` is `A`.
+    EnterInsert(InsertAt),
     /// Esc from insert: block-select the char at the insert caret.
     EnterNormal,
     /// `v`.
@@ -317,26 +332,12 @@ impl VimState {
             "x" | "delete" => VimAction::Delete(DeleteOp::Char),
             "D" => VimAction::Delete(DeleteOp::ToLineEnd),
             "backspace" => VimAction::Move(Motion::Left),
-            "i" => VimAction::EnterInsert {
-                append: false,
-                open_below: false,
-                open_above: false,
-            },
-            "a" => VimAction::EnterInsert {
-                append: true,
-                open_below: false,
-                open_above: false,
-            },
-            "o" => VimAction::EnterInsert {
-                append: false,
-                open_below: true,
-                open_above: false,
-            },
-            "O" => VimAction::EnterInsert {
-                append: false,
-                open_below: false,
-                open_above: true,
-            },
+            "i" => VimAction::EnterInsert(InsertAt::Caret),
+            "a" => VimAction::EnterInsert(InsertAt::Append),
+            "I" => VimAction::EnterInsert(InsertAt::FirstNonBlank),
+            "A" => VimAction::EnterInsert(InsertAt::LineEnd),
+            "o" => VimAction::EnterInsert(InsertAt::OpenBelow),
+            "O" => VimAction::EnterInsert(InsertAt::OpenAbove),
             "v" => {
                 self.mode = VimMode::Visual; // anchor set by exec
                 self.visual_linewise = false;
@@ -509,6 +510,20 @@ fn para_backward(text: &Rope, row: usize) -> usize {
         }
     }
     text.line_start_offset(0)
+}
+
+/// Byte offset of the first non-blank char of `caret`'s line; the line
+/// start when the line is empty or blank-only (`^` and `I`).
+fn first_non_blank(text: &Rope, caret: usize) -> usize {
+    let (start, end) = line_range(text, row_of(text, caret));
+    let mut target = start;
+    for ch in text.slice(start..end).chars() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        target += ch.len_utf8();
+    }
+    target
 }
 
 /// Byte offset of the `col`-th char of `row`, clamped to the line end.
@@ -795,17 +810,7 @@ pub fn exec(
                 Motion::LineStart => line_start,
                 // `^`: first non-blank char; blank-only line falls back to
                 // the line start.
-                Motion::FirstNonBlank => {
-                    let (start, end) = (line_start, line_end);
-                    let mut target = start;
-                    for ch in text.slice(start..end).chars() {
-                        if !ch.is_whitespace() {
-                            break;
-                        }
-                        target += ch.len_utf8();
-                    }
-                    target
-                }
+                Motion::FirstNonBlank => first_non_blank(&text, caret),
                 Motion::LineEnd => prev_char(&text, line_end).max(line_start),
                 Motion::DocStart | Motion::DocEnd => {
                     let row = if *m == Motion::DocStart {
@@ -993,30 +998,34 @@ pub fn exec(
             cx.notify();
         }
 
-        VimAction::EnterInsert {
-            append,
-            open_below,
-            open_above,
-        } => {
-            let mut at = caret;
-            if *append {
-                let (_, line_end) = line_range(&text, row_of(&text, at));
-                at = next_char(&text, at).min(line_end).max(at);
+        VimAction::EnterInsert(at) => {
+            let at = *at;
+            let mut caret = caret;
+            match at {
+                InsertAt::Append => {
+                    let (_, line_end) = line_range(&text, row_of(&text, caret));
+                    caret = next_char(&text, caret).min(line_end).max(caret);
+                }
+                // `I`: first non-blank char; a blank-only line falls back
+                // to the line start.
+                InsertAt::FirstNonBlank => caret = first_non_blank(&text, caret),
+                InsertAt::LineEnd => caret = line_range(&text, row_of(&text, caret)).1,
+                _ => {}
             }
-            if *open_below || *open_above {
-                let row = row_of(&text, at);
-                let offset = if *open_below {
+            if matches!(at, InsertAt::OpenBelow | InsertAt::OpenAbove) {
+                let row = row_of(&text, caret);
+                let offset = if at == InsertAt::OpenBelow {
                     line_range(&text, row).1 // before the `\n`
                 } else {
                     line_range(&text, row).0
                 };
                 goto(state, offset, cx);
                 state.insert("\n", window, cx);
-                if *open_above {
+                if at == InsertAt::OpenAbove {
                     goto(state, offset, cx); // caret on the new upper line
                 }
             } else {
-                goto(state, at, cx);
+                goto(state, caret, cx);
             }
             state.set_block_cursor(false, cx); // insert mode: thin caret only
             vim.mode = VimMode::Insert;
@@ -1304,42 +1313,18 @@ mod tests {
     #[test]
     fn insert_entry_and_exit() {
         let mut v = VimState::new();
-        assert_eq!(
-            run(&mut v, "i"),
-            VimAction::EnterInsert {
-                append: false,
-                open_below: false,
-                open_above: false
-            }
-        );
-        v.set_mode(VimMode::Insert);
-        v.set_mode(VimMode::Normal);
-        assert_eq!(
-            run(&mut v, "a"),
-            VimAction::EnterInsert {
-                append: true,
-                open_below: false,
-                open_above: false
-            }
-        );
-        v.set_mode(VimMode::Normal);
-        assert_eq!(
-            run(&mut v, "o"),
-            VimAction::EnterInsert {
-                append: false,
-                open_below: true,
-                open_above: false
-            }
-        );
-        v.set_mode(VimMode::Normal);
-        assert_eq!(
-            run(&mut v, "O"),
-            VimAction::EnterInsert {
-                append: false,
-                open_below: false,
-                open_above: true
-            }
-        );
+        for (key, at) in [
+            ("i", InsertAt::Caret),
+            ("a", InsertAt::Append),
+            ("I", InsertAt::FirstNonBlank),
+            ("A", InsertAt::LineEnd),
+            ("o", InsertAt::OpenBelow),
+            ("O", InsertAt::OpenAbove),
+        ] {
+            assert_eq!(run(&mut v, key), VimAction::EnterInsert(at));
+            v.set_mode(VimMode::Insert);
+            v.set_mode(VimMode::Normal);
+        }
     }
 
     #[test]

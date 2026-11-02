@@ -43,17 +43,21 @@ pub fn spacing(n: i32) -> Pixels {
 pub const RADIUS_PANEL: f32 = 12.;
 pub const RADIUS_SELECTION: f32 = 8.;
 
-/// Issue 19 Q13: user-selectable accents. "blue" is the ADR-0003 default.
+/// User-selectable accents, matching the macOS accent swatches (System
+/// Settings → Appearance): blue/purple/pink/red/orange/yellow/green, plus
+/// pure black. "blue" is the ADR-0003 default.
 pub const ACCENTS: &[(&str, u32)] = &[
-    ("blue", 0x3b82f6),
-    ("purple", 0x8b5cf6),
-    ("green", 0x22c55e),
-    ("orange", 0xf97316),
-    ("red", 0xef4444),
-    ("pink", 0xec4899),
+    ("blue", 0x0a84ff),
+    ("purple", 0xbf5af2),
+    ("pink", 0xff2d92),
+    ("red", 0xff453a),
+    ("orange", 0xff9f0a),
+    ("yellow", 0xffd60a),
+    ("green", 0x32d74b),
+    ("black", 0x000000),
 ];
 
-static CURRENT_ACCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3b82f6);
+static CURRENT_ACCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x0a84ff);
 
 /// Set the current accent by id; unknown ids (incl. "") fall back to blue.
 /// Callers re-apply the theme afterwards so derived colors update.
@@ -62,19 +66,29 @@ pub fn set_accent(id: &str) {
         .iter()
         .find(|(k, _)| *k == id)
         .map(|(_, v)| *v)
-        .unwrap_or(0x3b82f6);
+        .unwrap_or(0x0a84ff);
     CURRENT_ACCENT.store(hex, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The active accent color (Wake blue by default) — selection + actions only.
+/// The active accent color (macOS blue by default) — selection + actions only.
 pub fn accent() -> Hsla {
     gpui_kit::rgb(CURRENT_ACCENT.load(std::sync::atomic::Ordering::Relaxed)).into()
 }
 
-/// Foreground color that stays legible on `accent()` (all six are mid-lightness;
-/// white wins for every swatch).
+fn accent_luminance() -> f32 {
+    let hex = CURRENT_ACCENT.load(std::sync::atomic::Ordering::Relaxed);
+    let [r, g, b] = [(hex >> 16) & 0xff, (hex >> 8) & 0xff, hex & 0xff];
+    (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.
+}
+
+/// Foreground that stays legible on `accent()`: bright accents
+/// (yellow/green/orange/graphite) get black, the rest white.
 pub fn accent_foreground() -> Hsla {
-    hsla(0., 0., 1., 1.)
+    if accent_luminance() > 0.55 {
+        hsla(0., 0., 0., 1.)
+    } else {
+        hsla(0., 0., 1., 1.)
+    }
 }
 
 /// Sans follows the system (".SystemUIFont" = SF Pro on macOS).
@@ -169,6 +183,30 @@ mod tests {
         // UI round 12: ui() expresses a px design length as rems of the
         // 14px base rem, so it scales with theme.font_size (14 × zoom).
         assert_eq!(ui(14.), gpui_kit::rems(1.).into());
+    }
+
+    #[test]
+    fn accent_foreground_contrast() {
+        // Bright accents get black text, the rest (incl. pure black) white.
+        // Restores blue so the global default holds for later tests.
+        for (id, expect_black) in [
+            ("blue", false),
+            ("purple", false),
+            ("pink", false),
+            ("red", false),
+            ("orange", true),
+            ("yellow", true),
+            ("green", true),
+            ("black", false),
+        ] {
+            set_accent(id);
+            assert_eq!(
+                accent_foreground().l,
+                if expect_black { 0. } else { 1. },
+                "{id}"
+            );
+        }
+        set_accent("blue");
     }
 
     fn lum(hex: &str) -> f32 {

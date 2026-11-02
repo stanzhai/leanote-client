@@ -1,11 +1,17 @@
 # 更新日志 / Changelog
 
 
+
+## 3.1.8（2026-11-02）
+
+- **文本光标粗细与颜色（对齐 Zed）**：① 粗细——vendored 输入组件的光标宽度此前按系统分裂（macOS 1.5px / Windows 2px 逻辑像素，且绘制不做像素对齐），macOS 视觉过细、Windows 在 125%/150% 缩放下渲染发虚偏粗；现采用 Zed 的做法：全平台统一 2 逻辑像素 + 绘制时 `pixel_snap_bounds` 对齐到整数设备像素（细而清晰、跨平台一致）。② 颜色——光标由正文前景色改为**强调色**（`tokens.colors.accent`，即用户可选的 Wake 强调色，默认蓝），vim 块状光标同步变为强调色 45% 透明覆盖。
 ## 3.1.7（2026-11-01）
 
 - **修复：Windows 下霞鹜文楷等宽不生效（Issue 39）**：旧安装器把 ttf 写进 `~/Library/Fonts` —— 一个 Windows 根本不扫描的 macOS 路径（Windows 的用户字体需落 `%LOCALAPPDATA%\Microsoft\Windows\Fonts` 且在 HKCU `...\CurrentVersion\Fonts` 注册表登记，两者都没做）。根除而非补丁：ttf 下载一次进应用数据目录，启动时经 `TextSystem::add_fonts` **进程内注册**（DirectWrite 内存字体引用 / CoreText CGDataProvider / cosmic-text 三平台同构），当次启动即生效、无需重启，也不再触碰系统字体目录/注册表。首次运行后台下载完成后 live 注册并 `refresh_windows()` 重绘；本地 PDF 导出的 Typst 字体商店同步注入该 ttf（排在系统字体前，用户字体优先）。删除「重启后生效」提示（i18n `FontRestartHint`），设置页仅在下载中/失败时提示。
 
 - **窗口位置记忆完善（Issue 39）**：① 几何持久化不再只在窗口关闭钩子里 —— `observe_window_bounds`（移动/resize 均触发）防抖 500ms 落盘，⌘Q/崩溃/注销等不走 should-close 的退出路径不再丢最后一次位置；② 新增 `maximized` 字段，最大化关闭后下次启动恢复最大化（旧状态文件缺字段按普通窗口加载，serde default 兼容）；③ 显示器列表主屏排首：上次所在显示器已拔除时，`clamped()` 的回退居中落点固定为主屏幕（此前落 `displays.first()`，顺序无保证）。顺带清理 `start_window_drag` 里遗留的调试探针写入。
+
+- **Vim 模式补齐 `I`/`A` 行首、行尾插入（Issue 40）**：NORMAL 模式下 Shift+i 在**行首第一个非空白字符**处进入插入（整行空白回落行首，与 `^` 同语义），Shift+a 在**行尾**进入插入；此前两键被当作未知键吞掉无动作。实现上将 `EnterInsert` 的三个布尔字段重构为 `InsertAt` 枚举（`i`/`a`/`o`/`O` 行为不变），`^` 的首个非空白计算抽为 `first_non_blank` 供 `I` 共用；visual 模式刻意不进（子集无 block-insert）。
 
 ## 3.1.6（2026-11-01）
 
