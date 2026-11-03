@@ -2,6 +2,10 @@
 
 
 
+## 3.1.10（2026-11-03）
+
+- **修复：CI macOS 签名第二轮失败（code object is not signed at all / In subcomponent: leanote-cli）**：签名循环按 glob 顺序先签主程序 `Leanote`——现代 `codesign` 把「签主程序」视同签整个 `.app`，会校验 `Contents/MacOS/` 下全部同级可执行文件，遇到尚未签名的 `leanote-cli` 即报错。改为先签辅助可执行文件（跳过主程序），`.app` 整体签名时自会签上主程序。本地以 ad-hoc 身份逐字执行新代码块验证：helper → bundle → `--verify --deep --strict` 全通过。
+
 ## 3.1.9（2026-11-03）
 
 - **修复：CI macOS 签名必败（SecKeychainItemImport: Unknown format in import）**：`package-macos.sh` 曾把证书写入 `mktemp` 生成的**无扩展名**临时文件再 `security import`；现代 macOS 的 `security import` 按文件扩展名判定格式，无 `.p12` 后缀时对完全合法的证书同样报 "Unknown format in import"——与 secret 内容损坏的报错一字不差，极具误导性。改为 `$(mktemp).p12`（本地实测：合法 p12 → `1 identity imported`；垃圾内容 → 仍报 Unknown format；openssl 默认参数生成的 p12 → 报 MAC verification failed）。`import` 失败时现按 security 的错误信息分类输出排查提示（secret 不是 .p12 的 base64 / 密码不符或 p12 需 legacy 参数 `-macalg sha1 -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES`），README「发布签名」补充 secret 本地自查命令。

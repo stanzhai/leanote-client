@@ -101,7 +101,12 @@ if [ -n "${MACOS_CERT_P12_BASE64:-}" ]; then
     exit 1
   fi
   echo "==> codesign (Developer ID, hardened runtime): $IDENTITY"
+  # Helper executables must be signed before the bundle: signing the main
+  # executable makes codesign validate all sibling code in Contents/MacOS,
+  # and glob order puts "Leanote" first (fails on unsigned leanote-cli).
+  # Bundle signing below signs the main executable itself.
   for BIN in "$APP/Contents/MacOS/"*; do
+    [ "$BIN" = "$APP/Contents/MacOS/$APP_NAME" ] && continue
     codesign --force --timestamp --options runtime --sign "$IDENTITY" "$BIN"
   done
   codesign --force --timestamp --options runtime --sign "$IDENTITY" "$APP"
