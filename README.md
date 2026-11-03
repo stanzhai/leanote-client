@@ -59,6 +59,8 @@ powershell rust/scripts/package-windows.ps1 -Arch x64   # 需 makensis (NSIS)
 | `APPLE_APP_SPECIFIC_PASSWORD` | App 专用密码 |
 | `APPLE_TEAM_ID` | 10 位 Team ID（会员后台 Membership 页） |
 
+自查（本地验证 secret 内容，不必跑 CI）：`printf '%s' "$MACOS_CERT_P12_BASE64" | base64 --decode | openssl pkcs12 -info -passin pass:'导出密码' -noout && echo OK`。
+
 **Windows（需代码签名证书）：**
 
 购买 OV/EV 证书并导出含私钥的 `.pfx`，base64 用 PowerShell：`[Convert]::ToBase64String([IO.File]::ReadAllBytes('cert.pfx'))`，配 2 个 Secrets：`WINDOWS_CERT_PFX_BASE64`、`WINDOWS_CERT_PASSWORD`。

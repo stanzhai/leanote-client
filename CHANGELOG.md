@@ -2,6 +2,10 @@
 
 
 
+## 3.1.9（2026-11-03）
+
+- **修复：CI macOS 签名必败（SecKeychainItemImport: Unknown format in import）**：`package-macos.sh` 曾把证书写入 `mktemp` 生成的**无扩展名**临时文件再 `security import`；现代 macOS 的 `security import` 按文件扩展名判定格式，无 `.p12` 后缀时对完全合法的证书同样报 "Unknown format in import"——与 secret 内容损坏的报错一字不差，极具误导性。改为 `$(mktemp).p12`（本地实测：合法 p12 → `1 identity imported`；垃圾内容 → 仍报 Unknown format；openssl 默认参数生成的 p12 → 报 MAC verification failed）。`import` 失败时现按 security 的错误信息分类输出排查提示（secret 不是 .p12 的 base64 / 密码不符或 p12 需 legacy 参数 `-macalg sha1 -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES`），README「发布签名」补充 secret 本地自查命令。
+
 ## 3.1.8（2026-11-02）
 
 - **文本光标粗细与颜色（对齐 Zed）**：① 粗细——vendored 输入组件的光标宽度此前按系统分裂（macOS 1.5px / Windows 2px 逻辑像素，且绘制不做像素对齐），macOS 视觉过细、Windows 在 125%/150% 缩放下渲染发虚偏粗；现采用 Zed 的做法：全平台统一 2 逻辑像素 + 绘制时 `pixel_snap_bounds` 对齐到整数设备像素（细而清晰、跨平台一致）。② 颜色——光标由正文前景色改为**强调色**（`tokens.colors.accent`，即用户可选的 Wake 强调色，默认蓝），vim 块状光标同步变为强调色 45% 透明覆盖。

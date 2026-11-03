@@ -75,13 +75,24 @@ if [ -n "${MACOS_CERT_P12_BASE64:-}" ]; then
   fi
   KC_PASS=$(openssl rand -hex 16)
   KC=leanote-build.keychain-db
-  CERT=$(mktemp)
+  # security import parses by file extension — a bare mktemp path fails
+  # with "Unknown format in import" even for a valid p12.
+  CERT=$(mktemp).p12
   printf '%s' "$MACOS_CERT_P12_BASE64" | base64 --decode >"$CERT"
   # Idempotent: a previous failed run may have left the keychain behind.
   security delete-keychain "$KC" >/dev/null 2>&1 || true
   security create-keychain -p "$KC_PASS" "$KC"
   security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed 's/^ *"//;s/" *$//' | tr '\n' ' ')
-  security import "$CERT" -k "$KC" -P "${MACOS_CERT_PASSWORD:-}" -T /usr/bin/codesign
+  # Fail with a diagnosis instead of bare SecKeychainItemImport errors:
+  # "Unknown format" = secret isn't base64 of a real .p12; "MAC verification
+  # failed" = wrong password, or p12 built by openssl with default (non-legacy)
+  # algorithms that macOS keychains reject.
+  if ! security import "$CERT" -k "$KC" -P "${MACOS_CERT_PASSWORD:-}" -T /usr/bin/codesign; then
+    echo "error: cert import failed —" >&2
+    echo "  Unknown format: MACOS_CERT_P12_BASE64 不是 .p12 的 base64（钥匙串访问导出的「证书+私钥」.p12，README「发布签名」）" >&2
+    echo "  MAC verification failed: MACOS_CERT_PASSWORD 不符，或 openssl 默认参数生成的 p12（需 -macalg sha1 -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES）" >&2
+    exit 1
+  fi
   security set-key-partition-list -S apple-tool:,apple: -k "$KC_PASS" "$KC"
   rm -f "$CERT"
   IDENTITY=$(security find-identity -v -p codesigning "$KC" | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -1)
