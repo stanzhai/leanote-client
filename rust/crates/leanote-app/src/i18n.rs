@@ -62,6 +62,7 @@ keys! {
         "note contents failed; recorded and retried next sync"
     ),
     SyncFailed => ("同步失败", "Sync failed"),
+    Syncing => ("正在同步…", "Syncing…"),
     // Shell: left nav (ADR-0003).
     NavRecent => ("最近", "Recent"),
     NavStarred => ("星标", "Starred"),
@@ -340,6 +341,7 @@ mod tests {
         Key::SyncSummaryTags,
         Key::SyncSummaryFailures,
         Key::SyncFailed,
+        Key::Syncing,
         Key::NavRecent,
         Key::NavStarred,
         Key::NavTrash,

@@ -1571,6 +1571,13 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
 }
 
 impl Window {
+    /// leanote: expose the platform window's insets (safe area / IME) so
+    /// embedded mobile shells can pad around system UI. Desktop backends
+    /// return defaults.
+    pub fn insets(&self) -> crate::WindowInsets {
+        self.platform_window.insets()
+    }
+
     pub(crate) fn new(
         handle: AnyWindowHandle,
         options: WindowOptions,

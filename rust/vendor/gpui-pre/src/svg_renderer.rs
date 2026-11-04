@@ -125,6 +125,11 @@ impl SvgRenderer {
         static SYSTEM_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
             let mut db = usvg::fontdb::Database::new();
             db.load_system_fonts();
+            // leanote: fontdb's system loader has no iOS backend (CoreText
+            // path is macos-only), so <text> in SVGs drops every glyph.
+            // iOS system fonts are world-readable — load the directory.
+            #[cfg(target_os = "ios")]
+            db.load_fonts_dir("/System/Library/Fonts");
             Arc::new(db)
         });
 

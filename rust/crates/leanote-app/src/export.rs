@@ -84,7 +84,7 @@ fn inline_mermaid(mut out: String) -> String {
             .replace("&gt;", ">")
             .replace("&quot;", "\"")
             .replace("&#39;", "'");
-        match crate::mermaid::render_svg(&src, false) {
+        match leanote_reader::mermaid::render_svg(&src, false) {
             Ok(svg) => {
                 // `max-width` keeps wide diagrams inside the article column.
                 let patched = svg.replacen("<svg ", "<svg style=\"max-width:100%\" ", 1);
@@ -429,7 +429,7 @@ pub fn safe_filename(title: &str) -> String {
 /// quotes/GFM tables/footnotes — the full set a note can carry. Rich-text
 /// notes go through the same HTML→Markdown bridge as the PDF export.
 pub fn note_to_docx(note: &Note) -> Result<Vec<u8>, String> {
-    let md = crate::browse::reader_markdown_src(&note.title, &note.content, note.is_markdown);
+    let md = leanote_reader::reader_markdown_src(&note.title, &note.content, note.is_markdown);
     // The title becomes the document's H1 (every export format anchors on
     // it). Angle brackets get backslash-escaped: as raw markdown they would
     // parse as inline HTML tags and pulldown-cmark would drop them (a note

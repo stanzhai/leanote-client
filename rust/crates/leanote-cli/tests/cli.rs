@@ -69,6 +69,45 @@ fn add_flags_stdin_without_c() {
 }
 
 #[test]
+fn add_reuses_active_account_aizha_not_fallback_user() {
+    // Regression: open_store hardcoded user1, so add created a second
+    // "AI札" under user1 instead of the signed-in account's notebook.
+    let d = datadir("acct-reuse");
+    let (_, _, code) = run(&d, &["list"], None);
+    assert_eq!(code, 0);
+    let c = rusqlite::Connection::open(d.join("leanote.db")).unwrap();
+    c.execute(
+        "INSERT INTO accounts (UserId, Email, Username, Host, Token, IsActive)
+         VALUES ('realuser1','a@b.c','a','https://h','t',1)",
+        [],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO notebooks (NotebookId, UserId, Title, ParentNotebookId, Seq, Usn, LocalIsNew, IsDirty, LocalIsDelete)
+         VALUES ('nbreal000000000000000001','realuser1','AI札','',0,5,0,0,0)",
+        [],
+    )
+    .unwrap();
+    drop(c);
+    let (out, err, code) = run(&d, &["add", "-t", "Acct note", "-c", "body"], None);
+    assert_eq!(code, 0, "stdout={} err={}", out, err);
+    assert_eq!(out, "Added: \"Acct note\" -> AI札\n");
+    let c = rusqlite::Connection::open(d.join("leanote.db")).unwrap();
+    let nbs: i64 = c
+        .query_row("SELECT COUNT(*) FROM notebooks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(nbs, 1, "reuse the account's AI札, no second notebook");
+    let nb: String = c
+        .query_row(
+            "SELECT NotebookId FROM notes WHERE Title='Acct note'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(nb, "nbreal000000000000000001");
+}
+
+#[test]
 fn add_missing_title_or_content_errors_match_js() {
     // Derived from cmdAddInternal in leanote_cli.js
     let d = datadir("errs");

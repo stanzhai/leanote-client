@@ -15,6 +15,16 @@ use rusqlite::{params, OptionalExtension};
 
 pub const MAX_ENTRY: i64 = 200;
 
+/// Files contract for a note push (see [`note_files`]).
+#[derive(Default)]
+pub struct NoteFiles {
+    /// `Files` JSON attrs for every image the content references.
+    pub attrs: Vec<Value>,
+    /// Images whose bytes must still ride as `FileDatas[<LocalFileId>]`
+    /// multipart parts.
+    pub bodies: Vec<crate::ImageAttachment>,
+}
+
 /// API error. `Api` carries the server's own `{"Ok":false,"Msg":...}` string
 /// (e.g. "WrongPassword", "NOTLOGIN", "notExists"); `Unconnected` is the
 /// transport/JSON failure the JS client reports via `Web.unConnected()`.
@@ -271,10 +281,13 @@ impl Api {
             "note/getNoteContent",
             &params,
         )?;
-        Ok(v.get("Content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string())
+        // Server content arrives with image links absolutized by
+        // NoteService.FixContent (`<siteUrl>/api/file/getImage?fileId=`).
+        // Strip the host back to the server's own stored canonical RELATIVE
+        // form so local == server-stored, byte-identical and host-free.
+        Ok(normalize_server_content(
+            v.get("Content").and_then(Value::as_str).unwrap_or(""),
+        ))
     }
 
     /// GET `note/getHistories` → server-side content history rows
@@ -463,12 +476,13 @@ impl Api {
         tags: &[String],
         created: &str,
         updated: &str,
-        images: &[crate::ImageAttachment],
+        files: &NoteFiles,
     ) -> Result<Value, SyncError> {
+        let content = self.content_for_send(content);
         let mut form = vec![
             ("Title", title),
             ("NotebookId", notebook_server_id),
-            ("Content", content),
+            ("Content", content.as_str()),
             ("IsMarkdown", if is_markdown { "1" } else { "0" }),
             ("IsBlog", if is_blog { "1" } else { "0" }),
             ("CreatedTime", created),
@@ -477,11 +491,7 @@ impl Api {
         for t in tags {
             form.push(("Tags", t.as_str()));
         }
-        if images.is_empty() {
-            self.post_form("note/addNote", &[], &form)
-        } else {
-            self.post_note_multipart("note/addNote", &form, images)
-        }
+        self.post_note("note/addNote", &form, files)
     }
 
     pub fn update_note(
@@ -495,10 +505,11 @@ impl Api {
         tags: &[String],
         content: &str,
         updated: &str,
-        images: &[crate::ImageAttachment],
+        files: &NoteFiles,
     ) -> Result<Value, SyncError> {
         // JS always sends Content when ContentIsDirty; we have no such
         // column, so always send it.
+        let content = self.content_for_send(content);
         let usn_s = usn.to_string();
         let is_trash_s = if is_trash { "1" } else { "0" };
         let mut form = vec![
@@ -508,58 +519,82 @@ impl Api {
             ("Usn", usn_s.as_str()),
             ("IsTrash", is_trash_s),
             ("IsBlog", if is_blog { "1" } else { "0" }),
-            ("Content", content),
+            ("Content", content.as_str()),
             ("Abstract", ""),
             ("UpdatedTime", updated),
         ];
         for t in tags {
             form.push(("Tags", t.as_str()));
         }
-        if images.is_empty() {
-            self.post_form("note/updateNote", &[], &form)
-        } else {
-            self.post_note_multipart("note/updateNote", &form, images)
-        }
+        self.post_note("note/updateNote", &form, files)
     }
 
-    /// JS wire format for note pushes carrying image bodies: `Files` is the
-    /// JSON attribute array (src/note.js getFilesPostInfo), each dirty image
-    /// rides as a part named by its local file id (src/api.js FileDatas).
-    fn post_note_multipart(
+    /// JS `Note.fixNoteContentForSend`: local `leanote://` image links go
+    /// out as `{host}/api/file/getImage?fileId=` — the shape the server's
+    /// `fixPostNotecontent` regex matches, so it uploads the image parts
+    /// and rewrites the stored content to its own canonical RELATIVE form
+    /// `/api/file/getImage?fileId=<serverId>` (exactly what a web-uploaded
+    /// image looks like in stored content). Wire-only: the local DB keeps
+    /// `leanote://` until the push echo pulls the relative form back
+    /// (see [`normalize_server_content`]) — no host is ever stored, so a
+    /// server move changes nothing.
+    fn content_for_send(&self, content: &str) -> String {
+        content.replace(
+            "leanote://file/getImage",
+            &format!("{}/api/file/getImage", self.host),
+        )
+    }
+
+    /// JS wire format for note pushes with images (src/note.js
+    /// getFilesPostInfo + src/api.js FileDatas): `Files` is the JSON
+    /// attribute array for EVERY image the content references; each image
+    /// still lacking a server id rides as a multipart part named
+    /// `FileDatas[<LocalFileId>]` — the exact name the server's
+    /// `c.upload("FileDatas["+LocalFileId+"]")` looks up. Without bodies
+    /// needle posts urlencoded, so `Files` is a plain form field there.
+    fn post_note(
         &self,
         path: &str,
         form: &[(&str, &str)],
-        images: &[crate::ImageAttachment],
+        files: &NoteFiles,
     ) -> Result<Value, SyncError> {
-        let files = serde_json::to_string(
-            &images
-                .iter()
-                .map(|i| {
-                    json!({
-                        "FileId": i.local_id.0,
-                        "LocalFileId": i.local_id.0,
-                        "Type": "image",
-                        "HasBody": true,
-                        "IsAttach": false,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+        if files.bodies.is_empty() {
+            if files.attrs.is_empty() {
+                return self.post_form(path, &[], form);
+            }
+            let files_json = serde_json::to_string(&files.attrs)
+                .map_err(|e| SyncError::Unconnected(e.to_string()))?;
+            let mut f = form.to_vec();
+            f.push(("Files", files_json.as_str()));
+            return self.post_form(path, &[], &f);
+        }
+        let files_json = serde_json::to_string(&files.attrs)
+            .map_err(|e| SyncError::Unconnected(e.to_string()))?;
         let mut mform = form.to_vec();
-        mform.push(("Files", files.as_str()));
+        mform.push(("Files", files_json.as_str()));
 
+        let names: Vec<String> = files
+            .bodies
+            .iter()
+            .map(|img| format!("FileDatas[{}]", img.local_id.0))
+            .collect();
+        let mut parts: Vec<ureq::unversioned::multipart::Part> = Vec::new();
+        for img in &files.bodies {
+            let fname = img.file_name.clone();
+            parts.push(
+                ureq::unversioned::multipart::Part::bytes(&img.bytes)
+                    .file_name(fname.as_str())
+                    .mime_str(&img.mime)
+                    .map_err(|e| SyncError::Unconnected(e.to_string()))?,
+            );
+        }
+        // Form borrows its part names; `names` must outlive the builder.
         let mut builder = ureq::unversioned::multipart::Form::new();
         for (k, v) in &mform {
             builder = builder.text(k, v);
         }
-        for img in images {
-            let fname = img.file_name.clone();
-            let part = ureq::unversioned::multipart::Part::bytes(&img.bytes)
-                .file_name(fname.as_str())
-                .mime_str(&img.mime)
-                .map_err(|e| SyncError::Unconnected(e.to_string()))?;
-            builder = builder.part(&img.local_id.0, part);
+        for (i, part) in parts.into_iter().enumerate() {
+            builder = builder.part(names[i].as_str(), part);
         }
         let mut resp = self
             .agent
@@ -635,7 +670,7 @@ pub fn mac_addr() -> String {
                 continue;
             }
             let family = (*ifa.ifa_addr).sa_family as i32;
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             let bytes = (family == libc::AF_LINK).then(|| {
                 let sdl = &*(ifa.ifa_addr as *const libc::sockaddr_dl);
                 let (nlen, alen) = (sdl.sdl_nlen as usize, sdl.sdl_alen as usize);
@@ -646,7 +681,7 @@ pub fn mac_addr() -> String {
                         .collect::<Vec<_>>()
                 })
             });
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             let bytes = (family == libc::AF_PACKET).then(|| {
                 let sll = &*(ifa.ifa_addr as *const libc::sockaddr_ll);
                 (sll.sll_halen as usize >= 6).then(|| sll.sll_addr[..6].to_vec())
@@ -951,22 +986,76 @@ fn check_need_incr_sync_again(
     Ok(())
 }
 
-/// Issue 21 需求9: images referenced by the note's markdown that have not
-/// been uploaded yet (empty ServerId) ride along with the note push.
-fn dirty_images(store: &Store, content: &str) -> Result<Vec<crate::ImageAttachment>, SyncError> {
-    let mut out = Vec::new();
+/// JS `Note.getFilesPostInfo` (src/note.js): `Files` must declare EVERY
+/// image the content references, not just new ones — never-uploaded ones
+/// (HasBody:true) ride as multipart bodies, already-uploaded ones carry
+/// FileId=ServerId + LocalFileId so the server rewrites their links in
+/// the stored content (ApiNoteController.fixPostNotecontent matches
+/// `<host>/api/file/getImage?fileId=<LocalFileId>` and swaps in FileId).
+/// Skipping the uploaded ones stores local-id URLs server-side → broken
+/// images there.
+fn note_files(store: &Store, content: &str) -> Result<NoteFiles, SyncError> {
+    let mut files = NoteFiles::default();
+    let mut seen = std::collections::HashSet::new();
     for id in Store::image_ids_in_content(content) {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
         if let Some(img) = store.get_image(&id).map_err(db_err)? {
-            if img.server_id.is_empty()
-                && !out
-                    .iter()
-                    .any(|i: &crate::ImageAttachment| i.local_id == img.local_id)
-            {
-                out.push(img);
+            if img.server_id.is_empty() {
+                files.attrs.push(json!({
+                    "FileId": "", "LocalFileId": img.local_id.0,
+                    "Type": "image", "HasBody": true, "IsAttach": false,
+                }));
+                files.bodies.push(img);
+            } else {
+                files.attrs.push(json!({
+                    "FileId": img.server_id, "LocalFileId": img.local_id.0,
+                    "Type": "image", "HasBody": false, "IsAttach": false,
+                }));
             }
         }
     }
-    Ok(out)
+    Ok(files)
+}
+
+/// Server pulls arrive with image links absolutized by NoteService.
+/// FixContent: `https?://<siteUrl>/api/file/getImage?fileId=`. The server's
+/// own STORED form is the relative `/api/file/getImage?fileId=` (what a
+/// web-uploaded image looks like) — strip the host so the local copy is
+/// byte-identical with the server-stored content and pins no address
+/// (server moves change nothing). Any http(s) host converts: only the id
+/// matters locally.
+pub fn normalize_server_content(content: &str) -> String {
+    const TAIL: &str = "/api/file/getImage?fileId=";
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(pos) = rest.find(TAIL) {
+        let head = &rest[..pos];
+        let scheme_start = head.rfind("http://").or_else(|| head.rfind("https://"));
+        let host_ok = match scheme_start {
+            Some(p) => {
+                let host = head[p..]
+                    .strip_prefix("http://")
+                    .or_else(|| head[p..].strip_prefix("https://"))
+                    .unwrap_or(&head[p..]);
+                !host.is_empty()
+                    && !host.contains(['/', '"', '\'', '(', ')'])
+                    && !host.chars().any(char::is_whitespace)
+            }
+            None => false,
+        };
+        if host_ok {
+            out.push_str(&head[..scheme_start.unwrap()]);
+            out.push_str(TAIL);
+        } else {
+            // relative link or prose — copy through this TAIL untouched
+            out.push_str(&rest[..pos + TAIL.len()]);
+        }
+        rest = &rest[pos + TAIL.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Issue 21 需求9: after a pull, note markdown may reference images whose
@@ -989,12 +1078,11 @@ pub fn pull_missing_images(api: &Api, store: &Store) -> Result<usize, SyncError>
                 continue;
             };
             let img = crate::ImageAttachment {
+                // The id a pulled link references is by definition a
+                // server id — record it as such so a later push declares
+                // it HasBody:false instead of re-uploading the bytes.
                 local_id: crate::Id(id.clone()),
-                server_id: if id.starts_with("srvimg") {
-                    id.clone()
-                } else {
-                    String::new()
-                },
+                server_id: id.clone(),
                 file_name: format!("{id}.png"),
                 mime,
                 size: bytes.len() as i64,
@@ -1313,7 +1401,7 @@ fn push_dirty_notes(
             .unwrap_or_else(|| nb_local.clone());
 
         if n.is_new && !n.is_trash && !n.is_deleted {
-            let images = dirty_images(store, &n.content)?;
+            let files = note_files(store, &n.content)?;
             let ret = api.add_note(
                 &nb_server,
                 &n.title,
@@ -1323,7 +1411,7 @@ fn push_dirty_notes(
                 &n.tags,
                 &fmt_datetime(n.created_time),
                 &fmt_datetime(n.updated_time),
-                &images,
+                &files,
             )?;
             if ok(&ret) {
                 let sid = str_field(&ret, "NoteId");
@@ -1352,7 +1440,7 @@ fn push_dirty_notes(
                     .map_err(db_err)?;
             }
         } else {
-            let images = dirty_images(store, &n.content)?;
+            let files = note_files(store, &n.content)?;
             let ret = api.update_note(
                 &server_note_id,
                 &nb_server,
@@ -1363,7 +1451,7 @@ fn push_dirty_notes(
                 &n.tags,
                 &n.content,
                 &fmt_datetime(n.updated_time),
-                &images,
+                &files,
             )?;
             if ok(&ret) {
                 let usn = i64_field(&ret, "Usn");

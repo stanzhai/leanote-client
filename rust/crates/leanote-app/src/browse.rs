@@ -82,19 +82,6 @@ pub fn note_meta(notebook: &str, updated_ms: i64) -> String {
 /// display only (ticket 12) — the store keeps the original content until
 /// the user runs Convert to Markdown. Plain-text content has no HTML tags,
 /// so it converts to itself unchanged.
-pub fn reader_markdown_src(title: &str, content: &str, is_markdown: bool) -> String {
-    if is_markdown {
-        content.to_string()
-    } else {
-        let body = leanote_core::html2md::html_to_markdown(content);
-        if body.trim().is_empty() {
-            format!("# {title}\n")
-        } else {
-            body
-        }
-    }
-}
-
 /// Ticket 11 follow-up: derive a drag-drop target from the flat nav list,
 /// porting zTree's drop bands (`jquery.ztree.all-3.5.js` 2899–2914): top
 /// quarter of the hovered row = insert before, bottom quarter = after,
@@ -193,31 +180,6 @@ fn parent_and_sibling_pos(nodes: &[NavNode], ix: usize, dragged: &str) -> (Strin
 /// appended: the server 500s private images for anonymous GETs, and the
 /// preview fetches them with its plain HTTP client (no session cookies).
 /// Tokens are hex, so no URL escaping is needed.
-pub fn resolve_note_images(content: &str, store: &leanote_core::Store) -> String {
-    let mut out = content.to_string();
-    for id in leanote_core::Store::image_ids_in_content(content) {
-        if let Some(img) = store.get_image(&id).ok().flatten() {
-            out = out.replace(
-                &format!("leanote://file/getImage?fileId={id}"),
-                &format!(
-                    "data:{};base64,{}",
-                    img.mime,
-                    crate::export::base64_encode(&img.bytes)
-                ),
-            );
-        }
-    }
-    if let Some(acct) = store.active_account().ok().flatten() {
-        if !acct.token.is_empty() && !acct.host.is_empty() {
-            let host = acct.host.trim_end_matches('/');
-            out = out.replace(
-                &format!("{host}/api/file/getImage?fileId="),
-                &format!("{host}/api/file/getImage?token={}&fileId=", acct.token),
-            );
-        }
-    }
-    out
-}
 
 #[cfg(test)]
 mod tests {
@@ -347,72 +309,6 @@ mod tests {
         assert_eq!(note_meta("", 1_765_235_200_000), "2025-12-08");
     }
 
-    #[test]
-    fn reader_markdown_passthrough_and_conversion() {
-        let src = "# T\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n~~gone~~";
-        assert_eq!(reader_markdown_src("T", src, true), src);
-        // Rich text converts to Markdown for display, never fenced.
-        let rich = reader_markdown_src("T", "<h2>H</h2><p><strong>b</strong></p>", false);
-        assert!(rich.contains("## H"), "{rich}");
-        assert!(rich.contains("**b**"), "{rich}");
-        assert!(!rich.contains("```"), "{rich}");
-        // Plain text (no tags) survives as a paragraph: htmd treats the
-        // blank line as a soft break, both lines stay legible.
-        let plain = reader_markdown_src("T", "line1\n\nline2", false);
-        assert!(
-            plain.contains("line1") && plain.contains("line2"),
-            "{plain}"
-        );
-        // Empty rich body falls back to the title so the pane isn't blank.
-        assert_eq!(reader_markdown_src("T", "   ", false), "# T\n");
-    }
 
-    #[test]
-    fn resolve_note_images_swaps_known_ids_only() {
-        let dir = std::env::temp_dir().join(format!("lt-img-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = leanote_core::Store::open(dir.clone(), "u1".into()).unwrap();
-        store
-            .insert_image(&leanote_core::ImageAttachment {
-                local_id: leanote_core::Id("imgaaaaaaaaaaaaaaaaaaaa1".into()),
-                server_id: String::new(),
-                file_name: "a.png".into(),
-                mime: "image/png".into(),
-                bytes: vec![1, 2, 3],
-                size: 3,
-                created_time: 0,
-            })
-            .unwrap();
-        let md = "![a](leanote://file/getImage?fileId=imgaaaaaaaaaaaaaaaaaaaa1)\n![miss](leanote://file/getImage?fileId=zzz)";
-        let out = resolve_note_images(md, &store);
-        assert!(out.starts_with("![a](data:image/png;base64,"), "{out}");
-        assert!(out.contains("leanote://file/getImage?fileId=zzz"), "{out}");
-        std::fs::remove_dir_all(&dir).ok();
-    }
 
-    #[test]
-    fn resolve_note_images_appends_token_to_remote_links() {
-        let dir = std::env::temp_dir().join(format!("lt-imgtok-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = leanote_core::Store::open(dir.clone(), "u1".into()).unwrap();
-        store
-            .upsert_account(&leanote_core::Account {
-                user_id: "u1".into(),
-                email: String::new(),
-                username: String::new(),
-                host: "https://h.example".into(),
-                token: "abc123".into(),
-                is_active: true,
-            })
-            .unwrap();
-        let md = "![a](https://h.example/api/file/getImage?fileId=abc)\n\
-                  ![b](https://other.example/api/file/getImage?fileId=abc)";
-        let out = resolve_note_images(md, &store);
-        assert_eq!(
-            out,
-            "![a](https://h.example/api/file/getImage?token=abc123&fileId=abc)\n\
-             ![b](https://other.example/api/file/getImage?fileId=abc)"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
 }

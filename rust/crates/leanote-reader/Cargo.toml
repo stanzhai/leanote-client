@@ -1,0 +1,20 @@
+[package]
+name = "leanote-reader"
+version = "3.1.0"
+edition = "2021"
+publish = false
+
+# 阅读渲染管线（markdown/HTML→md、图片解析、Mermaid），桌面与移动端
+# 共享（issue 05 从 leanote-app 搬出，桌面改 import，不复制第二份）。
+
+[dependencies]
+leanote-core = { path = "../leanote-core" }
+gpui-base = { version = "0.7.3" }
+gpui-kit = { version = "0.7.3" }
+markdown = "1"
+serde_json = "1"
+typst-kit = { version = "0.15.1", features = ["scan-fonts", "embedded-fonts"] }
+resvg = "0.46.0"
+base64 = "0.22"
+merman = { version = "0.9.2", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape"] }
+usvg = { version = "0.46.0", default-features = false }

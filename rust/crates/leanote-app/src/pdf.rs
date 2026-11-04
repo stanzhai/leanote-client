@@ -64,7 +64,7 @@ fn blocks(children: &[Node], out: &mut String) {
                 // bytes so no virtual file is needed. Parse failure falls
                 // through to the code block below (ADR-0011).
                 if c.lang.as_deref() == Some("mermaid") {
-                    match crate::mermaid::render_svg(&c.value, false) {
+                    match leanote_reader::mermaid::render_svg(&c.value, false) {
                         Ok(svg) => {
                             out.push_str(&format!(
                                 "#image(bytes(({})), format: \"svg\", width: 100%)\n\n",

@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 leanote-core = { path = "../leanote-core" }
+leanote-reader = { path = "../leanote-reader" }
 gpui-base = { version = "0.7.3" }
 leanote-fakeserver = { path = "../../fake-server" }
 gpui-kit = { version = "0.7.3", features = [
@@ -33,9 +34,7 @@ typst-layout = "0.15.1"
 # Local PDF export: system fonts first (CJK via OS font dirs), embedded
 # Libertinus/DejaVu as guaranteed fallback.
 typst-kit = { version = "0.15.1", features = ["scan-fonts", "embedded-fonts"] }
-merman = { version = "0.9.2", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape"] }
 resvg = "0.46.0"
-usvg = { version = "0.46.0", default-features = false }
 knit-md-docx = "0.1.0"
 # History dialog: two-text unified patch for the kit Diff widget (same
 # version the kit itself vendors — already in Cargo.lock).

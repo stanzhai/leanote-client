@@ -1,6 +1,13 @@
 # 更新日志 / Changelog
 
 
+## 3.1.11（2026-11-04）
+
+- **修复：大陆无法下载霞鹜文楷等宽**：字体 ttf 此前仅从 GitHub Releases 直链下载，大陆访问 GitHub/objects.githubusercontent.com 常不通导致设置选了字体却始终回退系统字体。改为按序尝试三个同源地址：GitHub 直链 → ghfast.top → gh-proxy.com（均为 GitHub release 加速代理，字节级同源，魔数校验防代理返回 HTML 错误页）；实测死首链后经 ghfast.top 成功取回 25,957,300 字节 ttf。jsDelivr 因 20MB 文件上限（该字体 25.9MB）不可用，清华/南大镜像站未收录此项目。
+- **主题体系移植 Navop：6 个硬编码家族 → 39 个 JSON 主题（ADR-0014）**：把 [Navop](https://github.com/feigeCode/navop) 的主题设计整体搬来——其 23 个主题文件（39 个浅/深主题：Navop、Catppuccin、Gruvbox、Tokyo Night、Solarized、Flexoki、Everforest、Ayu、Matrix…）原样入库，经 gpui-kit 的 `ThemeRegistry` 注册加载；表面色、组件色、**每主题自带语法高亮**全部由主题文件经 `ThemeConfig::apply_config` 驱动，删除 `theme_family.rs` 家族表与手写语法 JSON，`apply_wake_theme` 瘦身为纯应用覆盖层（玻璃 token、字体/缩放、圆角）。应用面板的 `theme::material()` 四层改为镜像同一 JSON（同 kit 回退规则），面板与组件色彩同源一致。强调色改用 Navop 模型：主题自带强调色，设置页强调色行最前的**彩虹圆圈表示跟随主题自带强调色**（默认选中），其后 8 个纯色圆圈为手动覆盖（含 Navop 的 hover/active 配方）；设置页只有一个「主题」下拉——成对主题（X Light/X Dark）合并为一行，浅色外观自动用 Light 变体、深色自动用 Dark 变体，单模主题（Matrix 等）原名列出；prefs 单字段 `ui_theme` 存主题名（老配置 solarized → Solarized，其余落默认）。新增主题=放一个 JSON + 一行 include_str。修复同模式切换主题不刷新：`Theme::update` 内部 reload_mode=false，仅换 config 不会重载颜色，须显式 `apply_config` 当前模式（回归测试：真实 AppShell 窗口内切 Gruvbox 断言表面色与语法主题即时变化）；顺带修复强调色哨兵值与「black」色板（0x000000）碰撞导致选黑色板变成跟随主题的问题（哨兵改用 u32::MAX）。圆角跟随主题：Matrix 主题以 radius/radius.lg = 0 全局直角，但覆盖层把 radius_lg 硬写回 12、且离开 Matrix 时残留 0（apply_config 只在主题带 radius 键时才写）；现从注册表显式设两档圆角——主题给了就用主题值（Matrix=0 直角），没给用应用默认（6/12）。
+- **修复：CLI 添加笔记重复创建「AI札」**：`leanote add` 离线路径打开本地库时硬编码 `user1`，而已登录账户是真实 UserId，导致「按标题+用户找笔记本」永远落空、每次都在 `user1` 名下新建一本 AI札（实测数据里已有一本真实 AI札 + 一本 `user1` 孤儿副本）。`open_store` 现按 app 启动同款两段式开库：先以 `user1` 探测 `accounts` 表的激活账户，再按其 UserId 重开（未登录仍回落 `user1`）。顺带收紧 `ensure_notebook`：只复用 `LocalIsDelete=0` 的活笔记本，用户删过 AI札 后再 add 不会把新笔记塞进已删笔记本（原查询不过滤删除标记）。已重打包 dist 并对真实数据副本冒烟：两条 add 均落入真实账户既有 AI札，零新增笔记本。
+- **同步可见化：底部同步图标转圈 + 修复同步后当前笔记不刷新**：① 主窗口左下角同步按钮在后台同步进行中显示旋转的 RefreshCw（gpui-kit `Button::loading` 内建 Spinner，跟随系统「减弱动态效果」），tooltip 显示「正在同步…」，同步期间按钮防重复触发（`syncing` 状态 + 重入保护）。② 根因修复「笔记同步下来有变化，必须切换笔记才能看到最新」：`AppShell` 只有单一 `_task` 槽位，自动保存定时器（每次敲键 800ms 防抖）/导出面板/图片另存都会覆写该槽位、**丢弃正在运行的同步任务**——同步线程已把新内容写进数据库，但负责 `cx.notify()` 重绘的完成回调被取消，阅读区便一直显示旧文，直到用户切换笔记强制重绘。同步任务现改存独立 `sync_task` 槽位，任何 `_task` 写入都不再取消它；完成回调统一「停转圈 → 写状态 → invalidate_lists → notify」，阅读区每帧直查数据库，同步一落库即刷新当前查看内容（正在编辑的笔记不覆盖本地缓冲，仍走本地优先的冲突语义）。回归测试：真实 AppShell 窗口 + 进程内 fake server，同步启动后立即覆写 `_task`（复刻自动保存的取消路径），断言完成回调照常执行、转圈状态正确结束、拉取的新正文即阅读区所读行（旧单槽实现该测试红）。
+
 
 ## 3.1.10（2026-11-03）
 

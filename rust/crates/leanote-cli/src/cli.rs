@@ -307,7 +307,17 @@ fn cmd_add(args: &[String], piped: &str, api: Api) -> i32 {
 fn open_store() -> Result<Store, String> {
     let dir = std::env::var("LEANOTE_DATA")
         .unwrap_or_else(|_| leanote_core::app_data_dir().to_string_lossy().into_owned());
-    Store::open(std::path::PathBuf::from(dir), "user1".to_string()).map_err(|e| e.to_string())
+    let dir = std::path::PathBuf::from(dir);
+    // Data belongs to the signed-in account, not the offline fallback id —
+    // otherwise add auto-creates a second "AI札" under `user1`.
+    let user = Store::open(dir.clone(), "user1".to_string())
+        .map_err(|e| e.to_string())?
+        .active_account()
+        .ok()
+        .flatten()
+        .map(|a| a.user_id)
+        .unwrap_or_else(|| "user1".to_string());
+    Store::open(dir, user).map_err(|e| e.to_string())
 }
 
 // --- sync ---

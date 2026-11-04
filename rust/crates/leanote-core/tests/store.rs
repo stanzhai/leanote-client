@@ -68,6 +68,19 @@ fn add_auto_creates_aizha_notebook_once_with_dirty_flags() {
 }
 
 #[test]
+fn add_does_not_reuse_locally_deleted_notebook() {
+    let s = store("aizha-deleted");
+    let first = add(&s, "A", "c1", &[], "AI札");
+    s.raw_exec("UPDATE notebooks SET LocalIsDelete=1").unwrap();
+    let second = add(&s, "B", "c2", &[], "AI札");
+    assert_ne!(
+        second.notebook_id, first.notebook_id,
+        "a deleted notebook must not swallow new notes"
+    );
+    assert_eq!(s.notebooks().unwrap().len(), 1, "fresh live AI札 created");
+}
+
+#[test]
 fn add_upserts_tags() {
     let s = store("tags");
     add(&s, "A", "c", &["x", "y"], "AI札");

@@ -493,12 +493,17 @@ async fn incr_push_uploads_dirty_images_with_note() {
         files.contains(local_id),
         "Files declares the image: {files}"
     );
+    // JS fixNoteContentForSend wire form: the server's fixPostNotecontent
+    // regex only matches `https*://<host>/api/file/getImage?fileId=` —
+    // it then rewrites the STORED content to its canonical relative form
+    // with the server id, exactly like a web-uploaded image.
+    let pushed_content = up.fields["Content"].as_str().unwrap();
     assert_eq!(
-        up.fields["Content"]
-            .as_str()
-            .unwrap()
-            .contains("leanote://file/getImage"),
-        true
+        pushed_content,
+        format!(
+            "# Note 42\n\n![shot]({}/api/file/getImage?fileId={local_id})",
+            srv.url()
+        )
     );
 
     // server id mapped back into the images table
@@ -513,7 +518,7 @@ async fn incr_push_uploads_dirty_images_with_note() {
 
     // file/getImage serves the exact bytes
     let images = srv.images();
-    let (sid, (_, mime, bytes)) = images
+    let (_, (_, mime, bytes)) = images
         .iter()
         .find(|(k, _)| k.starts_with("srvimg"))
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -524,7 +529,7 @@ async fn incr_push_uploads_dirty_images_with_note() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn full_sync_pulls_referenced_image_bytes() {
-    let (srv, _dir, s, api) = synced("pull_images").await;
+    let (srv, dir, s, api) = synced("pull_images").await;
     // new server note referencing an image only the server has
     srv.set_images([(
         "srvimg9_0".to_string(),
@@ -541,18 +546,80 @@ async fn full_sync_pulls_referenced_image_bytes() {
     }));
     srv.set_notes(notes);
     let mut contents = srv.contents();
-    contents.insert(
-        "note0500".to_string(),
-        serde_json::json!("# pic\n\n![dot](leanote://file/getImage?fileId=srvimg9_0)"),
+    // Real-server getNoteContent form: NoteService.FixContent absolutizes
+    // the stored relative link with the site url before sending.
+    let stored = "# pic\n\n![dot](/api/file/getImage?fileId=srvimg9_0)".to_string();
+    let sent = stored.replace(
+        "/api/file/getImage",
+        &format!("{}/api/file/getImage", srv.url()),
     );
+    contents.insert("note0500".to_string(), serde_json::json!(sent));
     srv.set_contents(contents);
-    srv.set_sync_usn(2000);
-
     full_sync(&api, &s, &NoProgress).unwrap();
 
     let img = s.get_image("srvimg9_0").unwrap().expect("bytes pulled");
     assert_eq!(img.bytes, vec![1, 2, 3, 4]);
     assert_eq!(img.mime, "image/png");
+    // Local content normalized to the server's stored relative form —
+    // byte-identical with what the server keeps, host-free.
+    let n: String = {
+        let c = Connection::open(dir.join("leanote.db")).unwrap();
+        c.query_row(
+            "SELECT Content FROM notes WHERE ServerNoteId='note0500'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(n, stored, "local must equal server-stored relative form");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incr_push_files_declare_uploaded_images() {
+    use leanote_core::ImageAttachment;
+
+    let (srv, _dir, s, api) = synced("incr_files_attrs").await;
+    // image already uploaded: content still references the LOCAL id
+    let local_id = "img0000000000000000000b";
+    s.insert_image(&ImageAttachment {
+        local_id: Id(local_id.into()),
+        server_id: "srvimg777777777777777777777".into(),
+        file_name: "old.png".into(),
+        mime: "image/png".into(),
+        bytes: vec![1, 2, 3],
+        size: 3,
+        created_time: 0,
+    })
+    .unwrap();
+    s.update_note(
+        &Id("note0042".into()),
+        NoteUpdate {
+            content: Some(format!(
+                "# Note 42\n\n![old](leanote://file/getImage?fileId={local_id})"
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    srv.clear_pushes();
+
+    incr_sync(&api, &s, &NoProgress).unwrap();
+
+    // Files maps LocalFileId -> server FileId (HasBody:false) so the server
+    // rewrites the content link; body bytes are NOT re-sent.
+    let pushes = srv.pushes();
+    let up = find_push(&pushes, "note/updateNote");
+    let files = up.fields["Files"].as_str().unwrap();
+    assert!(
+        files.contains("\"FileId\":\"srvimg777777777777777777777\"")
+            && files.contains(&format!("\"LocalFileId\":\"{local_id}\""))
+            && files.contains("\"HasBody\":false"),
+        "Files attrs wrong: {files}"
+    );
+    assert!(
+        !srv.images().contains_key(local_id),
+        "uploaded image must not ride as a body again"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

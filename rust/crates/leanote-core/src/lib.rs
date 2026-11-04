@@ -207,7 +207,7 @@ pub fn app_data_dir() -> PathBuf {
             Some(x) if !x.is_empty() => PathBuf::from(x),
             _ => {
                 let home = std::env::var_os("HOME").expect("HOME");
-                if cfg!(target_os = "macos") {
+                if cfg!(any(target_os = "macos", target_os = "ios")) {
                     PathBuf::from(home)
                         .join("Library")
                         .join("Application Support")
@@ -832,11 +832,13 @@ impl Store {
 
     /// Lookup by the id that appears in `leanote://file/getImage?fileId=`
     /// — ServerId once uploaded, else the LocalId the note was written
-    /// with.
+    /// with. Matches either column (JS `File.getAllImages`:
+    /// `{$or:[{FileId}, {ServerFileId}]}`): a note written offline keeps
+    /// referencing its LocalId after the upload filled ServerId.
     pub fn get_image(&self, file_id: &str) -> rusqlite::Result<Option<ImageAttachment>> {
         let mut stmt = self.conn.prepare(
             "SELECT LocalId, ServerId, FileName, Mime, Bytes, Size, CreatedTime
-             FROM images WHERE ServerId=?1 OR (ServerId='' AND LocalId=?1)",
+             FROM images WHERE ServerId=?1 OR LocalId=?1",
         )?;
         stmt.query_row([file_id], |r| {
             Ok(ImageAttachment {
@@ -861,20 +863,28 @@ impl Store {
         Ok(())
     }
 
-    /// File ids referenced by this content as `leanote://file/getImage`
-    /// links (local ids until upload, server ids after) — used by the sync
-    /// push to find images that still need uploading.
+    /// File ids referenced by this content's image links — local ids in
+    /// `leanote://file/getImage?fileId=` (not yet uploaded) and server ids
+    /// in `/api/file/getImage?fileId=` (the server's canonical relative
+    /// form; also matches the tail of absolute urls, which is harmless —
+    /// the id is what matters).
     pub fn image_ids_in_content(content: &str) -> Vec<String> {
-        content
-            .split("leanote://file/getImage?fileId=")
-            .skip(1)
-            .map(|rest| {
-                rest.chars()
+        let mut ids: Vec<String> = Vec::new();
+        for prefix in [
+            "leanote://file/getImage?fileId=",
+            "/api/file/getImage?fileId=",
+        ] {
+            for rest in content.split(prefix).skip(1) {
+                let id: String = rest
+                    .chars()
                     .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .collect::<String>()
-            })
-            .filter(|s: &String| !s.is_empty())
-            .collect()
+                    .collect();
+                if !id.is_empty() && !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
     }
 
     /// Note by exact id regardless of trash/deleted state (JS getNote uses
@@ -1410,7 +1420,7 @@ fn ensure_notebook(
 ) -> rusqlite::Result<(Id, bool)> {
     if let Some(id) = tx
         .query_row(
-            "SELECT NotebookId FROM notebooks WHERE Title=?1 AND UserId=?2 LIMIT 1",
+            "SELECT NotebookId FROM notebooks WHERE Title=?1 AND UserId=?2 AND LocalIsDelete=0 LIMIT 1",
             params![title, user_id],
             |r| r.get::<_, String>(0).map(Id),
         )

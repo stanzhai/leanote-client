@@ -16,9 +16,15 @@
 use std::io::Read;
 use std::path::PathBuf;
 
-/// Regular weight, v1.530. Direct asset URL — no zip involved.
-const WENKAI_URL: &str =
-    "https://github.com/lxgw/LxgwWenKai/releases/download/v1.530/LXGWWenKaiMono-Regular.ttf";
+/// Regular weight, v1.530. Direct asset URLs, tried in order: GitHub first,
+/// then mainland-reachable acceleration proxies (GitHub/objects.githubusercontent
+/// are commonly unreachable from mainland China). Same asset, magic-checked
+/// below — a proxy answering an HTML error page cannot sneak through.
+const WENKAI_URLS: [&str; 3] = [
+    "https://github.com/lxgw/LxgwWenKai/releases/download/v1.530/LXGWWenKaiMono-Regular.ttf",
+    "https://ghfast.top/https://github.com/lxgw/LxgwWenKai/releases/download/v1.530/LXGWWenKaiMono-Regular.ttf",
+    "https://gh-proxy.com/https://github.com/lxgw/LxgwWenKai/releases/download/v1.530/LXGWWenKaiMono-Regular.ttf",
+];
 
 const FONT_FILE: &str = "LXGWWenKaiMono-Regular.ttf";
 
@@ -46,7 +52,7 @@ pub fn register(cx: &gpui_kit::App, dir: &std::path::Path) -> bool {
     ok
 }
 
-/// Blocking download (one retry on flaky Wi-Fi). Call off the UI thread.
+/// Blocking download (GitHub first, then CN mirrors). Call off the UI thread.
 pub fn install_wenkai(dir: &std::path::Path) -> std::io::Result<()> {
     let dest = font_path(dir);
     if dest.is_file() {
@@ -62,8 +68,8 @@ pub fn install_wenkai(dir: &std::path::Path) -> std::io::Result<()> {
         .build()
         .new_agent();
     let mut last_err: Option<std::io::Error> = None;
-    for _ in 0..2 {
-        match fetch(&agent, &dest) {
+    for url in WENKAI_URLS {
+        match fetch(&agent, url, &dest) {
             Ok(()) => return Ok(()),
             Err(e) => last_err = Some(e),
         }
@@ -72,11 +78,8 @@ pub fn install_wenkai(dir: &std::path::Path) -> std::io::Result<()> {
     Err(last_err.unwrap_or_else(|| std::io::Error::other("wenkai download failed")))
 }
 
-fn fetch(agent: &ureq::Agent, dest: &std::path::Path) -> std::io::Result<()> {
-    let resp = agent
-        .get(WENKAI_URL)
-        .call()
-        .map_err(std::io::Error::other)?;
+fn fetch(agent: &ureq::Agent, url: &str, dest: &std::path::Path) -> std::io::Result<()> {
+    let resp = agent.get(url).call().map_err(std::io::Error::other)?;
     // GitHub release assets redirect (302); the agent follows by default.
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {

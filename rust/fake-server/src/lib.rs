@@ -371,8 +371,14 @@ fn parse_multipart(
                 mime = v.trim().to_string();
             }
         }
-        if name.is_empty() {
-            continue;
+        // Real-server upload lookup: `c.upload("FileDatas["+LocalFileId+"]")`
+        // — needle serializes the FileDatas object exactly that way. Record
+        // the bare local id as the part name.
+        if let Some(id) = name
+            .strip_prefix("FileDatas[")
+            .and_then(|s| s.strip_suffix(']'))
+        {
+            name = id.to_string();
         }
         if filename.is_empty() {
             map.insert(

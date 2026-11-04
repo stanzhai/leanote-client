@@ -6,6 +6,10 @@ Rust rewrite of the leanote desktop app. Workspace layout:
 - `crates/leanote-cli` — `leanote` binary (add/list/show/search/edit/sync/serve)
 - `crates/leanote-http` — local `/api/*` + MCP server on 127.0.0.1:8912
 - `crates/leanote-app` — GPUI desktop shell (login, three-pane, editor, tray)
+- `crates/leanote-reader` — shared reading pipeline (markdown/HTML→md, image
+  resolve, Mermaid inline SVG) used by desktop and mobile (ADR-0011)
+- `crates/leanote-mobile` — iOS/Android read-mostly shell on vendored
+  `gpui-pre-mobile` (ADR-0013; see `.scratch/mobile/`)
 - `fake-server` — programmable leanote server for dev/tests
 
 ## Build
@@ -39,6 +43,93 @@ macOS .app — APFS/NTFS are case-insensitive so it can't be `leanote`),
 `bin\leanote.exe` (Windows, optional PATH section in NSIS), and `/usr/bin/leanote`
 (Linux). Icons are generated from `build/icon.png` by `scripts/gen-icons.sh`
 and committed under `packaging/` so CI needs no graphics toolchain.
+
+## Mobile (iOS / Android)
+
+Read-mostly companion app on the same gpui stack (`gpui-pre-mobile` vendored
+under `vendor/`, retargeted to our vendored gpui-pre 0.3.9 — ADR-0013).
+Host projects live in `mobile/{ios,android}`; the shared UI/data crates are
+`leanote-mobile` + `leanote-core` + `leanote-reader`.
+
+### iOS (simulator)
+
+Prereqs: Xcode (agree the license: `sudo xcodebuild -license`), XcodeGen
+(`brew install xcodegen`). If `xcode-select` still points at
+CommandLineTools (no iOS SDK), the Xcode project's prebuild script feeds
+SDKROOT/CC explicitly — otherwise `sudo xcode-select -s /Applications/Xcode.app`
+is the clean fix.
+
+```sh
+cd mobile/ios
+xcodegen generate                                   # once, and after project.yml edits
+xcodebuild -project Leanote.xcodeproj -scheme Leanote \
+  -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
+# or just open Leanote.xcodeproj in Xcode and hit Run
+xcrun simctl boot "iPhone 17 Pro"                    # if not booted
+APP=$(ls -d ~/Library/Developer/Xcode/DerivedData/Leanote-*/Build/Products/Debug-iphonesimulator/Leanote.app)
+xcrun simctl install "iPhone 17 Pro" "$APP"
+xcrun simctl launch "iPhone 17 Pro" com.leanote.mobile
+xcrun simctl io "iPhone 17 Pro" screenshot /tmp/leanote.png   # smoke evidence
+```
+
+Device/TestFlight: the project pre-wires `DEVELOPMENT_TEAM` — sign in to
+Xcode → Accounts, archive for `-sdk iphoneos`, upload via Organizer
+(steps in `.scratch/mobile/issues/09-ios-v1-acceptance.md`).
+
+### Android
+
+Prereqs: Android SDK + NDK (`ANDROID_NDK_HOME`), `cargo install cargo-ndk`.
+The API level matters: **`-P 26`** (= minSdk) — the cargo-ndk default 21
+fails linking `libnativewindow`.
+
+```sh
+mobile/android/build.sh                # Rust .so + debug APK, one shot
+# manual:
+cargo ndk -t arm64-v8a -P 26 -o mobile/android/gradle/app/src/main/jniLibs \
+  build --lib -p leanote-mobile
+cd mobile/android/gradle && ./gradlew assembleDebug
+adb install app/build/outputs/apk/debug/app-debug.apk  # sideload (self-use v1)
+```
+
+### Cross-checks (what CI runs — `.github/workflows/mobile-check.yml`)
+
+```sh
+# iOS target (needs Xcode; if xcode-select is CLT, set the env as below)
+SDK=/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk
+TC=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin
+SDKROOT=$SDK CC_aarch64_apple_ios=$TC/clang PATH="$TC:$PATH" \
+  cargo check -p leanote-mobile --target aarch64-apple-ios
+
+# Android target (needs NDK)
+N=$HOME/Library/Android/sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/darwin-x86_64/bin
+CC_aarch64_linux_android=$N/aarch64-linux-android24-clang \
+CXX_aarch64_linux_android=$N/aarch64-linux-android24-clang++ \
+AR_aarch64_linux_android=$N/llvm-ar \
+  cargo check -p leanote-mobile --target aarch64-linux-android
+```
+
+### Tests & dev hooks
+
+```sh
+cargo test                                        # whole workspace (desktop + reader + core)
+cargo test -p leanote-reader -p leanote-mobile    # shared pipeline / mobile units
+```
+
+Simulator smoke without typing (simctl has no tap/keyboard): launch with
+env prefixed `SIMCTL_CHILD_` —
+
+```sh
+SIMCTL_CHILD_LEANOTE_FAKE_SERVER=1 xcrun simctl launch …  # in-process fake server + auto login (full sync)
+SIMCTL_CHILD_LEANOTE_INITIAL_TAB=search|settings …        # open on a given tab
+SIMCTL_CHILD_LEANOTE_INITIAL_SCREEN=notebooks|tags|reader:<noteId> …  # notes-tab deep link
+SIMCTL_CHILD_LEANOTE_SEARCH=关键词 …                       # prefill + run a search
+xcrun simctl ui "iPhone 17 Pro" appearance dark           # dark-mode pass
+```
+
+Already-logged-in + `LEANOTE_FAKE_SERVER=1` boots only the in-process fake
+server (startup incremental sync) instead of re-login. Device data dir on
+iOS is `<container>/Library/Application Support/leanote/` (find the
+container with `xcrun simctl get_app_container <sim> com.leanote.mobile data`).
 
 ## Tray
 

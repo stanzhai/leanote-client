@@ -189,11 +189,13 @@ impl Render for HistoryDialog {
                                 let shell = shell.clone();
                                 let v = v.clone();
                                 let note_id = note_id.clone();
+                                let dark = shell.read(cx).dark(cx);
                                 window.open_alert_dialog(cx, move |alert, _w, _cx| {
                                     let shell_ok = shell.clone();
                                     let v_ok = v.clone();
                                     let note_ok = note_id.clone();
                                     alert
+                                        .bg(theme::material(theme::Material::Popover, dark))
                                         .title(i18n::t(lang, i18n::Key::RestoreConfirmTitle))
                                         .description(i18n::t(lang, i18n::Key::RestoreConfirmBody))
                                         .show_cancel(true)

@@ -22,8 +22,11 @@ pub enum LangPref {
 pub struct Prefs {
     pub appearance: AppearancePref,
     pub lang: LangPref,
-    /// ADR-0010: UI theme family id, "" = default. Legacy files carrying
-    /// `editor_palette` ("warm"/"solarized") migrate via the serde alias.
+    /// ADR-0014: theme choice — one name drives both appearances (the
+    /// Light variant serves light mode, the Dark variant dark mode;
+    /// paired themes are stored by stem, e.g. "Gruvbox"). "" = Navop.
+    /// Legacy files (`ui_theme`/`editor_palette` family ids, or the
+    /// interim `light_theme`) migrate in `load`.
     #[serde(default, alias = "editor_palette")]
     pub ui_theme: String,
     // Issue 19: vim keys on by default; old prefs files default to true too
@@ -120,13 +123,34 @@ const FILE: &str = "prefs.json";
 
 impl Prefs {
     pub fn load(dir: &std::path::Path) -> Self {
-        let mut p: Prefs = std::fs::read_to_string(dir.join(FILE))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+        let raw = std::fs::read_to_string(dir.join(FILE)).ok();
+        let mut p: Prefs = raw
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
         // 1.25/1.5/1.6 collapse to the new top step.
         if p.zoom > 1.21 {
             p.zoom = 1.2;
+        }
+        // ADR-0014: one theme name drives both appearances. The interim
+        // two-field format carries over by stripping the light side's
+        // " Light" suffix; old family ids map onto Navop stems or reset
+        // (only solarized has a same-named Navop theme).
+        if p.ui_theme.is_empty() {
+            if let Some(light) = raw
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .and_then(|v| v.get("light_theme")?.as_str().map(str::to_string))
+            {
+                p.ui_theme = light.strip_suffix(" Light").unwrap_or(&light).into();
+            }
+        }
+        match p.ui_theme.as_str() {
+            "solarized" => p.ui_theme = "Solarized".into(),
+            // The default pair's picker label.
+            "Navop" => p.ui_theme = "Default".into(),
+            "moss" | "warm" | "nord" | "ink" => p.ui_theme.clear(),
+            _ => {}
         }
         p
     }
@@ -167,7 +191,7 @@ mod tests {
         let p = Prefs {
             appearance: AppearancePref::Dark,
             lang: LangPref::Zh,
-            ui_theme: "solarized".into(),
+            ui_theme: "Gruvbox".into(),
             vim_default: true,
             recents: vec!["a".into()],
             pane_widths: PaneWidths {
@@ -227,18 +251,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// ADR-0010: old files say `editor_palette` — the serde alias must
-    /// load it into ui_theme (warm/solarized ids carried over verbatim).
+    /// ADR-0014: the interim two-field format collapses to one stem; old
+    /// family ids map to the Solarized stem or reset to the default.
     #[test]
-    fn legacy_editor_palette_key_migrates() {
+    fn legacy_theme_pref_migrates() {
         let dir = std::env::temp_dir().join(format!("lnprefs-mig-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(FILE),
-            r#"{"appearance":"Follow","lang":"Follow","editor_palette":"warm","vim_default":true,"recents":[]}"#,
-        )
-        .unwrap();
-        assert_eq!(Prefs::load(&dir).ui_theme, "warm");
+        for (key, json, expect) in [
+            (
+                "interim light/dark pair",
+                r#"{"appearance":"Follow","lang":"Follow","light_theme":"Solarized Light","dark_theme":"Solarized Dark","vim_default":true,"recents":[]}"#,
+                "Solarized",
+            ),
+            (
+                "interim dark-only pick",
+                r#"{"appearance":"Follow","lang":"Follow","light_theme":"Navop Light","dark_theme":"Matrix","vim_default":true,"recents":[]}"#,
+                "Default",
+            ),
+            (
+                "old family id ui_theme",
+                r#"{"appearance":"Follow","lang":"Follow","ui_theme":"solarized","vim_default":true,"recents":[]}"#,
+                "Solarized",
+            ),
+            (
+                "editor_palette alias",
+                r#"{"appearance":"Follow","lang":"Follow","editor_palette":"solarized","vim_default":true,"recents":[]}"#,
+                "Solarized",
+            ),
+            (
+                "family id without a Navop match",
+                r#"{"appearance":"Follow","lang":"Follow","ui_theme":"moss","vim_default":true,"recents":[]}"#,
+                "",
+            ),
+        ] {
+            std::fs::write(dir.join(FILE), json).unwrap();
+            assert_eq!(Prefs::load(&dir).ui_theme, expect, "{key}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

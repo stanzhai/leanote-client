@@ -1,0 +1,35 @@
+[package]
+name = "leanote-mobile"
+version = "3.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# gpui-pre-mobile vendored from longbridge/gpui-mobile@main (2026-11-03),
+# retargeted to our vendored gpui-pre/gpui-pre-wgpu 0.3.9 (upstream pins 0.3.10).
+# Local changes in vendor/gpui-pre-mobile: offscreen feature+module removed,
+# wgpu dep aligned to 29, platform_info impls removed (0.3.9 has no such
+# Platform method), camera/video_player refs feature-gated. See
+# .scratch/mobile/issues/01-version-alignment-spike.md.
+
+[dependencies]
+gpui = { package = "gpui-pre", path = "../../vendor/gpui-pre", default-features = false }
+gpui-mobile = { package = "gpui-pre-mobile", path = "../../vendor/gpui-pre-mobile", default-features = false }
+gpui-kit = { version = "0.7.3" }
+leanote-core = { path = "../leanote-core" }
+leanote-reader = { path = "../leanote-reader" }
+leanote-fakeserver = { path = "../../fake-server" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
+smol = "2"
+log = "0.4"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+android-activity = { version = "0.6", features = ["native-activity"] }

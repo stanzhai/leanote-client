@@ -30,7 +30,6 @@ use gpui_kit::component::{
 };
 use gpui_kit::div;
 use gpui_kit::prelude::*;
-use gpui_kit::HighlightStyle;
 use gpui_kit::{
     px, rems, AnyElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, SharedString,
     Task, UniformListScrollHandle, Window, WindowControlArea,
@@ -167,6 +166,9 @@ pub struct AppShell {
     user_id: String,
     /// Review item 2/3: outcome of the last incr sync (startup + SyncNow).
     sync_status: Option<Result<SharedString, SharedString>>,
+    /// True while a background sync runs — drives the spinning footer
+    /// icon (Button::loading) and guards re-entrancy.
+    syncing: bool,
     /// Local edits not yet pushed (notes/notebooks/tags IsDirty=1) —
     /// recomputed in invalidate_lists(); drives the pending-sync icon.
     pending_sync: bool,
@@ -174,8 +176,15 @@ pub struct AppShell {
     host: gpui_kit::Entity<InputState>,
     email: gpui_kit::Entity<InputState>,
     password: gpui_kit::Entity<InputState>,
-    /// Login+sync futures; dropped (cancelled) with the entity.
+    /// Login/autosave/export futures; dropped (cancelled) with the entity
+    /// or on the next write to this slot.
     _task: Option<Task<()>>,
+    /// Sync futures — a SEPARATE slot: every `_task` write (autosave
+    /// timer, export panel, image save) drops the previous task, which
+    /// used to cancel an in-flight sync's completion: the pull landed in
+    /// the DB but the notify never fired, so an open reader stayed stale
+    /// until the user switched notes.
+    sync_task: Option<Task<()>>,
     // --- Ticket 09 browse state ---
     nav: NavSelection,
     notebooks_open: bool,
@@ -353,6 +362,7 @@ impl AppShell {
             lang,
             user_id: user_id.unwrap_or_else(|| "user1".to_string()),
             sync_status: None,
+            syncing: false,
             pending_sync: false,
             vim_enabled: prefs.vim_default,
             notebook_drag_target: None,
@@ -361,6 +371,7 @@ impl AppShell {
             email,
             password,
             _task: None,
+            sync_task: None,
             nav: prefs
                 .nav
                 .selection
@@ -566,9 +577,14 @@ impl AppShell {
     /// (startup + SyncNow). Failure is non-blocking — logged + shown in the
     /// identity area.
     pub(crate) fn sync_now(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        if self.syncing {
+            return; // one sync at a time — re-entrancy guard
+        }
         let Some(acct) = self.store().and_then(|s| s.active_account().ok().flatten()) else {
             return;
         };
+        self.syncing = true;
+        cx.notify(); // spinner on
         let dir = self.data_dir.clone();
         let uid = acct.user_id.clone();
         let work = cx.background_spawn(async move {
@@ -580,9 +596,13 @@ impl AppShell {
                 Ok::<_, String>(stats)
             })()
         });
-        self._task = Some(cx.spawn(async move |this, cx| {
+        // `sync_task`, never `_task`: an autosave/export/image-save write
+        // to `_task` must not cancel this completion — it is what repaints
+        // the reader with the just-pulled content.
+        self.sync_task = Some(cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |shell, cx| {
+                shell.syncing = false;
                 match &result {
                     Ok(_) => {
                         shell.sync_status = Some(Ok("sync ok".into()));
@@ -602,9 +622,14 @@ impl AppShell {
     /// 避免全量覆盖丢数据），成功后 `full_sync` 从 USN −1 重拉并重下
     /// 所有正文（apply_sync_notes 在冲突时清空 Content，JS InitSync 语义）。
     pub(crate) fn force_sync_now(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        if self.syncing {
+            return;
+        }
         let Some(acct) = self.store().and_then(|s| s.active_account().ok().flatten()) else {
             return;
         };
+        self.syncing = true;
+        cx.notify();
         let dir = self.data_dir.clone();
         let uid = acct.user_id.clone();
         let work = cx.background_spawn(async move {
@@ -620,9 +645,10 @@ impl AppShell {
                 Ok::<_, String>(())
             })()
         });
-        self._task = Some(cx.spawn(async move |this, cx| {
+        self.sync_task = Some(cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |shell, cx| {
+                shell.syncing = false;
                 match &result {
                     Ok(()) => {
                         shell.sync_status = Some(Ok("sync ok".into()));
@@ -641,6 +667,10 @@ impl AppShell {
     /// Review item 3: one muted line for the identity area.
     fn sync_status_label(&self) -> SharedString {
         let t = |k: i18n::Key| i18n::t(self.lang, k);
+        // Syncing > Err > Pending > Ok > None: an in-flight sync leads.
+        if self.syncing {
+            return t(i18n::Key::Syncing).into();
+        }
         // Err > Pending > Ok > None: a failure must stay visible even with
         // un-pushed edits queued behind it.
         if let Some(Err(e)) = &self.sync_status {
@@ -669,9 +699,11 @@ impl AppShell {
         }
         self.user_id = "user1".to_string();
         self.sync_status = None;
+        self.syncing = false;
         self.pending_sync = false;
         self.phase = Phase::Login;
         self._task = None;
+        self.sync_task = None;
         self.invalidate_lists();
         window.close_all_dialogs(cx);
         cx.notify();
@@ -1150,54 +1182,73 @@ impl AppShell {
         // any color edits made inside are wiped. set_accent/main.rs use the
         // same stacked shape. Cost: one frame of kit-default colors before
         // the second update repaints.
-        let palette = p.ui_theme.clone();
         let font = p.font;
         let editor_size = p.editor_font_size.clone();
         let zoom = p.zoom;
         let appearance = p.appearance;
         let sys_mode = gpui_kit::component::ThemeMode::from(cx.window_appearance());
         gpui_kit::component::Theme::update(cx, move |theme| {
-            // Pick the target mode's registered config; Follow resolves the
+            // Pick the target mode's selected config; Follow resolves the
             // system appearance (read before the closure — cx moves in).
             let mode = match appearance {
                 crate::prefs::AppearancePref::Follow => sys_mode,
                 crate::prefs::AppearancePref::Light => gpui_kit::component::ThemeMode::Light,
                 crate::prefs::AppearancePref::Dark => gpui_kit::component::ThemeMode::Dark,
             };
-            let config = if mode.is_dark() {
-                theme.dark_theme.clone()
-            } else {
-                theme.light_theme.clone()
-            };
-            theme.apply_config(&config);
+            theme.mode = mode;
         });
         gpui_kit::component::Theme::update(cx, move |theme| {
-            crate::apply_wake_theme(theme, &palette, &font, &editor_size, zoom);
+            crate::apply_wake_theme(theme, &font, &editor_size, zoom);
         });
         cx.notify();
     }
 
-    /// ADR-0010: theme family pref → disk + live replay. Family swap
-    /// retints materials/fg/border and the editor highlight together.
-    fn set_ui_theme(&mut self, id: &str, cx: &mut gpui_kit::Context<Self>) {
+    /// ADR-0014: theme choice → disk + live replay. One name resolves
+    /// per-mode ("Gruvbox" → Gruvbox Light/Dark). Swapping configs inside
+    /// `Theme::update` is NOT enough: update runs edit(reload_mode=false),
+    /// which only re-applies a config when the MODE changed — so the
+    /// current mode's config must be applied explicitly here (colors AND
+    /// syntax highlight), then the overlay replays.
+    fn set_ui_theme(&mut self, name: &str, cx: &mut gpui_kit::Context<Self>) {
         let dir = self.data_dir.clone();
         let mut p = crate::prefs::Prefs::load(&dir);
-        p.ui_theme = id.to_string();
+        p.ui_theme = name.to_string();
         p.save(&dir);
-        theme::set_family(id);
-        let (family, font, editor_size, zoom) = (
-            p.ui_theme.clone(),
-            p.font,
-            p.editor_font_size.clone(),
-            p.zoom,
-        );
+        theme::select(name);
+        {
+            use gpui_kit::component::ThemeRegistry;
+            let registry = ThemeRegistry::global(cx);
+            let light_cfg = registry
+                .themes()
+                .get(theme::resolved_name(false))
+                .cloned()
+                .unwrap_or_else(|| registry.default_light_theme().clone());
+            let dark_cfg = registry
+                .themes()
+                .get(theme::resolved_name(true))
+                .cloned()
+                .unwrap_or_else(|| registry.default_dark_theme().clone());
+            gpui_kit::component::Theme::update(cx, |theme| {
+                theme.light_theme = light_cfg.clone();
+                theme.dark_theme = dark_cfg.clone();
+                let config = if theme.mode.is_dark() {
+                    dark_cfg
+                } else {
+                    light_cfg
+                };
+                theme.apply_config(&config);
+            });
+        }
+        let (font, editor_size, zoom) = (p.font, p.editor_font_size.clone(), p.zoom);
         gpui_kit::component::Theme::update(cx, move |theme| {
-            crate::apply_wake_theme(theme, &family, &font, &editor_size, zoom)
+            crate::apply_wake_theme(theme, &font, &editor_size, zoom)
         });
         cx.notify();
     }
 
-    /// Issue 19: accent color pref → disk + live swap.
+    /// Issue 19 / ADR-0014: accent pref → disk + live swap. "" (the
+    /// rainbow circle) follows the theme's own primary; a swatch id is a
+    /// manual override.
     fn set_accent(&mut self, id: &str, cx: &mut gpui_kit::Context<Self>) {
         let dir = self.data_dir.clone();
         let mut p = crate::prefs::Prefs::load(&dir);
@@ -1207,14 +1258,9 @@ impl AppShell {
         // Live swap must reach kit-owned surfaces (context-menu hover,
         // ghost-button hover read tokens.accent), not just theme::accent()
         // call sites — replay the wake overlay.
-        let (palette, font, editor_size, zoom) = (
-            p.ui_theme.clone(),
-            p.font,
-            p.editor_font_size.clone(),
-            p.zoom,
-        );
+        let (font, editor_size, zoom) = (p.font, p.editor_font_size.clone(), p.zoom);
         gpui_kit::component::Theme::update(cx, move |theme| {
-            crate::apply_wake_theme(theme, &palette, &font, &editor_size, zoom)
+            crate::apply_wake_theme(theme, &font, &editor_size, zoom)
         });
         cx.notify();
     }
@@ -1247,11 +1293,10 @@ impl AppShell {
         let mut p = crate::prefs::Prefs::load(&dir);
         p.zoom = factor;
         p.save(&dir);
-        let palette = p.ui_theme.clone();
         let font = p.font;
         let editor_size = p.editor_font_size.clone();
         gpui_kit::component::Theme::update(cx, move |theme| {
-            crate::apply_wake_theme(theme, &palette, &font, &editor_size, factor)
+            crate::apply_wake_theme(theme, &font, &editor_size, factor)
         });
     }
 
@@ -1263,12 +1308,11 @@ impl AppShell {
         let mut p = crate::prefs::Prefs::load(&dir);
         p.font = id.to_string();
         p.save(&dir);
-        let palette = p.ui_theme.clone();
         let font = p.font;
         let editor_size = p.editor_font_size.clone();
         let zoom = p.zoom;
         gpui_kit::component::Theme::update(cx, move |theme| {
-            crate::apply_wake_theme(theme, &palette, &font, &editor_size, zoom)
+            crate::apply_wake_theme(theme, &font, &editor_size, zoom)
         });
         cx.notify();
     }
@@ -1295,12 +1339,11 @@ impl AppShell {
             _ => String::new(),
         };
         p.save(&dir);
-        let palette = p.ui_theme.clone();
         let font = p.font;
         let editor_size = p.editor_font_size.clone();
         let zoom = p.zoom;
         gpui_kit::component::Theme::update(cx, move |theme| {
-            crate::apply_wake_theme(theme, &palette, &font, &editor_size, zoom)
+            crate::apply_wake_theme(theme, &font, &editor_size, zoom)
         });
         cx.notify();
     }
@@ -1780,9 +1823,11 @@ impl AppShell {
     fn confirm_empty_trash(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
         let shell = cx.entity();
         let lang = self.lang;
+        let dark = self.dark(cx);
         window.open_alert_dialog(cx, move |alert, _window, _cx| {
             let shell_ok = shell.clone();
             alert
+                .bg(theme::material(Material::Popover, dark))
                 .title(i18n::t(lang, i18n::Key::EmptyTrash))
                 .description(i18n::t(lang, i18n::Key::EmptyTrashConfirmBody))
                 .show_cancel(true)
@@ -1958,7 +2003,7 @@ impl AppShell {
         };
         let name = format!("{}.pdf", crate::export::safe_filename(&n.title));
         let title = n.title.clone();
-        let src = crate::browse::reader_markdown_src(&n.title, &n.content, n.is_markdown);
+        let src = leanote_reader::reader_markdown_src(&n.title, &n.content, n.is_markdown);
         self.export_with_panel(name, cx, move |path| {
             let bytes = crate::pdf::note_to_pdf_title(&title, &src)?;
             std::fs::write(&path, bytes).map_err(|e| e.to_string())
@@ -2038,6 +2083,7 @@ impl AppShell {
     ) {
         let shell = cx.entity();
         let lang = self.lang;
+        let dark = self.dark(cx);
         let name = cx.new(|cx| {
             let mut s = InputState::new(window, cx)
                 .placeholder(i18n::t(lang, i18n::Key::NotebookNamePlaceholder));
@@ -2069,6 +2115,7 @@ impl AppShell {
                 .w(px(360.))
                 .title(t(title))
                 .child(Input::new(&name).appearance(true).bordered(true).h_8())
+                .bg(theme::material(Material::Popover, dark))
                 .footer(
                     DialogFooter::new()
                         .child(DialogClose::new().trigger(|b| b.label(t(i18n::Key::Cancel))))
@@ -2228,6 +2275,7 @@ impl AppShell {
     ) {
         let shell = cx.entity();
         let lang = self.lang;
+        let dark = self.dark(cx);
         let store = self.store();
         // JS delete guards run in this order: sub-notebooks first, then
         // notes — only an empty notebook can be deleted.
@@ -2244,6 +2292,7 @@ impl AppShell {
         if has_subs {
             window.open_alert_dialog(cx, move |alert, _window, _cx| {
                 alert
+                    .bg(theme::material(Material::Popover, dark))
                     .title(i18n::t(lang, i18n::Key::DeleteNotebookTitle))
                     .description(i18n::t(lang, i18n::Key::DeleteNotebookHasSubNotebooks))
                     .ok_text(i18n::t(lang, i18n::Key::Confirm))
@@ -2258,6 +2307,7 @@ impl AppShell {
             );
             window.open_alert_dialog(cx, move |alert, _window, _cx| {
                 alert
+                    .bg(theme::material(Material::Popover, dark))
                     .title(i18n::t(lang, i18n::Key::DeleteNotebookTitle))
                     .description(body.clone())
                     .ok_text(i18n::t(lang, i18n::Key::Confirm))
@@ -2270,6 +2320,7 @@ impl AppShell {
             let shell_ok = shell.clone();
             let id_ok = id_str.clone();
             alert
+                .bg(theme::material(Material::Popover, dark))
                 .title(i18n::t(lang, i18n::Key::DeleteNotebookTitle))
                 .description(body.clone())
                 .show_cancel(true)
@@ -2841,7 +2892,7 @@ impl Render for AppShell {
                 if let (Some(_title), Some(content)) = (title, src) {
                     let content = self
                         .store()
-                        .map(|s| browse::resolve_note_images(&content, &s))
+                        .map(|s| leanote_reader::resolve_note_images(&content, &s))
                         .unwrap_or(content);
                     let preview_px =
                         px(theme::preview_font_px(&prefs.editor_font_size, prefs.zoom));
@@ -2879,7 +2930,7 @@ impl Render for AppShell {
                             ),
                         )
                         .child(
-                            crate::mermaid::install_full(
+                            mermaid_view(
                                 TextView::markdown("full-preview", content),
                                 dark,
                                 Some(cx.entity().downgrade()),
@@ -4085,6 +4136,8 @@ impl AppShell {
         if let Some(acct) = acct {
             // Sync: icon carries the last outcome; click = sync now.
             // Four states, Err > Pending > Ok > None (label shares the order).
+            // While `syncing`, Button::loading spins RefreshCw (the kit
+            // Spinner) and blocks double-clicking a running sync.
             let icon = match (&self.sync_status, self.pending_sync) {
                 (Some(Err(_)), _) => AssetIcon::TriangleAlert,
                 (_, true) => AssetIcon::RefreshCw,
@@ -4096,6 +4149,8 @@ impl AppShell {
             footer = footer.child(
                 Button::new("nav-sync")
                     .icon(icon)
+                    .loading(self.syncing)
+                    .loading_icon(Icon::new(AssetIcon::RefreshCw))
                     .ghost()
                     .tooltip(title)
                     .on_click(cx.listener(|this, _ev, _window, cx| this.sync_now(cx)))
@@ -4201,38 +4256,38 @@ impl AppShell {
     /// per call keeps language live without reopening the dialog.
     fn open_settings(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
         let shell = cx.entity();
-        // ADR-0010: family picker entity must exist BEFORE the dialog
+        // ADR-0014: theme picker entity must exist BEFORE the dialog
         // closure borrows cx — entity creation can't happen inside it.
-        let zh = self.lang == Lang::Zh;
-        let items: Vec<SharedString> = theme::FAMILIES
+        // One picker: paired themes collapse to their stem ("Gruvbox"),
+        // and the choice auto-matches the appearance mode.
+        let items: Vec<SharedString> = theme::choices()
             .iter()
-            .map(|f| SharedString::from(if zh { f.name_zh } else { f.name_en }))
+            .map(|c| SharedString::from(*c))
             .collect();
-        let sel = theme::family_index(&crate::prefs::Prefs::load(&self.data_dir).ui_theme);
-        let family_state = cx.new(|cx| {
-            ComboboxState::new(
-                SearchableVec::new(items),
+        let p0 = crate::prefs::Prefs::load(&self.data_dir);
+        let sel = theme::choices()
+            .iter()
+            .position(|c| *c == p0.ui_theme)
+            .unwrap_or(0);
+        let theme_state = cx.new(|cx| {
+            ComboboxState::<SearchableVec<SharedString>>::new(
+                SearchableVec::new(items.clone()),
                 vec![IndexPath::default().row(sel)],
                 window,
                 cx,
             )
             .searchable(false)
         });
-        cx.subscribe(&family_state, {
-            let zh = zh;
+        cx.subscribe(&theme_state, {
+            let items = items.clone();
             move |this: &mut AppShell,
                   _: gpui_kit::Entity<ComboboxState<SearchableVec<SharedString>>>,
                   ev: &ComboboxEvent<SearchableVec<SharedString>>,
                   cx| {
                 if let ComboboxEvent::Confirm(vals) = ev {
-                    let hit = vals.first().and_then(|v| {
-                        theme::FAMILIES.iter().position(|f| {
-                            SharedString::from(if zh { f.name_zh } else { f.name_en }) == *v
-                        })
-                    });
-                    if let Some(ix) = hit {
-                        let id = theme::FAMILIES[ix].id;
-                        this.set_ui_theme(id, cx);
+                    if let Some(pick) = vals.first().and_then(|v| items.iter().position(|n| n == v))
+                    {
+                        this.set_ui_theme(&items[pick].to_string(), cx);
                     }
                 }
             }
@@ -4291,8 +4346,9 @@ impl AppShell {
                                 },
                             ),
                         ))
-                        // ADR-0010: theme family — UI-wide, so it lives in
-                        // Appearance, not Editor. One pref retints everything.
+                        // ADR-0014 (Navop): ONE theme choice — pairs list
+                        // as their stem and auto-match the appearance
+                        // mode (light ↔ "X Light", dark ↔ "X Dark").
                         .child(row(
                             t(i18n::Key::UiTheme).into(),
                             // kit's Combobox renders `.size_full()` on its
@@ -4300,16 +4356,52 @@ impl AppShell {
                             // right-aligned like every other row control
                             // instead of stretching across the row.
                             gpui_kit::div()
-                                .w(theme::ui(94.))
+                                .w(theme::ui(128.))
                                 .child(
-                                    Combobox::new(&family_state)
+                                    Combobox::new(&theme_state)
                                         .with_size(gpui_kit::component::Size::Small)
-                                        .menu_width(gpui_kit::px(150.)),
+                                        .menu_width(gpui_kit::px(180.)),
                                 )
                                 .into_any_element(),
                         ))
                         .child(row(t(i18n::Key::AccentColor).into(), {
                             let mut swatches = gpui_kit::base::h_flex().gap_1();
+                            // ADR-0014: the rainbow circle = follow the
+                            // theme's own accent (the default). The flat
+                            // swatches after it are manual overrides.
+                            let follow_selected = prefs.accent.is_empty();
+                            let shell_f = shell_c.clone();
+                            let follow = gpui_kit::div()
+                                .id("accent-follow")
+                                .relative()
+                                .size(px(18.))
+                                .rounded_full()
+                                .overflow_hidden()
+                                .child(Self::rainbow_wheel().absolute().size_full())
+                                .when(follow_selected, |el| {
+                                    // macOS accent-pick style: a white
+                                    // check glyph over the circle; a ring
+                                    // reads as hover, not as the pick.
+                                    el.child(
+                                        gpui_kit::div()
+                                            .absolute()
+                                            .size_full()
+                                            .flex()
+                                            .justify_center()
+                                            .items_center()
+                                            .child(
+                                                Icon::new(AssetIcon::Check)
+                                                    .size(px(14.))
+                                                    .text_color(gpui_kit::white()),
+                                            ),
+                                    )
+                                });
+                            let follow = follow.on_click(move |_, _window, cx| {
+                                let _ = shell_f.update(cx, |this, cx| {
+                                    this.set_accent("", cx);
+                                });
+                            });
+                            swatches = swatches.child(follow);
                             for (id, hex) in theme::ACCENTS {
                                 let shell = shell_c.clone();
                                 let id = *id;
@@ -4320,9 +4412,6 @@ impl AppShell {
                                     .rounded_full()
                                     .bg(gpui_kit::rgb(*hex))
                                     .when(selected, |el| {
-                                        // macOS accent-pick style: a check
-                                        // glyph inside the circle; a ring
-                                        // reads as hover, not as the pick.
                                         el.child(
                                             Icon::new(AssetIcon::Check)
                                                 .size(px(18.))
@@ -4622,6 +4711,36 @@ impl AppShell {
                 .bg(theme::material(Material::Popover, dark))
                 .child(content)
         });
+    }
+
+    /// ADR-0014: the follow-theme accent swatch — a 6-color pie wheel.
+    /// gpui's `overflow_hidden` clips RECTANGULARLY (see kit
+    /// attachment.rs), so flex color slices can never form a circle;
+    /// six PathBuilder wedges share one center and radius, making the
+    /// outline a true circle by construction.
+    fn rainbow_wheel() -> gpui_kit::Canvas<()> {
+        gpui_kit::canvas(
+            |_, _, _| {},
+            |bounds, _, window, _| {
+                const WHEEL: [u32; 6] =
+                    [0xff453a, 0xff9f0a, 0xffd60a, 0x32d74b, 0x0a84ff, 0xbf5af2];
+                let center = bounds.center();
+                let r = bounds.size.width.min(bounds.size.height) * 0.5;
+                let at = |a: f32| gpui_kit::point(center.x + r * a.cos(), center.y + r * a.sin());
+                let step = std::f32::consts::TAU / 6.;
+                for (i, hex) in WHEEL.iter().enumerate() {
+                    let a0 = i as f32 * step - std::f32::consts::FRAC_PI_2;
+                    let mut wedge = gpui_kit::PathBuilder::fill();
+                    wedge.move_to(center);
+                    wedge.line_to(at(a0));
+                    wedge.arc_to(gpui_kit::point(r, r), px(0.), false, true, at(a0 + step));
+                    wedge.close();
+                    if let Ok(path) = wedge.build() {
+                        window.paint_path(path, gpui_kit::rgb(*hex));
+                    }
+                }
+            },
+        )
     }
 
     /// History dialog (issue 19 → 分栏改版): server-side version list first
@@ -5609,9 +5728,9 @@ impl AppShell {
 
         let content = self
             .store()
-            .map(|s| browse::resolve_note_images(&n.content, &s))
+            .map(|s| leanote_reader::resolve_note_images(&n.content, &s))
             .unwrap_or_else(|| n.content.clone());
-        let src = browse::reader_markdown_src(&n.title, &content, n.is_markdown);
+        let src = leanote_reader::reader_markdown_src(&n.title, &content, n.is_markdown);
 
         let preview_px = px(theme::preview_font_px(&prefs.editor_font_size, prefs.zoom));
         let mut col = gpui_kit::base::v_flex()
@@ -5634,7 +5753,7 @@ impl AppShell {
             // parse options; `.scrollable` keeps the whole pane from
             // scrolling away under the toolbar.
             .child(
-                crate::mermaid::install_full(
+                mermaid_view(
                     TextView::markdown("reader", src),
                     dark,
                     Some(cx.entity().downgrade()),
@@ -5847,14 +5966,14 @@ impl AppShell {
                     prefs.zoom,
                 )))
                 .child(
-                    crate::mermaid::install_full(
+                    mermaid_view(
                         TextView::markdown(
                             "editor-preview",
-                            browse::reader_markdown_src(
+                            leanote_reader::reader_markdown_src(
                                 &title_txt,
                                 &self
                                     .store()
-                                    .map(|s| browse::resolve_note_images(&src, &s))
+                                    .map(|s| leanote_reader::resolve_note_images(&src, &s))
                                     .unwrap_or_else(|| src.clone()),
                                 true,
                             ),
@@ -6254,6 +6373,40 @@ mod tests {
         assert_eq!(fmt_time(86_400_000), "1970-01-02");
     }
 
+    /// ADR-0014: the follow-theme rainbow wheel must lay out at the full
+    /// 18×18 box (an unsized canvas measures 0×0 and paints nothing) and
+    /// paint its PathBuilder wedges without erroring.
+    #[gpui_kit::test]
+    fn rainbow_wheel_paints(cx: &mut gpui_kit::TestAppContext) {
+        struct Wheel;
+        impl Render for Wheel {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut gpui_kit::Context<Self>,
+            ) -> impl IntoElement {
+                gpui_kit::div()
+                    .id("wheel")
+                    .debug_selector(|| "wheel".into())
+                    .relative()
+                    .size(px(18.))
+                    .child(AppShell::rainbow_wheel().absolute().size_full())
+            }
+        }
+        let window = cx.add_window(|_, _| Wheel);
+        cx.run_until_parked();
+        let mut cx = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = cx
+            .debug_bounds("wheel")
+            .expect("wheel swatch must be laid out");
+        assert_eq!(
+            (bounds.size.width, bounds.size.height),
+            (px(18.), px(18.)),
+            "wheel must fill the 18×18 swatch box"
+        );
+    }
+
     #[test]
     fn nav_selection_compares_by_identity() {
         assert_eq!(
@@ -6270,6 +6423,263 @@ mod tests {
         );
     }
 
+    /// ADR-0014 regression: switching themes in the SAME appearance mode
+    /// must restyle immediately. `Theme::update` runs with
+    /// reload_mode=false, which re-applies a config only when the MODE
+    /// changed — a plain config swap left the old colors live until the
+    /// user flipped light/dark. set_ui_theme must apply the current
+    /// mode's config explicitly.
+    #[gpui_kit::test]
+    fn set_ui_theme_restyles_without_mode_flip(cx: &mut gpui_kit::TestAppContext) {
+        let _state = crate::theme::STATE_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("leanote-themeswitch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        cx.update(gpui_kit::init);
+        let mut shell_entity: Option<gpui_kit::Entity<AppShell>> = None;
+        let window = cx
+            .update(|cx| {
+                cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+                    let shell = cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true,
+                            Some("user1".into()),
+                            None,
+                            None,
+                        )
+                    });
+                    shell_entity = Some(shell.clone());
+                    shell
+                })
+            })
+            .unwrap();
+        let _shell_entity = shell_entity.unwrap();
+        cx.run_until_parked();
+        cx.background_executor.allow_parking();
+
+        // Boot sequence (main.rs): register bundled themes, pick Navop,
+        // install the pair. Without registration every registry lookup
+        // in set_ui_theme misses and falls to kit defaults.
+        cx.update(|cx| {
+            crate::theme::register(cx);
+            crate::theme::select("Default");
+            use gpui_kit::component::{Theme, ThemeRegistry};
+            let registry = ThemeRegistry::global(cx);
+            let light = registry
+                .themes()
+                .get(crate::theme::resolved_name(false))
+                .cloned()
+                .unwrap();
+            let dark = registry
+                .themes()
+                .get(crate::theme::resolved_name(true))
+                .cloned()
+                .unwrap();
+            Theme::update(cx, |theme| {
+                theme.light_theme = light;
+                theme.dark_theme = dark;
+            });
+            Theme::change(gpui_kit::component::ThemeMode::Light, None, cx);
+        });
+        // Light mode (test default); Navop Light vs Gruvbox Light sidebars
+        // differ, and apply_wake_theme never overwrites colors.sidebar.
+        let sidebar =
+            |cx: &mut gpui_kit::App| gpui_kit::component::Theme::global(cx).colors.sidebar;
+        let before = cx.update(sidebar);
+        window
+            .update(cx, |shell, _window, cx| shell.set_ui_theme("Gruvbox", cx))
+            .unwrap();
+        let after = cx.update(sidebar);
+        assert_ne!(
+            before, after,
+            "same-mode theme switch must restyle without an appearance flip"
+        );
+        assert_eq!(
+            cx.update(|cx| gpui_kit::component::Theme::global(cx)
+                .highlight_theme
+                .name
+                .clone()),
+            "Gruvbox Light",
+            "syntax highlight must follow the switched theme"
+        );
+        // Mode flip after the switch: dark must resolve to Gruvbox Dark
+        // (the newly installed pair), not a stale default.
+        window
+            .update(cx, |shell, _window, cx| shell.set_appearance(2, cx))
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| gpui_kit::component::Theme::global(cx)
+                .highlight_theme
+                .name
+                .clone()),
+            "Gruvbox Dark"
+        );
+        // Radii follow the theme: Matrix squares them off (0), Gruvbox
+        // (no radius keys) gets the app panel radius. Switch back and
+        // forth to prove BOTH directions restyle.
+        window
+            .update(cx, |shell, _window, cx| shell.set_ui_theme("Matrix", cx))
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| gpui_kit::component::Theme::global(cx).radius_lg),
+            px(0.),
+            "Matrix (radius.lg = 0) must square off large radii"
+        );
+        window
+            .update(cx, |shell, _window, cx| shell.set_ui_theme("Gruvbox", cx))
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| gpui_kit::component::Theme::global(cx).radius_lg),
+            px(crate::theme::RADIUS_PANEL),
+            "leaving Matrix must restore rounded radii"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Sync UX regression: (1) an in-flight sync's completion must survive
+    /// unrelated `_task` writes — autosave/export/image-save used to drop
+    /// the task, so the pull landed in the DB but the notify never fired
+    /// and the open reader showed stale text until the user switched
+    /// notes; (2) the spinner lifecycle (`syncing` true → false) that
+    /// drives the footer's spinning sync icon.
+    #[gpui_kit::test]
+    fn sync_completion_survives_task_overwrite_and_refreshes_note(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use leanote_fakeserver::FakeServer;
+        use serde_json::json;
+
+        // Fake server on its own thread + runtime (same shape as main.rs
+        // boot_fake_server); the handle is Arc-shared so the test can
+        // mutate the "server side" afterwards.
+        let (tx, rx) = std::sync::mpsc::channel::<FakeServer>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+            rt.block_on(async {
+                let srv = leanote_fakeserver::start().await;
+                srv.set_sync_usn(1);
+                srv.set_notebooks(vec![json!({
+                    "NotebookId":"nb1","Title":"Inbox","Seq":1,"ParentNotebookId":"",
+                    "IsDeleted":false,"Usn":1,
+                    "CreatedTime":"2026-01-01T00:00:00Z","UpdatedTime":"2026-01-01T00:00:00Z"
+                })]);
+                srv.set_notes(vec![json!({
+                    "NoteId":"n1","Title":"Note","NotebookId":"nb1","Usn":1,
+                    "IsDeleted":false,"IsTrash":false,"IsMarkdown":true,"Tags":"[]",
+                    "CreatedTime":"2026-01-01T00:00:00Z","UpdatedTime":"2026-01-01T00:00:00Z"
+                })]);
+                srv.set_contents(
+                    [("n1".to_string(), json!("old body"))]
+                        .into_iter()
+                        .collect(),
+                );
+                srv.set_tags(vec![]);
+                tx.send(srv.clone()).unwrap();
+                std::future::pending::<()>().await
+            });
+        });
+        let srv = rx.recv().unwrap();
+
+        let dir = std::env::temp_dir().join(format!("leanote-syncrefresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Signed-in state, seeded by a first full sync (outside the UI).
+        let store = leanote_core::Store::open(dir.clone(), "user1".into()).unwrap();
+        let acct = Api::login(
+            &srv.url(),
+            leanote_fakeserver::EMAIL,
+            leanote_fakeserver::PWD,
+            &store,
+        )
+        .unwrap();
+        leanote_core::sync::full_sync(&Api::for_account(&acct), &store, &NoProgress).unwrap();
+
+        cx.update(gpui_kit::init);
+        let note_id = leanote_core::Id("n1".into());
+        let window = cx
+            .update(|cx| {
+                cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+                    cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true,
+                            Some("user1".into()),
+                            None,
+                            None,
+                        )
+                    })
+                })
+            })
+            .unwrap();
+        // The note is open in the reader.
+        window
+            .update(cx, |shell, window, cx| {
+                shell.select_note(note_id.clone(), window, cx);
+                let n = shell
+                    .store()
+                    .unwrap()
+                    .get_note_any(&note_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(n.content, "old body");
+            })
+            .unwrap();
+
+        // Server-side edit arrives (another client changed the note).
+        srv.set_contents(
+            [("n1".to_string(), json!("new body from server"))]
+                .into_iter()
+                .collect(),
+        );
+        srv.set_notes(vec![json!({
+            "NoteId":"n1","Title":"Note","NotebookId":"nb1","Usn":2,
+            "IsDeleted":false,"IsTrash":false,"IsMarkdown":true,"Tags":"[]",
+            "CreatedTime":"2026-01-01T00:00:00Z","UpdatedTime":"2026-01-02T00:00:00Z"
+        })]);
+        srv.set_sync_usn(2);
+
+        // Sync, then immediately clobber `_task` the way an autosave
+        // timer / export panel does — the old single-slot bug.
+        window
+            .update(cx, |shell, _window, cx| {
+                shell.sync_now(cx);
+                assert!(shell.syncing, "spinner state must be on while syncing");
+                shell._task = None; // what schedule_autosave/export used to do
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        window
+            .update(cx, |shell, _window, _cx| {
+                assert!(!shell.syncing, "spinner must stop after completion");
+                assert!(
+                    matches!(shell.sync_status, Some(Ok(_))),
+                    "completion must run despite the _task overwrite — it is \
+                     the notify that repaints the open reader"
+                );
+                // The reader re-reads this exact row every frame.
+                let n = shell
+                    .store()
+                    .unwrap()
+                    .get_note_any(&note_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    n.content, "new body from server",
+                    "pulled content must be what the reader renders"
+                );
+            })
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
     /// End-to-end vim pipeline check: real AppShell view rendered in a test
     /// window, keystrokes dispatched through the full gpui pipeline (bindings
     /// → actions → key listeners), asserting against the real editor buffer.
@@ -7762,10 +8172,27 @@ Element tree, entities, contexts."
 /// too heavy for a text wash, making the span unreadable. Keep the accent
 /// hue but fade it to 10% alpha so body text stays legible on top.
 fn markdown_view_style() -> TextViewStyle {
-    TextViewStyle::default().inline_code(HighlightStyle {
-        background_color: Some(crate::theme::accent().opacity(0.1)),
-        ..Default::default()
-    })
+    leanote_reader::markdown_view_style(crate::theme::accent())
+}
+
+/// Mermaid + 图片右键菜单（桌面版把 AppShell 菜单接进共享渲染管线）。
+fn mermaid_view(
+    view: gpui_kit::component::text::TextView,
+    dark: bool,
+    shell: Option<gpui_kit::WeakEntity<AppShell>>,
+) -> gpui_kit::component::text::TextView {
+    let menu = shell.map(|shell| {
+        std::sync::Arc::new(
+            move |url: &gpui_kit::SharedUri,
+                  source: &gpui_kit::ImageSource,
+                  event: &gpui_kit::ClickEvent,
+                  window: &mut Window,
+                  cx: &mut gpui_kit::App| {
+                on_image_menu(shell.clone(), url, source, event, window, cx)
+            },
+        ) as leanote_reader::mermaid::ImageMenuHandler
+    });
+    leanote_reader::mermaid::install_full(view, dark, menu)
 }
 
 /// Suggested `(stem, extension)` for saving `url`'s image.

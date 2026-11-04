@@ -1,10 +1,11 @@
-//! Wake visual language (ADR-0003): 4 material layers, 8 type sizes, 4px
-//! spacing grid, panel/selection radii, Wake-blue accent, SF Pro + Menlo.
-//! Dark/light follow the system; this module only carries the token values.
+//! Visual language (ADR-0003 system, ADR-0014 Navop theme registry): 4
+//! material layers, 8 type sizes, 4px spacing grid, panel/selection
+//! radii, theme-following accent, SF Pro + Menlo. Dark/light follow the
+//! system; this module only carries the token values.
 
-pub use crate::theme_family::{
-    border, family_highlight, family_index, foreground, glass_base, material, muted_foreground,
-    set_family, FAMILIES,
+pub use crate::theme_registry::{
+    border, choices, foreground, glass_base, material, muted_foreground, register, resolved_name,
+    select, theme_radii, MODE_DARK,
 };
 use gpui_kit::{hsla, px, Hsla, Pixels};
 
@@ -43,11 +44,13 @@ pub fn spacing(n: i32) -> Pixels {
 pub const RADIUS_PANEL: f32 = 12.;
 pub const RADIUS_SELECTION: f32 = 8.;
 
-/// User-selectable accents, matching the macOS accent swatches (System
-/// Settings → Appearance): blue/purple/pink/red/orange/yellow/green, plus
-/// pure black. "blue" is the ADR-0003 default.
+/// User-selectable accent overrides, matching the macOS accent swatches
+/// (System Settings → Appearance): blue/purple/pink/red/orange/yellow/
+/// green, plus pure black. The DEFAULT ("" / no pick) follows the active
+/// Navop theme's primary — Navop's own model, where the custom accent is
+/// an optional override (ADR-0014).
 pub const ACCENTS: &[(&str, u32)] = &[
-    ("blue", 0x0a84ff),
+    ("blue", 0x3b82f6),
     ("purple", 0xbf5af2),
     ("pink", 0xff2d92),
     ("red", 0xff453a),
@@ -57,38 +60,55 @@ pub const ACCENTS: &[(&str, u32)] = &[
     ("black", 0x000000),
 ];
 
-static CURRENT_ACCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x0a84ff);
+/// u32::MAX = follow the theme's primary (the default); otherwise an ACCENTS hex
+/// (0 is NOT the sentinel — the black swatch is 0x000000).
+static CURRENT_ACCENT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
 
-/// Set the current accent by id; unknown ids (incl. "") fall back to blue.
-/// Callers re-apply the theme afterwards so derived colors update.
+/// Set the accent by swatch id. "" / unknown ids clear the override and
+/// follow the theme. Callers re-apply the theme afterwards so derived
+/// colors update.
 pub fn set_accent(id: &str) {
     let hex = ACCENTS
         .iter()
         .find(|(k, _)| *k == id)
         .map(|(_, v)| *v)
-        .unwrap_or(0x0a84ff);
+        .unwrap_or(u32::MAX);
     CURRENT_ACCENT.store(hex, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The active accent color (macOS blue by default) — selection + actions only.
+/// True when the user picked a swatch (the theme override is active).
+pub fn accent_is_custom() -> bool {
+    CURRENT_ACCENT.load(std::sync::atomic::Ordering::Relaxed) != u32::MAX
+}
+
+/// The active accent — the theme's primary unless the user picked a
+/// swatch. Selection + actions only.
 pub fn accent() -> Hsla {
-    gpui_kit::rgb(CURRENT_ACCENT.load(std::sync::atomic::Ordering::Relaxed)).into()
+    if accent_is_custom() {
+        gpui_kit::rgb(CURRENT_ACCENT.load(std::sync::atomic::Ordering::Relaxed)).into()
+    } else {
+        crate::theme_registry::theme_primary()
+    }
+}
+
+/// Foreground that stays legible on `accent()`: the theme's own choice
+/// when following, else bright custom accents (yellow/green/orange/
+/// graphite) get black and the rest white.
+pub fn accent_foreground() -> Hsla {
+    if !accent_is_custom() {
+        crate::theme_registry::theme_primary_foreground()
+    } else if accent_luminance() > 0.55 {
+        hsla(0., 0., 0., 1.)
+    } else {
+        hsla(0., 0., 1., 1.)
+    }
 }
 
 fn accent_luminance() -> f32 {
     let hex = CURRENT_ACCENT.load(std::sync::atomic::Ordering::Relaxed);
     let [r, g, b] = [(hex >> 16) & 0xff, (hex >> 8) & 0xff, hex & 0xff];
     (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.
-}
-
-/// Foreground that stays legible on `accent()`: bright accents
-/// (yellow/green/orange/graphite) get black, the rest white.
-pub fn accent_foreground() -> Hsla {
-    if accent_luminance() > 0.55 {
-        hsla(0., 0., 0., 1.)
-    } else {
-        hsla(0., 0., 1., 1.)
-    }
 }
 
 /// Sans follows the system (".SystemUIFont" = SF Pro on macOS).
@@ -141,6 +161,12 @@ pub fn ui(n: f32) -> gpui_kit::AbsoluteLength {
     gpui_kit::rems(n / 14.).into()
 }
 
+/// The accent/mode globals (CURRENT_ACCENT, MODE_DARK) are process-wide;
+/// every test that touches them must hold this lock — cargo runs tests
+/// on parallel threads (the race surfaced with the theme-switch test).
+#[cfg(test)]
+pub(crate) static STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,17 +174,12 @@ mod tests {
     #[test]
     fn table_completeness() {
         assert_eq!(MATERIALS.len(), 4);
-        // Every layer has a light and dark value, and dark layers darken as
-        // they rise (base < list < background < popover) so depth reads.
+        // Every layer resolves for both appearances (registry tests cover
+        // the per-theme table itself).
         for dark in [false, true] {
             for m in MATERIALS {
                 let _ = material(m, dark);
             }
-        }
-        for dark in [false, true] {
-            assert!(material(Material::Base, dark).l < material(Material::List, dark).l);
-            assert!(material(Material::List, dark).l < material(Material::Background, dark).l);
-            assert!(material(Material::Background, dark).l <= material(Material::Popover, dark).l);
         }
         // 8 type sizes, strictly ascending.
         assert_eq!(FONT_SIZES.len(), 8);
@@ -187,8 +208,10 @@ mod tests {
 
     #[test]
     fn accent_foreground_contrast() {
-        // Bright accents get black text, the rest (incl. pure black) white.
-        // Restores blue so the global default holds for later tests.
+        let _state = STATE_LOCK.lock().unwrap();
+        // Bright custom accents get black text, the rest (incl. pure
+        // black) white. Restores the no-pick default so the global state
+        // holds for later tests.
         for (id, expect_black) in [
             ("blue", false),
             ("purple", false),
@@ -206,68 +229,24 @@ mod tests {
                 "{id}"
             );
         }
-        set_accent("blue");
+        set_accent("");
     }
 
-    fn lum(hex: &str) -> f32 {
-        // Relative luminance-lite: mean of max/min channel — enough to
-        // order grays and near-grays. Pure table test, no global state.
-        let h = hex.strip_prefix('#').unwrap_or(hex);
-        let ch: Vec<f32> = (0..3)
-            .map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap() as f32 / 255.)
-            .collect();
-        (ch.iter().cloned().fold(f32::MIN, f32::max) + ch.iter().cloned().fold(f32::MAX, f32::min))
-            / 2.
-    }
-
-    /// Families (ADR-0010): every family × appearance has all 4 layers as
-    /// parseable hex, Base/List translucent, fg distinct from bg, and
-    /// layer lightness ordering so depth reads in every family. Pure
-    /// table assertions — no CURRENT_FAMILY global, no test-order coupling.
+    /// ADR-0014: no pick (""/unknown) follows the active theme's primary
+    /// — Navop Light's blue-500 with the default selection — and clears
+    /// the custom flag.
     #[test]
-    fn family_table_completeness() {
-        use crate::theme_family::FAMILIES;
-        assert_eq!(FAMILIES.len(), 6);
-        for f in FAMILIES {
-            for dark in [false, true] {
-                let c = if dark { &f.dark } else { &f.light };
-                let base_alpha = u8::from_str_radix(&c.base[7..9], 16).unwrap() as f32 / 255.;
-                let list_alpha = u8::from_str_radix(&c.list[7..9], 16).unwrap() as f32 / 255.;
-                assert!(base_alpha < 1., "{} base must stay translucent", f.id);
-                assert!(list_alpha < 1., "{} list must stay translucent", f.id);
-                assert_ne!(
-                    lum(c.fg),
-                    lum(c.background),
-                    "{} fg must differ from bg",
-                    f.id
-                );
-                assert!(
-                    lum(c.base) < lum(c.list),
-                    "{}: base {} !< list {}",
-                    f.id,
-                    c.base,
-                    c.list
-                );
-                assert!(
-                    lum(c.list) < lum(c.background),
-                    "{}: list {} !< bg {}",
-                    f.id,
-                    c.list,
-                    c.background
-                );
-                assert!(
-                    lum(c.background) <= lum(c.popover),
-                    "{}: bg {} !<= popover {}",
-                    f.id,
-                    c.background,
-                    c.popover
-                );
-            }
-        }
-        // legacy palette ids map onto the same-named families
-        assert_eq!(family_index("warm"), 2);
-        assert_eq!(family_index("solarized"), 3);
-        assert_eq!(family_index("bogus"), 0);
-        assert_eq!(family_index(""), 0);
+    fn accent_follows_theme_by_default() {
+        let _state = STATE_LOCK.lock().unwrap();
+        set_accent("");
+        assert!(!accent_is_custom());
+        // Default selection: Navop Light in light mode.
+        MODE_DARK.store(false, std::sync::atomic::Ordering::Relaxed);
+        let a = accent();
+        let p = crate::theme_registry::theme_primary();
+        assert_eq!((a.h, a.s, a.l, a.a), (p.h, p.s, p.l, p.a));
+        set_accent("bogus-id");
+        assert!(!accent_is_custom(), "unknown ids clear the override");
+        set_accent("");
     }
 }

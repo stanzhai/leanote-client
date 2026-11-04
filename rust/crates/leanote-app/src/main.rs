@@ -11,20 +11,20 @@ mod fonts;
 mod history_dialog;
 mod i18n;
 mod markdown_input;
-mod mermaid;
 mod pdf;
 mod prefs;
 mod search_overlay;
 mod single_instance;
 mod slash_panel;
 mod theme;
-mod theme_family;
+mod theme_registry;
 mod vim;
 mod window_state;
 
 use app_shell::AppShell;
 use gpui_base::input::set_language_config;
 use gpui_kit::component::input::language_config::LanguageConfig;
+use gpui_kit::component::Colorize as _;
 use gpui_kit::component::Theme;
 use gpui_kit::{px, AppContext as _, TitlebarOptions, WindowOptions};
 use std::path::PathBuf;
@@ -508,18 +508,36 @@ fn leanote_main() {
             ]);
 
             let prefs = prefs::Prefs::load(&dir);
-            // ADR-0010: family first — apply_wake_theme's material/fg/border
-            // reads go through CURRENT_FAMILY.
-            theme::set_family(&prefs.ui_theme);
-            let pref_palette: std::sync::Arc<String> = std::sync::Arc::new(prefs.ui_theme.clone());
-            let palette_boot = pref_palette.clone();
 
-            // Theme: follow system first (loads registered theme), then overlay
-            // Wake tokens + editor palette. Re-applied on every appearance
-            // change. `apply_config` overwrites highlight_theme on every mode
-            // reload, so the palette assignment lives here too.
-            // Panes read window.appearance(); keep it in sync with the saved
-            // pref (issue 19 #26).
+            // ADR-0014 (Navop theme system): register the bundled themes,
+            // pick the user's choice (one name resolves per-mode: "Gruvbox"
+            // → Gruvbox Light in light mode, Gruvbox Dark in dark), then
+            // install the pair as the kit's configs.
+            theme::register(cx);
+            theme::select(&prefs.ui_theme);
+            {
+                use gpui_kit::component::ThemeRegistry;
+                let registry = ThemeRegistry::global(cx);
+                let light = registry
+                    .themes()
+                    .get(theme::resolved_name(false))
+                    .cloned()
+                    .unwrap_or_else(|| registry.default_light_theme().clone());
+                let dark = registry
+                    .themes()
+                    .get(theme::resolved_name(true))
+                    .cloned()
+                    .unwrap_or_else(|| registry.default_dark_theme().clone());
+                Theme::update(cx, |theme| {
+                    theme.light_theme = light;
+                    theme.dark_theme = dark;
+                });
+            }
+
+            // Theme mode: kit loads the selected config (colors + syntax
+            // highlight come from the theme file now). Panes read
+            // window.appearance(); keep it in sync with the saved pref
+            // (issue 19 #26).
             cx.set_window_appearance(match prefs.appearance {
                 prefs::AppearancePref::Follow => None,
                 prefs::AppearancePref::Light => Some(gpui_kit::WindowAppearance::Light),
@@ -534,7 +552,7 @@ fn leanote_main() {
                     Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx)
                 }
             }
-            // Issue 19: restore persisted accent BEFORE the wake overlay —
+            // Issue 19: restore persisted accent BEFORE the overlay —
             // apply_wake_theme reads theme::accent() into colors/tokens, so
             // setting it afterwards left kit hover/selection on the old hue.
             theme::set_accent(&prefs.accent);
@@ -542,13 +560,7 @@ fn leanote_main() {
             let font_boot = prefs.font.clone();
             let editor_size_boot = prefs.editor_font_size.clone();
             Theme::update(cx, move |theme| {
-                apply_wake_theme(
-                    theme,
-                    &palette_boot,
-                    &font_boot,
-                    &editor_size_boot,
-                    zoom_boot,
-                )
+                apply_wake_theme(theme, &font_boot, &editor_size_boot, zoom_boot)
             });
 
             // UI round 10 #6 / Issue 39: register the cached WenKai ttf with
@@ -662,12 +674,11 @@ fn leanote_main() {
                             return;
                         }
                         Theme::sync_system_appearance(None, cx);
-                        let palette = p.ui_theme.clone();
                         let font = p.font;
                         let editor_size = p.editor_font_size.clone();
                         let zoom = p.zoom;
                         Theme::update(cx, move |theme| {
-                            apply_wake_theme(theme, &palette, &font, &editor_size, zoom)
+                            apply_wake_theme(theme, &font, &editor_size, zoom)
                         });
                     })
                     .detach();
@@ -762,72 +773,68 @@ fn save_window_state(window: &mut gpui_kit::Window, dir: &std::path::Path) {
     window_state::WindowState::from_bounds(&b, maximized).save(dir);
 }
 
-/// Wake tokens on top of the kit theme (materials, radii, fonts).
-/// Call AFTER sync_system_appearance, never inside the same update that
+/// App tokens on top of the kit theme (ADR-0014: surfaces and the syntax
+/// highlight come from the Navop theme config via `apply_config`; this
+/// overlay only carries what the theme files don't own — user accent,
+/// glass, fonts, zoom, radii).
+/// Call AFTER the mode/config change, never inside the same update that
 /// changes mode (mode swap reloads and wipes color edits).
-pub(crate) fn apply_wake_theme(
-    theme: &mut Theme,
-    palette_id: &str,
-    font_pref: &str,
-    editor_size: &str,
-    zoom: f32,
-) {
-    use gpui_kit::component::theme::{ThemeColor, ThemeMode};
+pub(crate) fn apply_wake_theme(theme: &mut Theme, font_pref: &str, editor_size: &str, zoom: f32) {
+    use gpui_kit::component::theme::ThemeMode;
     let dark = theme.mode == ThemeMode::Dark;
-    // ThemeColor is Copy; light()/dark() hand back an Arc of the base table.
-    let mut colors = *if dark {
-        ThemeColor::dark()
-    } else {
-        ThemeColor::light()
-    };
-    colors.title_bar = theme::material(theme::Material::Base, dark);
-    colors.sidebar = theme::material(theme::Material::Base, dark);
-    colors.list = theme::material(theme::Material::List, dark);
-    colors.background = theme::material(theme::Material::Background, dark);
-    colors.popover = theme::material(theme::Material::Popover, dark);
-    colors.foreground = theme::foreground(dark);
-    colors.muted_foreground = theme::muted_foreground(dark);
-    colors.border = theme::border(dark);
-    // Selection color: kit defaults (light: blue wash 0x1d4ed8@0.3, dark:
-    // 0x55a0fc@0.3) — overriding with solid white made light-mode selection
-    // invisible (white on white). Issue 24 regression: apply_wake_theme runs
-    // on every theme switch AND accent change, so the override leaked into
-    // the reader/preview selection after any accent pick in light mode.
-    colors.accent = theme::accent();
-    colors.primary = theme::accent();
-    // Selected segmented pills (settings rows) paint from the primary
-    // button tokens. Written on BOTH sides (colors + tokens): reconcile
-    // keeps a field only when the two agree — a token-only write survived
-    // same-mode replays but any mode/appearance switch changed
-    // colors.button_primary (kit per-mode default: neutral-900 light /
-    // neutral-50 dark) and reconcile stamped that near-black/near-white
-    // default back over the accent. Same trick as the transparent
-    // background below.
-    colors.button_primary = theme::accent();
-    colors.button_primary_hover = theme::accent().opacity(0.9);
-    colors.button_primary_active = theme::accent().opacity(0.8);
-    colors.button_primary_foreground = theme::accent_foreground();
-    // White on the accent in BOTH modes: kit default (neutral-900/neutral-50)
-    // put dark text on the mid-saturation wake accents — unreadable menu
-    // hover / ⌘K selection / ghost-button hover in light mode.
-    colors.accent_foreground = theme::accent_foreground();
-    theme.colors = colors;
+    theme::MODE_DARK.store(dark, std::sync::atomic::Ordering::Relaxed);
+
+    // Issue 19 / Navop's custom-accent model: a picked swatch overrides
+    // the theme's primary everywhere (accent, buttons, ring); no pick
+    // leaves the theme file's own primary in charge.
+    if theme::accent_is_custom() {
+        let accent = theme::accent();
+        // Navop's hover recipe: lighten 0.1 on hover, darken 0.1 on press.
+        theme.colors.primary = accent;
+        theme.colors.primary_hover = accent.lighten(0.1);
+        theme.colors.primary_active = accent.darken(0.1);
+        theme.colors.primary_foreground = theme::accent_foreground();
+        theme.colors.accent = accent;
+        theme.colors.accent_foreground = theme::accent_foreground();
+        // Selected segmented pills (settings rows) paint from the primary
+        // button tokens. Written on BOTH sides (colors + tokens):
+        // reconcile keeps a field only when the two agree — a token-only
+        // write survived same-mode replays but any mode/appearance switch
+        // reloaded the config and reconcile stamped the file's primary
+        // back over the pick. Same trick as the transparent background.
+        theme.colors.button_primary = accent;
+        theme.colors.button_primary_hover = accent.lighten(0.1);
+        theme.colors.button_primary_active = accent.darken(0.1);
+        theme.colors.button_primary_foreground = theme::accent_foreground();
+        theme.colors.ring = accent;
+        theme.colors.list_active_border = accent;
+        theme.colors.drag_border = accent;
+        theme.colors.selection = accent.opacity(0.25);
+    }
+
     // Issue 19: the kit Root plugin paints the window from
-    // `tokens.background`, a field distinct from `colors` — the kit default
-    // (opaque white / neutral-950) covered the blurred window background.
-    // Root must stay fully transparent; the nav pane paints the glass tint.
+    // `tokens.background`, a field distinct from `colors` — the kit
+    // default covered the blurred window background. Root must stay
+    // fully transparent; the nav pane paints the glass tint.
     //
-    // Both sides are set to the SAME transparent value. Reconcile then sees
-    // `colors.background` changed but `tokens.background.color` already
-    // equal to it and keeps the token (its "set on both sides to one color"
-    // branch) — writing only the token made reconcile stamp the opaque
-    // material back in whenever the family/mode changed `colors.background`,
-    // killing the glass until an identical second click. Only this pair:
-    // tokens.popover feeds menus/dialog panels, which stay opaque.
+    // Both sides are set to the SAME transparent value. Reconcile then
+    // sees `colors.background` changed but `tokens.background.color`
+    // already equal to it and keeps the token (its "set on both sides to
+    // one color" branch) — writing only the token made reconcile stamp
+    // the opaque material back in whenever the theme/mode changed
+    // `colors.background`, killing the glass until an identical second
+    // click. Only this pair: tokens.popover feeds menus/dialog panels,
+    // which stay opaque.
     let transparent = gpui_kit::transparent_black();
     theme.colors.background = transparent;
     theme.tokens = (&theme.colors).into();
-    theme.radius_lg = px(theme::RADIUS_PANEL);
+    // ADR-0014: radii FOLLOW THE THEME — Matrix squares everything off
+    // at 0. apply_config only writes radii when the theme HAS the keys,
+    // so a theme without them would inherit the previous theme's value;
+    // set both explicitly from the registry (None → app defaults).
+    let (radius, radius_lg) = crate::theme_registry::theme_radii(dark);
+    theme.radius = px(radius.unwrap_or(6.));
+    theme.radius_lg = px(radius_lg.unwrap_or(theme::RADIUS_PANEL));
     theme.font_family = theme::sans_for(font_pref).into();
     // Issue 24: rem size must come from theme.font_size — the kit Root
     // plugin re-stamps window rem from it every frame, so any window-level
@@ -838,10 +845,6 @@ pub(crate) fn apply_wake_theme(
     theme.mono_font_family = theme::sans_for(font_pref).into();
     theme.mono_font_size = px(theme::editor_font_px(editor_size) * zoom);
     theme.shadow = false; // ADR-0003: zero shadow on persistent UI
-                          // ADR-0010: highlight theme comes from the active family ("" = kit
-                          // default). Must RESET every call — skipping the write left a
-                          // previously-picked family live until restart.
-    theme.highlight_theme = theme::family_highlight(palette_id, dark);
 }
 
 #[cfg(test)]
@@ -851,31 +854,35 @@ mod selection_tests {
     /// Issue 24 regression: the white selection override made light-mode
     /// text selection invisible (white on white). apply_wake_theme runs on
     /// boot, every appearance change AND every accent change, so the token
-    /// must stay a translucent kit default in BOTH modes.
+    /// must stay a translucent wash in BOTH modes — the theme file's own
+    /// selection, or accent@0.25 when the user picked a swatch.
     #[test]
     fn selection_stays_translucent_in_both_modes() {
-        for mode in [
-            gpui_kit::component::ThemeMode::Light,
-            gpui_kit::component::ThemeMode::Dark,
-        ] {
-            let mut theme = gpui_kit::component::Theme::default();
-            theme.mode = mode;
-            apply_wake_theme(&mut theme, "", "", "", 1.0);
-            let sel = theme.colors.selection;
-            assert!(
-                sel.a < 1.,
-                "{mode:?}: selection must be a translucent wash, got {sel:?}"
-            );
-            // Light mode: a wash must not be white — white on white is
-            // invisible on the light materials.
-            if mode == gpui_kit::component::ThemeMode::Light {
-                let white = gpui_kit::white();
+        let _state = crate::theme::STATE_LOCK.lock().unwrap();
+        for custom in [false, true] {
+            crate::theme::set_accent(if custom { "pink" } else { "" });
+            for mode in [
+                gpui_kit::component::ThemeMode::Light,
+                gpui_kit::component::ThemeMode::Dark,
+            ] {
+                let mut theme = gpui_kit::component::Theme::default();
+                theme.mode = mode;
+                apply_wake_theme(&mut theme, "", "", 1.0);
+                let sel = theme.colors.selection;
                 assert!(
-                    (sel.l - white.l).abs() > 0.1 || sel.a < 0.9,
-                    "{mode:?}: selection is effectively white — invisible in light mode"
+                    sel.a < 1.,
+                    "{mode:?}/{custom}: selection must be a translucent wash, got {sel:?}"
                 );
+                if mode == gpui_kit::component::ThemeMode::Light {
+                    let white = gpui_kit::white();
+                    assert!(
+                        (sel.l - white.l).abs() > 0.1 || sel.a < 0.9,
+                        "{mode:?}/{custom}: selection is effectively white — invisible in light mode"
+                    );
+                }
             }
         }
+        crate::theme::set_accent("");
     }
 
     /// UI round 12 regression: a botched edit dropped `theme.font_size`, so
@@ -884,7 +891,7 @@ mod selection_tests {
     #[test]
     fn zoom_scales_ui_and_editor_fonts() {
         let mut theme = gpui_kit::component::Theme::default();
-        apply_wake_theme(&mut theme, "", "", "medium", 1.2);
+        apply_wake_theme(&mut theme, "", "medium", 1.2);
         assert_eq!(theme.font_size, gpui_kit::px(14. * 1.2));
         assert_eq!(theme.mono_font_size, gpui_kit::px(16. * 1.2));
     }
@@ -896,21 +903,23 @@ mod glass_tests {
 
     /// Round 4 regression: `Theme::update` runs `reconcile` after the
     /// closure, which overwrites `tokens.background` with the (opaque)
-    /// `colors.background` whenever that color changed — family/accent/
-    /// appearance switches killed the window glass until a no-change second
-    /// click. The fix writes the SAME transparent value on both sides, the
-    /// branch reconcile leaves untouched. Simulate reconcile's field loop
-    /// for `background` after a family switch and assert the token survives.
+    /// `colors.background` whenever that color changed — theme/accent/
+    /// appearance switches killed the window glass until a no-change
+    /// second click. The fix writes the SAME transparent value on both
+    /// sides, the branch reconcile leaves untouched. Simulate reconcile's
+    /// field loop for `background` after a theme switch and assert the
+    /// token survives.
     #[test]
     fn reconcile_keeps_transparent_background_token() {
         let mut theme = gpui_kit::component::Theme::default();
-        apply_wake_theme(&mut theme, "moss", "", "", 1.0);
+        apply_wake_theme(&mut theme, "", "", 1.0);
         // reconcile's per-field logic, hand-rolled for `background`.
         let colors_before = theme.colors;
         let tokens_before = theme.tokens;
-        // A family/mode switch changes colors.background (opaque material
-        // of the OTHER family) before our closure re-runs.
-        apply_wake_theme(&mut theme, "", "", "", 1.0);
+        // A theme/mode switch reloads the config, which rewrites
+        // colors.background (opaque) before our closure re-runs.
+        theme.colors.background = gpui_kit::white();
+        apply_wake_theme(&mut theme, "", "", 1.0);
         if theme.colors.background != colors_before.background {
             if theme.tokens.background.color != theme.colors.background {
                 theme.tokens.background = theme.colors.background.into();
@@ -927,33 +936,35 @@ mod glass_tests {
 
     /// The settings segmented pills paint from tokens.button_primary. A
     /// token-only accent write was wiped by reconcile on every mode
-    /// switch (colors.button_primary carried the kit per-mode default —
+    /// switch (colors.button_primary reloaded from the theme file —
     /// near black in light, near WHITE in dark: the "sometimes white"
-    /// selected pill). Writing colors + tokens to one value keeps the
-    /// accent through reconcile, like the transparent background above.
+    /// selected pill). Writing colors + tokens to one value keeps a
+    /// PICKED accent through reconcile, like the transparent background.
     #[test]
-    fn reconcile_keeps_accent_primary_button() {
+    fn reconcile_keeps_picked_accent_primary_button() {
+        let _state = crate::theme::STATE_LOCK.lock().unwrap();
+        crate::theme::set_accent("purple");
         let mut theme = gpui_kit::component::Theme::default();
-        apply_wake_theme(&mut theme, "", "", "", 1.0);
-        // Mode switch: kit loads the OTHER mode's table, changing
-        // colors.button_primary to its per-mode default, then our closure
-        // re-runs. Hand-roll reconcile's field loop for button_primary.
+        apply_wake_theme(&mut theme, "", "", 1.0);
+        // Mode switch: kit loads the OTHER mode's config, changing
+        // colors.button_primary to its value, then our closure re-runs.
         let colors_before = theme.colors;
         let tokens_before = theme.tokens;
         theme.colors.button_primary = gpui_kit::component::theme::ThemeColor::dark().button_primary;
-        apply_wake_theme(&mut theme, "", "", "", 1.0);
+        apply_wake_theme(&mut theme, "", "", 1.0);
         if theme.colors.button_primary != colors_before.button_primary {
             if theme.tokens.button_primary.color != theme.colors.button_primary {
                 theme.tokens.button_primary = theme.colors.button_primary.into();
             }
         } else if theme.tokens.button_primary != tokens_before.button_primary {
-            theme.colors.button_primary = theme.tokens.button_primary.color;
+            theme.colors.button_primary = theme.tokens.background.color;
         }
         let expected = crate::theme::accent();
         let got = theme.tokens.button_primary.color;
         assert_eq!(
             got, expected,
-            "selected pill must stay the accent after a mode switch, got {got:?}"
+            "selected pill must stay the picked accent after a mode switch, got {got:?}"
         );
+        crate::theme::set_accent("");
     }
 }

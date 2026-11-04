@@ -1,0 +1,47 @@
+name: mobile-check
+
+# 移动端双 target 编译门禁（issue 09 / ADR-0013）：
+# iOS check 需 Xcode SDK（macos runner 原生满足）；Android check 需 NDK。
+on:
+  push:
+    paths: ["rust/**", ".github/workflows/mobile-check.yml"]
+  pull_request:
+    paths: ["rust/**", ".github/workflows/mobile-check.yml"]
+
+jobs:
+  ios:
+    name: cargo check aarch64-apple-ios
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p leanote-mobile --target aarch64-apple-ios
+
+  android:
+    name: cargo check aarch64-linux-android
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: rust
+    env:
+      ANDROID_NDK_VERSION: "28.2.13676358"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NDK toolchain env
+        run: |
+          YES=y "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" > /dev/null
+          NDK_TOOL="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CC_aarch64_linux_android=$NDK_TOOL/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_linux_android=$NDK_TOOL/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$NDK_TOOL/llvm-ar" >> "$GITHUB_ENV"
+      - run: cargo check -p leanote-mobile --target aarch64-linux-android

@@ -26,3 +26,9 @@ node_modules/fs.extra
 
 node_modules
 .omc
+
+# mobile build artifacts
+rust/mobile/ios/build/
+rust/mobile/android/gradle/app/build/
+rust/mobile/android/gradle/app/src/main/jniLibs/
+rust/mobile/android/gradle/mobile/
