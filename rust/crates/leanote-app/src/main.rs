@@ -794,8 +794,7 @@ pub(crate) fn apply_wake_theme(theme: &mut Theme, font_pref: &str, editor_size: 
         theme.colors.primary_hover = accent.lighten(0.1);
         theme.colors.primary_active = accent.darken(0.1);
         theme.colors.primary_foreground = theme::accent_foreground();
-        theme.colors.accent = accent;
-        theme.colors.accent_foreground = theme::accent_foreground();
+
         // Selected segmented pills (settings rows) paint from the primary
         // button tokens. Written on BOTH sides (colors + tokens):
         // reconcile keeps a field only when the two agree — a token-only
@@ -811,6 +810,29 @@ pub(crate) fn apply_wake_theme(theme: &mut Theme, font_pref: &str, editor_size: 
         theme.colors.drag_border = accent;
         theme.colors.selection = accent.opacity(0.25);
     }
+
+    // `colors.accent` drives kit accent consumers — ghost/icon button
+    // hover paints a 50% wash of tokens.accent (button.rs `Ghost`).
+    // The theme files' own `accent.background` keys are deep/pale
+    // selection tints (Navop Dark #1e3a8a, Light #e0f2fe), NOT the
+    // "follow the theme" accent the picker promises — ADR-0014 defines
+    // that as the theme's PRIMARY. Written in BOTH modes from
+    // theme::accent(): the pick, or the active theme's primary.
+    theme.colors.accent = theme::accent();
+    theme.colors.accent_foreground = theme::accent_foreground();
+
+    // Markdown-rendered links paint from `colors.link` — the theme-file
+    // key falls back to the file's primary at APPLY time only, and a
+    // swatch switch (custom → follow-theme) re-runs this overlay without
+    // reloading the config, which would leave the link stale on the old
+    // swatch. Written UNCONDITIONALLY: `theme::accent()` resolves to the
+    // picked swatch or the active theme's primary (the same value the
+    // config fallback yields), so both sources drive markdown rendering.
+    // Same hover/active recipe as primary.
+    let link = theme::accent();
+    theme.colors.link = link;
+    theme.colors.link_hover = link.lighten(0.1);
+    theme.colors.link_active = link.darken(0.1);
 
     // Issue 19: the kit Root plugin paints the window from
     // `tokens.background`, a field distinct from `colors` — the kit
@@ -883,6 +905,41 @@ mod selection_tests {
             }
         }
         crate::theme::set_accent("");
+    }
+
+    /// Markdown links render from `colors.link` (the theme-file key falls
+    /// back to the file's primary at apply time — schema.rs
+    /// `apply_color!(link, fallback = self.primary)`). Both accent sources
+    /// must drive it: a picked swatch (custom branch) AND the theme's own
+    /// primary (follow mode). The follow case also covers the stale-value
+    /// bug: switching custom → follow re-runs the overlay without a config
+    /// reload, so the link must be rewritten, not left on the old swatch.
+    #[test]
+    fn picked_accent_drives_markdown_link_color() {
+        let _state = crate::theme::STATE_LOCK.lock().unwrap();
+        // Custom swatch → link follows the pick.
+        crate::theme::set_accent("purple");
+        let mut theme = gpui_kit::component::Theme::default();
+        apply_wake_theme(&mut theme, "", "", 1.0);
+        assert_eq!(
+            theme.colors.link,
+            crate::theme::accent(),
+            "preview links must follow the picked accent"
+        );
+        // Follow theme → link follows the theme's primary, not the stale
+        // purple left in colors by the run above.
+        crate::theme::set_accent("");
+        apply_wake_theme(&mut theme, "", "", 1.0);
+        assert_eq!(
+            theme.colors.link,
+            crate::theme::accent(),
+            "preview links must follow the theme primary in follow mode"
+        );
+        assert_eq!(
+            theme.tokens.link.color,
+            crate::theme::accent(),
+            "tokens side must agree"
+        );
     }
 
     /// UI round 12 regression: a botched edit dropped `theme.font_size`, so

@@ -1,6 +1,14 @@
 # 更新日志 / Changelog
 
 
+
+## Unreleased
+
+- **默认主题（Navop Dark）深色模式整体提亮 + 左栏层次感 + 主流语法着色**：原深色整体过深，且侧栏 `#1e1e1e` 与内容区 `#171717` 仅差 7/255，窗口糊成一块平面。锚点重定（用户裁决）：侧栏 `#262626`、中栏/阅读区 `#333333`（参考 Navop 体系引入前「侧栏最深、亮度向内容逐层爬升」的分层设计，步长 13）；markdown 编辑器面同为 `#262626`——深色收敛为两级灰阶（`#262626` 沉浸面：侧栏/列表/表格/编辑器，`#333333` 窗口面）。其余深色值按新锚点均衡重排：popover/secondary `#3a3a3a`、hover `#474747`、active `#575757`、border `#4a4a4a`、滚动条拇指 `#545454`；饱和色不动。**语法着色**：Navop 原语法表只覆盖 keyword/string 等 10 个通用 token，markdown 的 capture 词汇（标题/强调/链接/行内代码/列表标记）一个都没定义，编辑器里 markdown 几乎无色；深色换 **One Dark**、浅色换 **GitHub Light** 主流标准配色，并补全 kit schema 原生支持的 markdown token——标题粗体着色、`*强调*` 斜体、`**粗体**`、行内 `代码`、链接文字/地址、列表标记、围栏分隔符各得其所。单一数据源不变：kit 组件与应用面板仍读同一份 navop.json（ADR-0014 修订 8）。
+- **修复：markdown 渲染强调色跟随用户色板与主题色（双向）**：阅读/预览链接色渲染自 `colors.link`——该键仅在主题配置 apply 时回落求值一次（schema `apply_color!(link, fallback = primary)`）。`apply_wake_theme` 现在**无条件**写入 `link`/`link_hover`/`link_active`（取 `theme::accent()`：色板色或当前主题 primary），色板与跟随两种来源都动态作用于 markdown 渲染；渲染侧每帧从活动主题折算，写入即生效。
+- **修复：强调色切回「跟随主题」后界面组件残留旧色板（整体排查）**：`set_accent` 此前只重放 wake overlay、不重载主题配置——而 overlay 的自定义分支会覆写 `primary`/`accent`/`ring`/`selection`/`button_primary`/`list_active_border`/`drag_border`，从色板切回跟随时这些字段没有任何东西把它们恢复成主题文件值，于是图标按钮、设置面板选中胶囊等 kit 组件钉死在旧色板上。修复：抽出 `reapply_theme_config`（重装注册表当前主题对 + 显式 apply_config 当前模式，`set_ui_theme` 原有逻辑复用），`set_accent` 在 overlay 前先跑它——自定义分支随后按需覆写，跟随则保留文件原值，双向都干净。移动端排查：`PrefsChanged` 每次全量 `theme::apply`（含配置重载），跟随恢复本就正确，仅补齐自定义色板下漏写的 `link` 三件套（桌面同款）。
+- **修复：跟随主题时图标按钮（ghost）hover 不用主题强调色**：kit 的 ghost 按钮悬停底色 = `tokens.accent` 的 50% 洗色（button.rs `Ghost` 分支），而主题文件自带的 `accent.background` 键是深/浅选择蒙版（Navop Dark `#1e3a8a`、Light `#e0f2fe`），不是「跟随主题」语义里的强调色——ADR-0014 定义跟随 = 主题 **primary**（`#3b82f6`）。`apply_wake_theme` 现在把 `accent`/`accent_foreground` 的写入移出自定义分支、两种模式统一取 `theme::accent()`（色板色或主题 primary）：自定义行为不变，跟随模式下 ghost hover、其他 accent 消费者（缺省 list.hover 回退等）全部与主题强调色一致。回归测试补断言：跟随时 `colors.accent` == 注册表主题 primary。
+
 ## 3.1.11（2026-11-04）
 
 - **修复：大陆无法下载霞鹜文楷等宽**：字体 ttf 此前仅从 GitHub Releases 直链下载，大陆访问 GitHub/objects.githubusercontent.com 常不通导致设置选了字体却始终回退系统字体。改为按序尝试三个同源地址：GitHub 直链 → ghfast.top → gh-proxy.com（均为 GitHub release 加速代理，字节级同源，魔数校验防代理返回 HTML 错误页）；实测死首链后经 ghfast.top 成功取回 25,957,300 字节 ttf。jsDelivr 因 20MB 文件上限（该字体 25.9MB）不可用，清华/南大镜像站未收录此项目。

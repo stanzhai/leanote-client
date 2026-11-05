@@ -317,6 +317,16 @@ mod tests {
             assert_ne!(e.fg.l, e.background.l, "{}: fg equals bg", e.name);
             assert_eq!(e.primary.a, 1.0, "{}: primary must be opaque", e.name);
         }
+        // Pre-Navop depth ordering survives in the default theme (ADR-0014
+        // local fork): the dark sidebar sits clearly below the content
+        // background — the step that keeps the left column and the reading
+        // area readable as two layers (sidebar #0a0a0a < background
+        // #171717, gap ≈ 0.05 in HSL lightness; 0.04 ≈ a 10-pt sRGB step).
+        let d = &ENTRIES[1];
+        assert!(
+            d.background.l - d.sidebar.l > 0.04,
+            "Navop Dark sidebar must be clearly darker than its background"
+        );
         // Picker: pairs collapse to the stem, singles list verbatim, and
         // one choice serves both appearances.
         assert_eq!(choices().first(), Some(&"Default"));

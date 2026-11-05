@@ -15,7 +15,9 @@ ADR-0003/0010 的主题实现是代码内硬编码的 6 个「主题家族」表
 4. **强调色跟随主题 primary（Navop 模型）**：默认（prefs `accent=""`）用当前主题的 `primary.background`/`primary.foreground`；用户点选色板（Issue 19 的 8 色）才覆盖（含 navop 的 hover `lighten(0.1)`/active `darken(0.1)` 配方与 `selection = accent@0.25`）；设置页强调色行最前为**彩虹圆圈**（六色扇形拼圆）= 跟随主题自带强调色（默认选中，白勾），其后 8 个纯色圆圈为手动覆盖。
 5. **单一主题选项（2026-11-04 修订）**：prefs 保留单字段 `ui_theme` 存**主题名**——成对主题（"X Light"/"X Dark"）存族干 "X"，选择器也只列一行；外观模式自动匹配变体（浅色 ↔ "X Light"，深色 ↔ "X Dark"），单模主题（Matrix、Catppuccin Latte…）原名列出、仅服务其所属模式（另一侧回落 Navop）。解析顺序：精确名 → 兄弟变体 → Navop 默认。设置页只有一个「主题」下拉。迁移：老家族 id `solarized` → "Solarized"，`moss`/`warm`/`nord`/`ink` → 默认；中间格式的 `light_theme` 去掉 " Light" 后缀收编。
 6. **删除**：`theme_family.rs`（家族表、`family_highlight`、手写语法 JSON、`set_family`）与 `apply_wake_theme` 里的表面色/滚动条/高亮覆盖全部移除——主题文件说了算。
+
 7. **不动**：玻璃强度 pref（作用于 nav 面板 Base 色 alpha）、选区半透明约束（Issue 24 回归测试改为覆盖「跟随主题」与「自定义色板」两分支）、字体/缩放/圆角/间距（ADR-0003 体系）。
+8. **默认主题深色整体提亮与侧栏分层（2026-11-05 修订）**：Navop Dark 原值整体过深且侧栏 `#1e1e1e` 距正文 `#171717` 仅 7/255，深色下整个窗口糊成一块平面。用户裁决（三轮）：① 分层参考 Navop 前家族表的「侧栏最深、亮度向内容爬升」；② 整体过深，锚点定为侧栏 `#262626`、正文/列表/阅读区 `#333333`；③ 编辑器面同为 `#262626`——深色收敛为两级灰阶（`#262626` 沉浸面：侧栏/list/table/编辑器，`#333333` 窗口面），层间步长统一 13。其余深色值按新锚点重排：popover/secondary `#3a3a3a`、hover `#474747`、active `#575757`、全局 border `#4a4a4a`、滚动条拇指 `#545454`；饱和色（primary/danger/success/warning/info）不动。④ **语法着色换主流方案**：Navop 原语法表只定义了 10 个通用 token（keyword/string/…），而 markdown 的 tree-sitter capture 词汇是 `title`/`emphasis(.strong)`/`link_uri`/`link_text`/`text.code.span`/`punctuation.*`——一个都对不上，编辑器里 markdown 几乎无着色。深色换 **One Dark**、浅色换 **GitHub Light** 标准配色，并把 kit 语法 schema 原生支持的 markdown token 全部补上（标题加粗着色、强调斜体/粗体、行内代码、链接、列表标记、围栏分隔符）。这是对「主题文件原样入库」的有意偏离，仅动 navop.json（深浅两侧的 colors+highlight），其余 22 个文件保持上游原样。
 
 ## 后果
 

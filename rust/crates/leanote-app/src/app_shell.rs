@@ -1203,6 +1203,36 @@ impl AppShell {
         cx.notify();
     }
 
+    /// Install the registry's current pair and re-apply the CURRENT mode's
+    /// config — the only way to restore pristine theme-file colors after
+    /// apply_wake_theme's custom-accent branch overwrote them. `Theme::update`
+    /// runs edit(reload_mode=false): it re-applies a config only when the mode
+    /// changed, so an explicit apply_config is required (see set_ui_theme).
+    fn reapply_theme_config(cx: &mut gpui_kit::App) {
+        use gpui_kit::component::ThemeRegistry;
+        let registry = ThemeRegistry::global(cx);
+        let light_cfg = registry
+            .themes()
+            .get(theme::resolved_name(false))
+            .cloned()
+            .unwrap_or_else(|| registry.default_light_theme().clone());
+        let dark_cfg = registry
+            .themes()
+            .get(theme::resolved_name(true))
+            .cloned()
+            .unwrap_or_else(|| registry.default_dark_theme().clone());
+        gpui_kit::component::Theme::update(cx, |theme| {
+            theme.light_theme = light_cfg.clone();
+            theme.dark_theme = dark_cfg.clone();
+            let config = if theme.mode.is_dark() {
+                dark_cfg
+            } else {
+                light_cfg
+            };
+            theme.apply_config(&config);
+        });
+    }
+
     /// ADR-0014: theme choice → disk + live replay. One name resolves
     /// per-mode ("Gruvbox" → Gruvbox Light/Dark). Swapping configs inside
     /// `Theme::update` is NOT enough: update runs edit(reload_mode=false),
@@ -1215,30 +1245,7 @@ impl AppShell {
         p.ui_theme = name.to_string();
         p.save(&dir);
         theme::select(name);
-        {
-            use gpui_kit::component::ThemeRegistry;
-            let registry = ThemeRegistry::global(cx);
-            let light_cfg = registry
-                .themes()
-                .get(theme::resolved_name(false))
-                .cloned()
-                .unwrap_or_else(|| registry.default_light_theme().clone());
-            let dark_cfg = registry
-                .themes()
-                .get(theme::resolved_name(true))
-                .cloned()
-                .unwrap_or_else(|| registry.default_dark_theme().clone());
-            gpui_kit::component::Theme::update(cx, |theme| {
-                theme.light_theme = light_cfg.clone();
-                theme.dark_theme = dark_cfg.clone();
-                let config = if theme.mode.is_dark() {
-                    dark_cfg
-                } else {
-                    light_cfg
-                };
-                theme.apply_config(&config);
-            });
-        }
+        Self::reapply_theme_config(cx);
         let (font, editor_size, zoom) = (p.font, p.editor_font_size.clone(), p.zoom);
         gpui_kit::component::Theme::update(cx, move |theme| {
             crate::apply_wake_theme(theme, &font, &editor_size, zoom)
@@ -1257,7 +1264,13 @@ impl AppShell {
         theme::set_accent(id);
         // Live swap must reach kit-owned surfaces (context-menu hover,
         // ghost-button hover read tokens.accent), not just theme::accent()
-        // call sites — replay the wake overlay.
+        // call sites. The CONFIG re-apply is the load-bearing half when
+        // going custom → follow: the custom branch of apply_wake_theme
+        // overwrites primary/accent/ring/selection/button_primary/
+        // list_active_border/drag_border, and only a fresh apply_config
+        // restores the file's own values — the overlay alone left icon
+        // buttons and settings pills on the old swatch.
+        Self::reapply_theme_config(cx);
         let (font, editor_size, zoom) = (p.font, p.editor_font_size.clone(), p.zoom);
         gpui_kit::component::Theme::update(cx, move |theme| {
             crate::apply_wake_theme(theme, &font, &editor_size, zoom)
@@ -6421,6 +6434,101 @@ mod tests {
             NavSelection::Tag("rust".into()),
             NavSelection::Tag("rust".into())
         );
+    }
+
+    /// Accent custom → follow must restore the theme file's own colors on
+    /// kit-owned surfaces (icon buttons read tokens.accent, settings pills
+    /// read button_primary). The custom branch of apply_wake_theme
+    /// overwrites those fields; replaying the overlay alone — as set_accent
+    /// did — left them stale on the old swatch. The fix re-applies the
+    /// current mode's config first (reapply_theme_config).
+    #[gpui_kit::test]
+    fn accent_follow_restores_kit_surfaces(cx: &mut gpui_kit::TestAppContext) {
+        let _state = crate::theme::STATE_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("leanote-accentfollow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        cx.update(gpui_kit::init);
+        let mut shell_entity: Option<gpui_kit::Entity<AppShell>> = None;
+        let window = cx
+            .update(|cx| {
+                cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+                    let shell = cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true,
+                            Some("user1".into()),
+                            None,
+                            None,
+                        )
+                    });
+                    shell_entity = Some(shell.clone());
+                    shell
+                })
+            })
+            .unwrap();
+        let _shell_entity = shell_entity.unwrap();
+        cx.run_until_parked();
+        cx.background_executor.allow_parking();
+
+        cx.update(|cx| {
+            crate::theme::register(cx);
+            crate::theme::select("Default");
+            use gpui_kit::component::{Theme, ThemeRegistry};
+            let registry = ThemeRegistry::global(cx);
+            let light = registry
+                .themes()
+                .get(crate::theme::resolved_name(false))
+                .cloned()
+                .unwrap();
+            let dark = registry
+                .themes()
+                .get(crate::theme::resolved_name(true))
+                .cloned()
+                .unwrap();
+            Theme::update(cx, |theme| {
+                theme.light_theme = light;
+                theme.dark_theme = dark;
+            });
+            Theme::change(gpui_kit::component::ThemeMode::Light, None, cx);
+        });
+
+        let read = |cx: &mut gpui_kit::App| {
+            let t = gpui_kit::component::Theme::global(cx);
+            (t.colors.primary, t.colors.accent, t.colors.button_primary)
+        };
+        // Custom swatch: everything follows the pick.
+        window
+            .update(cx, |shell, _window, cx| shell.set_accent("purple", cx))
+            .unwrap();
+        let (p_purple, a_purple, b_purple) = cx.update(read);
+        let expected = crate::theme::accent();
+        assert_eq!(a_purple, expected, "custom: tokens.accent follows the pick");
+        assert_eq!(
+            b_purple, expected,
+            "custom: button_primary follows the pick"
+        );
+
+        // Back to follow: kit surfaces must return to the theme file's
+        // colors (primary from the registry; NOT the stale purple).
+        window
+            .update(cx, |shell, _window, cx| shell.set_accent("", cx))
+            .unwrap();
+        let (p_after, a_after, b_after) = cx.update(read);
+        let file_primary = crate::theme_registry::theme_primary();
+        assert_eq!(
+            p_after, file_primary,
+            "follow: primary restored from the theme file"
+        );
+        assert_eq!(
+            a_after, file_primary,
+            "follow: ghost-hover accent must be the theme primary, not the file's tint key"
+        );
+        assert_ne!(b_after, b_purple, "follow: pills no longer the old swatch");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ADR-0014 regression: switching themes in the SAME appearance mode
