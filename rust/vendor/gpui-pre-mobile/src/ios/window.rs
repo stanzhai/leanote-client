@@ -1400,6 +1400,20 @@ impl PlatformWindow for IosWindow {
         self.input_handler.borrow_mut().take()
     }
 
+    // leanote: focus → soft keyboard. Core diffs focused text input each frame
+    // and calls this (Android's window.rs already bridges the same pair) —
+    // without it tapping a text field focuses GPUI-side but the UIKit keyboard
+    // never appears, so nothing can be typed.
+    fn text_input_state_changed(&self, change: gpui::TextInputStateChange) {
+        match change {
+            gpui::TextInputStateChange::FocusGained => {
+                self.show_keyboard_with_type(crate::KeyboardType::Default)
+            }
+            gpui::TextInputStateChange::FocusLost => self.hide_keyboard(),
+            _ => {}
+        }
+    }
+
     fn prompt(
         &self,
         _level: PromptLevel,

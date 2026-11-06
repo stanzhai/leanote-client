@@ -10,7 +10,11 @@ pub fn set_lang(id: &str) {
 }
 
 pub fn lang() -> &'static str {
-    if LANG.load(std::sync::atomic::Ordering::Relaxed) == 1 { "en" } else { "zh" }
+    if LANG.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+        "en"
+    } else {
+        "zh"
+    }
 }
 
 pub fn t(key: &str) -> &'static str {
@@ -46,8 +50,8 @@ fn t_for(lang: &str, key: &str) -> &'static str {
         ("zh", "appearance") => "外观",
         ("zh", "language") => "语言",
         ("zh", "zoom") => "界面缩放",
-        ("zh", "theme_light") => "浅色主题",
-        ("zh", "theme_dark") => "深色主题",
+        ("zh", "theme") => "主题",
+        ("zh", "accent") => "强调色",
         ("zh", "account") => "账户",
         ("zh", "sync_now") => "立即同步",
         ("zh", "syncing_now") => "同步中…",
@@ -80,8 +84,8 @@ fn t_for(lang: &str, key: &str) -> &'static str {
         ("en", "appearance") => "Appearance",
         ("en", "language") => "Language",
         ("en", "zoom") => "UI Zoom",
-        ("en", "theme_light") => "Light Theme",
-        ("en", "theme_dark") => "Dark Theme",
+        ("en", "theme") => "Theme",
+        ("en", "accent") => "Accent",
         ("en", "account") => "Account",
         ("en", "sync_now") => "Sync Now",
         ("en", "syncing_now") => "Syncing…",

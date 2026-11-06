@@ -20,3 +20,10 @@ gpui-pre = { path = "vendor/gpui-pre" }
 # image click handler (right-click menu in previews) through .plugin().
 # Re-vendor on gpui-base upgrade. See ADR-0005.
 gpui-base = { path = "vendor/gpui-base" }
+# leanote: vendored with one change — shader_barycentrics probe guarded with
+# respondsToSelector (wgpu 30.0.1's fix backported). Xcode's Metal API
+# validation wraps the device in CaptureMTLDevice, which doesn't declare the
+# selector; objc2's generated send panics "method not found" and aborts at
+# startup. Re-vendor on wgpu upgrade (29.0.4 → check upstream fixed). See
+# .scratch/mobile/issues/12.
+wgpu-hal = { path = "vendor/wgpu-hal" }

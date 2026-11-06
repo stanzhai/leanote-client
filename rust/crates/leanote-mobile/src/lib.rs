@@ -4,8 +4,8 @@
 pub mod app;
 pub mod fake;
 pub mod i18n;
-pub mod notes_tab;
 pub mod login;
+pub mod notes_tab;
 pub mod prefs;
 pub mod search_tab;
 pub mod settings_tab;
@@ -48,13 +48,15 @@ mod android {
             }
         };
 
-        gpui::Application::with_platform(shared.into_rc()).run(|cx: &mut App| {
-            cx.open_window(WindowOptions::default(), |window, cx| {
-                let content = cx.new(|cx| MobileApp::new(window, cx));
-                cx.new(|cx| Root::new(content, window, cx))
-            })
-            .expect("open leanote mobile window");
-        });
+        gpui::Application::with_platform(shared.into_rc())
+            .with_assets(gpui_kit::assets::AllAssets)
+            .run(|cx: &mut App| {
+                cx.open_window(WindowOptions::default(), |window, cx| {
+                    let content = cx.new(|cx| MobileApp::new(window, cx));
+                    cx.new(|cx| Root::new(content, window, cx))
+                })
+                .expect("open leanote mobile window");
+            });
     }
 }
 
@@ -103,6 +105,10 @@ mod ios {
         std::panic::set_hook(Box::new(|info| {
             nslog(&format!("leanote-mobile PANIC: {info}"));
         }));
+
+        // 图标资产（kit IconName → icons/*.svg）：嵌入式 Application 不会自带
+        // asset source，vendored ffi 钩子在这里注入（Tab 栏图标依赖它）。
+        gpui_mobile::ios::ffi::set_asset_source(std::sync::Arc::new(gpui_kit::assets::AllAssets));
 
         gpui_mobile::ios::ffi::set_app_callback(Box::new(|cx: &mut App| {
             gpui_kit::init(cx);

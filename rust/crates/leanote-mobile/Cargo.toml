@@ -33,3 +33,7 @@ objc2 = "0.6"
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15"
 android-activity = { version = "0.6", features = ["native-activity"] }
+
+[dev-dependencies]
+# host 端 GPUI 视觉测试（TestAppContext + simulate_click）所需。
+gpui = { package = "gpui-pre", path = "../../vendor/gpui-pre", default-features = false, features = ["test-support"] }

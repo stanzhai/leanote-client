@@ -6,6 +6,7 @@ use crate::login::{LoginEvent, LoginView};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::{Icon, IconName};
 use gpui_kit::prelude::*;
 use gpui_kit::{div, px, rems, App, Entity, SharedString, Task, Window};
 use leanote_core::sync::{full_sync, Api, SyncProgress, SyncStats};
@@ -287,6 +288,11 @@ impl MobileApp {
 
     /// 库就绪后挂上笔记/搜索 Tab（boot 已登录或同步完成两个路径共用）。
     fn attach_notes_tab(&mut self, cx: &mut Context<Self>) {
+        // 已挂载（boot 路径登录过）则跳过：重复挂载会换新实体，把用户
+        // 正在进行的浏览栈/抽屉状态整屏重置。
+        if self.shell.read(cx).notes.is_some() {
+            return;
+        }
         let Some(store) = self.store.clone() else {
             return;
         };
@@ -322,7 +328,9 @@ impl MobileApp {
         .detach();
         let shell = self.shell.clone();
         let _ = shell.update(cx, |s, cx| {
-            s.notes = Some(notes);
+            s.notes = Some(notes.clone());
+            // 阅读屏进出（NotesTab push/pop）要联动 Tab 栏显隐 → 观察。
+            cx.observe(&notes, |_, _, cx| cx.notify()).detach();
             cx.notify();
         });
     }
@@ -484,35 +492,59 @@ impl Render for TabShell {
                 None => self.placeholder(t("not_synced"), cx).into_any_element(),
             },
         };
-        let bar =
-            div()
-                .flex()
-                .w_full()
-                .h(px(50.))
-                .pb(safe_bottom)
-                .bg(cx.theme().sidebar)
-                .children([TabId::Notes, TabId::Search, TabId::Settings].map(|id| {
-                    let selected = self.tab == id;
-                    div()
-                        .id(SharedString::new(format!("tab-{}", id.label())))
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when(selected, |el| el.bg(cx.theme().primary))
-                        .child(Label::new(id.label()).text_size(rems(0.9)).text_color(
-                            if selected {
-                                cx.theme().primary_foreground
-                            } else {
-                                cx.theme().muted_foreground
-                            },
-                        ))
-                        .on_click(cx.listener(move |this, _ev, _window, cx| {
-                            this.tab = id;
-                            cx.notify();
-                        }))
-                }));
+        // iOS 惯例 Tab 栏：图标 + 小字号标签，选中着 primary、未选 muted，
+        // 顶缘发丝线；不用整格底色块。高度内容驱动（固定 h 会把 pb 计入、
+        // 内容区被压到 22px，图标越过上边线）。
+        let bar = div()
+            .flex()
+            .w_full()
+            .pb(safe_bottom)
+            .bg(cx.theme().sidebar)
+            .border_t_1()
+            .border_color(cx.theme().border.opacity(0.6))
+            .children([TabId::Notes, TabId::Search, TabId::Settings].map(|id| {
+                let selected = self.tab == id;
+                // accent 是浅蓝容器色（accent.background），选中 tint 用 primary。
+                let color = if selected {
+                    cx.theme().primary
+                } else {
+                    cx.theme().muted_foreground
+                };
+                let icon = match id {
+                    TabId::Notes => IconName::FileText,
+                    TabId::Search => IconName::Search,
+                    TabId::Settings => IconName::Settings,
+                };
+                div()
+                    .id(SharedString::new(format!("tab-{}", id.label())))
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    // 固定 cell 高 + 垂直居中：图标/标签在可视栏内居中，
+                    // 底部只留 safe area 背景（不留内容空白）。
+                    .h(px(52.))
+                    .justify_center()
+                    .gap(px(2.))
+                    .child(Icon::new(icon).size(px(22.)).text_color(color))
+                    .child(
+                        Label::new(id.label())
+                            .text_size(rems(0.65))
+                            .text_color(color),
+                    )
+                    .on_click(cx.listener(move |this, _ev, _window, cx| {
+                        this.tab = id;
+                        cx.notify();
+                    }))
+            }));
 
+        // 阅读屏全屏沉浸：隐藏 Tab 栏，内容落到 safe bottom 之上。
+        let chrome_hidden = self.tab == TabId::Notes
+            && self
+                .notes
+                .as_ref()
+                .map(|n| n.read(cx).is_reader())
+                .unwrap_or(false);
         div()
             .size_full()
             .flex()
@@ -521,7 +553,13 @@ impl Render for TabShell {
             // min_h_0：flex item 的自动最小尺寸 = 内容 min-content，长列表会把
             // wrapper 撑到整列表高——Tab 栏被推出屏、滚动容器等于内容高（无溢出
             // 可滚）。三个 Tab 的滚动都路由经过这里，修一处。
-            .child(div().flex_1().min_h_0().child(content))
-            .child(bar)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .when(chrome_hidden, |el| el.pb(safe_bottom))
+                    .child(content),
+            )
+            .when(!chrome_hidden, |el| el.child(bar))
     }
 }

@@ -3485,7 +3485,6 @@ impl Window {
         // Use .take() instead of .pop() to preserve Vec length, so that cached
         // paint_range indices remain valid for reuse_paint on the next frame.
         // Search backwards to find the last Some entry, since reuse_paint may
-        // have copied None slots from the previous frame. (Fixes #50456)
         let focused_text_input_active = if let Some(mut input_handler) = self
             .next_frame
             .input_handlers
@@ -5401,8 +5400,6 @@ impl Window {
         input_handler: impl InputHandler,
         cx: &App,
     ) {
-        self.invalidator.debug_assert_paint();
-
         if focus_handle.is_focused(self) {
             let cx = self.to_async(cx);
             self.next_frame

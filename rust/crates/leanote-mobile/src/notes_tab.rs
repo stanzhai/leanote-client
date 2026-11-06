@@ -1,16 +1,18 @@
 //! 笔记 Tab（issue 04）：最近列表 + 笔记本/标签浏览 + 推入栈导航。
-//! 阅读页本 issue 为占位（标题 + 返回），真渲染在 issue 05。
+//! 根屏「最近」栏的汉堡按钮开左侧笔记本抽屉（滑入）。
 
+use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::component::label::Label;
-use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::{ActiveTheme, Icon};
 use gpui_kit::prelude::*;
-use gpui_kit::{div, px, rems, EventEmitter, SharedString, Window};
+use gpui_kit::{div, px, rems, AnimationExt, EventEmitter, SharedString, Window};
 use leanote_core::{NoteMeta, Store};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const RECENT_LIMIT: usize = 20; // 桌面同款常量（app_shell.rs#57 的镜像）
 
-/// 手动刷新请求（issue 08：点「最近」头行 = 下拉刷新的等价物）。
+/// 手动刷新请求（issue 08：点「最近」头行的 ⟳ = 下拉刷新的等价物）。
 pub enum NotesEvent {
     RefreshRequested,
 }
@@ -44,25 +46,37 @@ impl EventEmitter<NotesEvent> for NotesTab {}
 pub struct NotesTab {
     store: Option<Arc<Mutex<Store>>>,
     stack: Vec<Screen>,
+    /// 根屏左侧笔记本抽屉开关（汉堡按钮 / 点遮罩关闭）。
+    drawer_open: bool,
 }
 
 impl NotesTab {
+    /// Tab 栏显隐联动：阅读屏全屏沉浸（TabShell 观察 entity 变化）。
+    pub fn is_reader(&self) -> bool {
+        matches!(self.stack.last(), Some(Screen::Reader { .. }))
+    }
     pub fn new(store: Option<Arc<Mutex<Store>>>) -> Self {
         // Dev 深链（模拟器无法点击）：notebooks|tags|reader:<noteId>
         let initial = match std::env::var("LEANOTE_INITIAL_SCREEN").as_deref() {
             Ok("notebooks") => Some(Screen::Notebooks),
             Ok("tags") => Some(Screen::Tags),
-            Ok(v) if v.starts_with("reader:") => v.strip_prefix("reader:").map(|id| Screen::Reader {
-                note_id: leanote_core::Id(id.to_string()),
-                title: "".into(),
-            }),
+            Ok(v) if v.starts_with("reader:") => {
+                v.strip_prefix("reader:").map(|id| Screen::Reader {
+                    note_id: leanote_core::Id(id.to_string()),
+                    title: "".into(),
+                })
+            }
             _ => None,
         };
         let mut stack = vec![Screen::Root];
         if let Some(s) = initial {
             stack.push(s);
         }
-        Self { store, stack }
+        Self {
+            store,
+            stack,
+            drawer_open: false,
+        }
     }
 
     fn push(&mut self, s: Screen, cx: &mut Context<Self>) {
@@ -183,29 +197,136 @@ impl NotesTab {
             .child(Label::new(title).text_size(rems(1.0)))
             .on_click(cx.listener(|this, _ev, _window, cx| this.pop(cx)))
     }
+
+    /// 左侧笔记本抽屉：从左滑入 280px 面板，点笔记本直达其笔记列表，
+    /// 点遮罩关闭。子笔记本按层级缩进（两层，与 Notebooks 屏同源）。
+    fn drawer(&self, window: &mut Window, cx: &Context<Self>) -> gpui_kit::AnyElement {
+        let safe = window.insets().safe_area;
+        let mut list = gpui_kit::base::v_flex().w_full().pt(safe.top);
+        list = list.child(
+            div().w_full().px_4().py_3().child(
+                Label::new(crate::i18n::t("notebooks"))
+                    .text_size(rems(0.75))
+                    .text_color(cx.theme().muted_foreground),
+            ),
+        );
+        for (id, title, depth) in self.notebooks() {
+            let t: SharedString = title.clone().into();
+            let filter_id = id.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::new(format!("nb-drawer-{id}")))
+                    .w_full()
+                    .pl(px(16.) + px(24.) * depth as f32)
+                    .pr_4()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .child(Label::new(title).text_size(rems(0.9)))
+                    .on_click(cx.listener(move |this, _ev, _window, cx| {
+                        this.drawer_open = false;
+                        this.stack.truncate(1);
+                        this.push(
+                            Screen::NoteList {
+                                title: t.clone(),
+                                filter: ListFilter::Notebook(filter_id.clone()),
+                            },
+                            cx,
+                        );
+                    })),
+            );
+        }
+        let panel = div()
+            .id("drawer-panel")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left_0()
+            .w(px(280.))
+            .bg(cx.theme().popover)
+            .shadow_lg()
+            .overflow_y_scroll()
+            .block_mouse_except_scroll()
+            .child(list);
+        // 滑入：左缘 -280 → 0（160ms ease-in-out）。
+        let panel = panel.with_animation(
+            "drawer-slide",
+            gpui_kit::Animation::new(Duration::from_millis(160)).with_easing(gpui_kit::ease_in_out),
+            |el, delta| el.left(px(-280. * (1. - delta))),
+        );
+        div()
+            .id("drawer-scrim")
+            .debug_selector(|| "drawer-scrim".to_string())
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(gpui_kit::black().opacity(0.4))
+            // 遮罩必须挡住底下列表：Normal 命中盒不拦截，一次 tap 会
+            // 穿透叠加的每一层（笔记本行、遮罩、底下的笔记行全触发）。
+            .occlude()
+            .child(panel)
+            .on_click(cx.listener(|this, _ev, _window, cx| {
+                this.drawer_open = false;
+                cx.notify();
+            }))
+            .into_any_element()
+    }
 }
 
 impl Render for NotesTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let safe = window.insets().safe_area;
         let screen = self.stack.last().cloned().unwrap_or(Screen::Root);
+        let is_root = matches!(screen, Screen::Root);
         let mut col = gpui_kit::base::v_flex().w_full();
         match screen {
             Screen::Root => {
                 col = col
                     .child(
+                        // 「最近」栏：☰ 开笔记本抽屉，⟳ 手动刷新（issue 08）。
                         div()
-                            .id("recent-refresh")
+                            .id("recent-bar")
                             .w_full()
                             .px_4()
                             .py_3()
+                            .flex()
+                            .items_center()
+                            .justify_between()
                             .child(
-                                Label::new(format!("{}  ⟳", crate::i18n::t("recent")))
-                                    .text_size(rems(1.2)),
+                                div()
+                                    .id("drawer-toggle")
+                                    .debug_selector(|| "drawer-toggle".to_string())
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Icon::new(AssetIcon::Menu)
+                                            .size(px(20.))
+                                            .text_color(cx.theme().foreground),
+                                    )
+                                    .child(
+                                        Label::new(crate::i18n::t("recent")).text_size(rems(1.2)),
+                                    )
+                                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                                        this.drawer_open = true;
+                                        cx.notify();
+                                    })),
                             )
-                            .on_click(cx.listener(|_, _ev, _window, cx| {
-                                cx.emit(NotesEvent::RefreshRequested);
-                            })),
+                            .child(
+                                div()
+                                    .id("recent-refresh")
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        Icon::new(AssetIcon::RefreshCw)
+                                            .size(px(18.))
+                                            .text_color(cx.theme().muted_foreground),
+                                    )
+                                    .on_click(cx.listener(|_, _ev, _window, cx| {
+                                        cx.emit(NotesEvent::RefreshRequested);
+                                    })),
+                            ),
                     )
                     .children(self.recent().iter().map(|n| {
                         let title: SharedString = if n.title.is_empty() {
@@ -231,13 +352,6 @@ impl Render for NotesTab {
                             }),
                         )
                     }))
-                    .child(Self::row(
-                        "browse-notebooks",
-                        crate::i18n::t("browse_notebooks"),
-                        None,
-                        cx,
-                        cx.listener(|this, _ev, _window, cx| this.push(Screen::Notebooks, cx)),
-                    ))
                     .child(Self::row(
                         "browse-tags",
                         "标签",
@@ -361,10 +475,11 @@ impl Render for NotesTab {
                                         .pb_8(),
                                     ),
                             ),
-                    );
+                    )
+                    .into_any_element();
             }
         }
-        div()
+        let content = div()
             .size_full()
             .pt(safe.top)
             .bg(cx.theme().background)
@@ -374,6 +489,61 @@ impl Render for NotesTab {
                     .id("notes-scroll")
                     .overflow_y_scroll()
                     .child(col),
-            )
+            );
+        // 根屏抽屉覆盖层（面板自身处理刘海，不吃 safe.top）。
+        if is_root && self.drawer_open {
+            div()
+                .size_full()
+                .relative()
+                .child(content)
+                .child(self.drawer(window, cx))
+                .into_any_element()
+        } else {
+            content.into_any_element()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prefs::MobilePrefs;
+    use gpui_kit::{px, TestAppContext, VisualTestContext};
+
+    /// 汉堡开抽屉 → 点遮罩关闭（无 store 时空列表也算打开）。
+    #[gpui_kit::test]
+    fn drawer_toggle_opens_and_closes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx: &mut gpui_kit::App| {
+            crate::theme::apply(&MobilePrefs::default(), None, cx);
+        });
+        let notes = cx.add_window(|_, _| NotesTab::new(None));
+        cx.run_until_parked();
+        let mut vcx = VisualTestContext::from_window(notes.into(), cx);
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+        let toggle = vcx
+            .debug_bounds("drawer-toggle")
+            .expect("drawer toggle laid out");
+        assert_eq!(toggle.size.height, px(20.), "icon-sized toggle");
+        assert!(toggle.size.width > px(40.), "icon + 最近 label");
+        vcx.simulate_click(toggle.center(), gpui_kit::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            cx.update(|cx: &mut gpui_kit::App| notes.read(cx).unwrap().drawer_open),
+            "hamburger opens the drawer"
+        );
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+        let scrim = vcx
+            .debug_bounds("drawer-scrim")
+            .expect("scrim laid out while open");
+        vcx.simulate_click(
+            scrim.center() + gpui_kit::point(px(120.), px(0.)),
+            gpui_kit::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|cx: &mut gpui_kit::App| notes.read(cx).unwrap().drawer_open),
+            "tapping the scrim closes the drawer"
+        );
     }
 }

@@ -535,6 +535,43 @@ fn take_app_callback() -> Option<Box<dyn FnOnce(&mut App)>> {
         .and_then(|cell| unsafe { (*cell.0.get()).take() })
 }
 
+// leanote: embedded hosts need an asset source for `svg()` icons — kit
+// `IconName` paths resolve against the application's assets, which the
+// embedded `Application` was never given. Registered before `run_app`
+// (same protocol as `set_app_callback`), applied via `with_assets`.
+struct AssetCell(std::cell::UnsafeCell<Option<std::sync::Arc<dyn gpui::AssetSource>>>);
+// Safety: only accessed from the iOS main thread.
+unsafe impl Send for AssetCell {}
+unsafe impl Sync for AssetCell {}
+
+static ASSET_SOURCE: OnceLock<AssetCell> = OnceLock::new();
+
+/// Register the host's asset source. Call before [`run_app`], main thread.
+pub fn set_asset_source(source: std::sync::Arc<dyn gpui::AssetSource>) {
+    let cell = ASSET_SOURCE.get_or_init(|| AssetCell(std::cell::UnsafeCell::new(None)));
+    unsafe {
+        *cell.0.get() = Some(source);
+    }
+}
+
+fn take_asset_source() -> Option<std::sync::Arc<dyn gpui::AssetSource>> {
+    ASSET_SOURCE
+        .get()
+        .and_then(|cell| unsafe { (*cell.0.get()).take() })
+}
+
+/// `with_assets` takes `impl AssetSource` by value; forward through the Arc.
+struct SharedAssetSource(std::sync::Arc<dyn gpui::AssetSource>);
+
+impl gpui::AssetSource for SharedAssetSource {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        self.0.load(path)
+    }
+    fn list(&self, path: &str) -> gpui::Result<Vec<gpui::SharedString>> {
+        self.0.list(path)
+    }
+}
+
 /// C entry point called from `main.m`'s app delegate.
 ///
 /// Consumer crates should call [`set_app_callback`] **before** this function
@@ -564,7 +601,13 @@ pub fn run_app() {
     }
 
     let platform = Rc::new(super::IosPlatform::new());
-    let application = Application::with_platform(platform).run_embedded(|cx: &mut App| {
+    // leanote: host asset source (svg icons) registered via set_asset_source.
+    let app_builder = Application::with_platform(platform);
+    let app_builder = match take_asset_source() {
+        Some(source) => app_builder.with_assets(SharedAssetSource(source)),
+        None => app_builder,
+    };
+    let application = app_builder.run_embedded(|cx: &mut App| {
         if let Some(cb) = take_app_callback() {
             log::info!("GPUI iOS: Invoking user-provided app callback");
             cb(cx);
