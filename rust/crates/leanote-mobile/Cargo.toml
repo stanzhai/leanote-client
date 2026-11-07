@@ -26,6 +26,11 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt"] }
 smol = "2"
 log = "0.4"
+# gpui-kit 的图标/主题资产走 rust-embed：debug 构建（debug_assertions）
+# 默认从编译机文件系统读（cargo registry 路径），真机上不存在 → 图标
+# 全部消失（模拟器进程在 macOS 上读得到，掩盖了问题）。借 feature
+# 统一给同版本 rust-embed 开 debug-embed，debug 构建也内嵌进二进制。
+rust-embed = { version = "8.7.2", features = ["debug-embed"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6"

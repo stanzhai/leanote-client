@@ -12,9 +12,12 @@ use std::time::Duration;
 
 const RECENT_LIMIT: usize = 20; // 桌面同款常量（app_shell.rs#57 的镜像）
 
-/// 手动刷新请求（issue 08：点「最近」头行的 ⟳ = 下拉刷新的等价物）。
+/// 手动刷新请求（issue 08：点「最近」头行的 ⟳ = 下拉刷新的等价物）；
+/// ReturnToSearch：从搜索结果进入的阅读屏 pop 时请求切回搜索 Tab
+/// （返回到来源列表，而非笔记 Tab 根屏）。
 pub enum NotesEvent {
     RefreshRequested,
+    ReturnToSearch,
 }
 
 /// 栈内一屏。
@@ -48,7 +51,15 @@ pub struct NotesTab {
     stack: Vec<Screen>,
     /// 根屏左侧笔记本抽屉开关（汉堡按钮 / 点遮罩关闭）。
     drawer_open: bool,
+    /// 边缘右滑返回（issue 17）：进行中的手势累计位移；None = 无手势。
+    edge_swipe: Option<(f32, f32)>,
+    /// 栈顶阅读屏是否由搜索结果进入（pop 时切回搜索 Tab）。
+    reader_from_search: bool,
 }
+/// 右滑起手须在左缘多少 px 内（iOS 边缘手势同款语义）。
+const EDGE_SWIPE_START: f32 = 24.;
+/// 累计右滑多少 px 触发返回。
+const EDGE_SWIPE_MIN: f32 = 48.;
 
 impl NotesTab {
     /// Tab 栏显隐联动：阅读屏全屏沉浸（TabShell 观察 entity 变化）。
@@ -76,11 +87,14 @@ impl NotesTab {
             store,
             stack,
             drawer_open: false,
+            edge_swipe: None,
+            reader_from_search: false,
         }
     }
 
     fn push(&mut self, s: Screen, cx: &mut Context<Self>) {
         self.stack.push(s);
+        self.edge_swipe = None; // 换屏废弃进行中的手势
         cx.notify();
     }
 
@@ -93,12 +107,54 @@ impl NotesTab {
     ) {
         self.stack.truncate(1); // 从任意浏览深度直达
         self.push(Screen::Reader { note_id, title }, cx);
+        self.reader_from_search = true;
     }
-
     fn pop(&mut self, cx: &mut Context<Self>) {
         if self.stack.len() > 1 {
-            self.stack.pop();
+            let popped = self.stack.pop();
+            if self.reader_from_search && matches!(popped, Some(Screen::Reader { .. })) {
+                self.reader_from_search = false;
+                cx.emit(NotesEvent::ReturnToSearch);
+            }
             cx.notify();
+        }
+        self.edge_swipe = None;
+    }
+
+    /// 边缘右滑返回（issue 17）：触摸 pan 在平台层映射为 ScrollWheel 派发
+    /// （vendored gpui-pre-mobile ios/events.rs），非根屏上从左缘
+    /// `EDGE_SWIPE_START` 内起手、横向主导且累计右滑 ≥ `EDGE_SWIPE_MIN`
+    /// 即 pop 一屏。只观察不消费——事件继续冒泡，列表竖滚不受影响。
+    fn on_edge_swipe_scroll(&mut self, ev: &gpui_kit::ScrollWheelEvent, cx: &mut Context<Self>) {
+        if self.stack.len() < 2 {
+            self.edge_swipe = None;
+            return;
+        }
+        let px_val = |p: &gpui_kit::Pixels| f32::from(p);
+        match ev.touch_phase {
+            gpui_kit::TouchPhase::Started => {
+                // 仅触摸 pan 的 delta 是 Pixels（真实滚轮是 Lines）。
+                self.edge_swipe = if matches!(ev.delta, gpui_kit::ScrollDelta::Pixels(_))
+                    && px_val(&ev.position.x) <= EDGE_SWIPE_START
+                {
+                    Some((0., 0.))
+                } else {
+                    None
+                };
+            }
+            gpui_kit::TouchPhase::Moved => {
+                if let (Some(s), gpui_kit::ScrollDelta::Pixels(d)) = (self.edge_swipe, ev.delta) {
+                    let s = (s.0 + px_val(&d.x), s.1 + px_val(&d.y));
+                    if s.0 >= EDGE_SWIPE_MIN && s.0 > s.1.abs() * 2. {
+                        self.pop(cx); // 右滑到位 → 返回
+                    } else if s.1.abs() > s.0 {
+                        self.edge_swipe = None; // 纵向主导 → 交给列表滚动
+                    } else {
+                        self.edge_swipe = Some(s);
+                    }
+                }
+            }
+            _ => self.edge_swipe = None, // Ended/Cancelled → 复位
         }
     }
 
@@ -111,23 +167,26 @@ impl NotesTab {
             .unwrap_or_default()
     }
 
-    /// (id, title, depth) — 父先于子、兄弟按 Seq；两层缩进够 v1 用。
+    /// 桌面同源（leanote_core::nav::notebook_nodes，issue 15）：roots 按
+    /// Seq、子挂父下按 Seq、深度优先；孤儿（父 id 无对应笔记本）不显示。
+    /// 此前移动端自排（按 parent 字符串分组）→ 顺序/嵌套与桌面不一致。
     fn notebooks(&self) -> Vec<(leanote_core::Id, String, usize)> {
         self.with_store(|s| {
-            let mut nbs = s.notebooks().unwrap_or_default();
-            nbs.sort_by(|a, b| {
-                a.parent_notebook_id
-                    .cmp(&b.parent_notebook_id)
-                    .then(a.seq.cmp(&b.seq))
-            });
-            nbs.iter()
+            let nbs = s.notebooks().unwrap_or_default();
+            let rows: Vec<(String, String, String, i64)> = nbs
+                .iter()
                 .map(|n| {
                     (
-                        n.notebook_id.clone(),
+                        n.notebook_id.to_string(),
                         n.title.clone(),
-                        usize::from(!n.parent_notebook_id.is_empty()),
+                        n.parent_notebook_id.clone(),
+                        n.seq,
                     )
                 })
+                .collect();
+            leanote_core::nav::notebook_nodes(&rows, &Default::default())
+                .into_iter()
+                .map(|n| (leanote_core::Id(n.id), n.title, n.depth as usize))
                 .collect()
         })
         .unwrap_or_default()
@@ -342,6 +401,7 @@ impl Render for NotesTab {
                             Some(&n.desc),
                             cx,
                             cx.listener(move |this, _ev, _window, cx| {
+                                this.reader_from_search = false;
                                 this.push(
                                     Screen::Reader {
                                         note_id: id.clone(),
@@ -425,6 +485,7 @@ impl Render for NotesTab {
                     col = col.child(Self::row(&n.note_id, &t, Some(&n.desc), cx, {
                         let t = t.clone();
                         cx.listener(move |this, _ev, _window, cx| {
+                            this.reader_from_search = false;
                             this.push(
                                 Screen::Reader {
                                     note_id: nid.clone(),
@@ -454,6 +515,12 @@ impl Render for NotesTab {
                     .size_full()
                     .pt(safe.top)
                     .bg(cx.theme().background)
+                    // 边缘右滑返回（issue 17）
+                    .on_scroll_wheel(cx.listener(
+                        |this, ev: &gpui_kit::ScrollWheelEvent, _w, cx| {
+                            this.on_edge_swipe_scroll(ev, cx)
+                        },
+                    ))
                     .child(
                         gpui_kit::base::v_flex()
                             .size_full()
@@ -483,6 +550,14 @@ impl Render for NotesTab {
             .size_full()
             .pt(safe.top)
             .bg(cx.theme().background)
+            .when(!is_root, |el| {
+                // 边缘右滑返回（issue 17）
+                el.on_scroll_wheel(
+                    cx.listener(|this, ev: &gpui_kit::ScrollWheelEvent, _w, cx| {
+                        this.on_edge_swipe_scroll(ev, cx)
+                    }),
+                )
+            })
             .child(
                 div()
                     .size_full()
@@ -544,6 +619,132 @@ mod tests {
         assert!(
             !cx.update(|cx: &mut gpui_kit::App| notes.read(cx).unwrap().drawer_open),
             "tapping the scrim closes the drawer"
+        );
+    }
+
+    /// 回归（issue 15）：笔记本列表与桌面同序（leanote_core::nav 同源）——
+    /// 子笔记本紧跟其父、深度 1；不再按 parent 字符串分组把子项甩到全表尾。
+    #[test]
+    fn notebooks_nest_children_under_parent() {
+        let dir = std::env::temp_dir().join(format!("lt-nb-order-{}", std::process::id()));
+        let store = Store::open(dir.clone(), "u1".into()).unwrap();
+        // create_notebook 前插（新 root 取最小 Seq-1）：B 先建、A 后建 → A 在前。
+        store.create_notebook("B", "").unwrap();
+        let a = store.create_notebook("A", "").unwrap();
+        store.create_notebook("A1", &a.notebook_id.0).unwrap();
+        let tab = NotesTab::new(Some(std::sync::Arc::new(std::sync::Mutex::new(store))));
+        let rows = tab.notebooks();
+        let titles: Vec<(&str, usize)> = rows.iter().map(|(_, t, d)| (t.as_str(), *d)).collect();
+        let ia = titles.iter().position(|(t, _)| *t == "A").unwrap();
+        // 子紧随父（桌面 DFS 同款），且缩进一级。
+        assert_eq!(
+            titles[ia + 1],
+            ("A1", 1),
+            "child nested after parent: {titles:?}"
+        );
+        assert_eq!(titles[ia].1, 0);
+        let ib = titles
+            .iter()
+            .position(|(t, d)| *t == "B" && *d == 0)
+            .unwrap();
+        assert!(
+            ib > ia + 1,
+            "later root stays after A's subtree: {titles:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 回归（issue 17）：非根屏左缘起手右滑 ≥48px → pop；屏幕中部起手
+    /// 不触发。注入原始 TouchEvent 走真实管线：手势识别器 → pan 转滚轮
+    /// 派发（与真机手指同一条路径）。
+    #[gpui_kit::test]
+    fn edge_swipe_right_pops_non_root_screen(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let notes = cx.add_window(|_, _| NotesTab::new(None));
+        notes
+            .update(cx, |t, _window, cx| t.push(Screen::Notebooks, cx))
+            .unwrap();
+        let wh: gpui_kit::AnyWindowHandle = notes.into();
+        let mut vcx = VisualTestContext::from_window(wh, cx);
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+        let touch = |vcx: &mut VisualTestContext, id: u64, phase, x: f32, y: f32| {
+            vcx.simulate_event(gpui_kit::TouchEvent {
+                id: gpui_kit::TouchId(id),
+                phase,
+                position: gpui_kit::point(px(x), px(y)),
+                predicted_position: None,
+                force: None,
+            });
+        };
+        let depth = |cx: &mut TestAppContext| {
+            cx.update(|cx: &mut gpui_kit::App| notes.read(cx).unwrap().stack.len())
+        };
+
+        // 屏幕中部起手右滑：不是返回手势。
+        touch(&mut vcx, 1, gpui_kit::TouchPhase::Started, 200., 300.);
+        touch(&mut vcx, 1, gpui_kit::TouchPhase::Moved, 240., 301.);
+        touch(&mut vcx, 1, gpui_kit::TouchPhase::Ended, 280., 302.);
+        assert_eq!(depth(cx), 2, "mid-screen pan is not a back gesture");
+
+        // 左缘起手横向右滑到位：返回。
+        touch(&mut vcx, 2, gpui_kit::TouchPhase::Started, 8., 300.);
+        touch(&mut vcx, 2, gpui_kit::TouchPhase::Moved, 40., 300.);
+        touch(&mut vcx, 2, gpui_kit::TouchPhase::Moved, 72., 301.);
+        touch(&mut vcx, 2, gpui_kit::TouchPhase::Ended, 80., 301.);
+        assert_eq!(depth(cx), 1, "edge swipe right pops the screen");
+    }
+
+    /// 回归（本次）：搜索进入的阅读屏 pop → 发 ReturnToSearch（Tab 壳切回
+    /// 搜索列表）；笔记 Tab 内部进入的阅读屏 pop → 不发。
+    #[gpui_kit::test]
+    fn reader_pop_returns_to_origin(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+        cx.update(gpui_kit::init);
+        let notes = cx.add_window(|_, _| NotesTab::new(None));
+        let returns = std::rc::Rc::new(RefCell::new(0usize));
+        cx.update(|cx: &mut gpui_kit::App| {
+            let entity = notes.entity(cx).unwrap();
+            cx.subscribe(&entity, {
+                let returns = returns.clone();
+                move |_, ev: &NotesEvent, _| {
+                    if matches!(ev, NotesEvent::ReturnToSearch) {
+                        *returns.borrow_mut() += 1;
+                    }
+                }
+            })
+            .detach();
+        });
+
+        // 搜索结果进入 → pop 触发 ReturnToSearch。
+        notes
+            .update(cx, |t, _, cx| {
+                t.open_reader(leanote_core::Id("n1".into()), "T".into(), cx)
+            })
+            .unwrap();
+        notes.update(cx, |t, _, cx| t.pop(cx)).unwrap();
+        assert_eq!(
+            *returns.borrow(),
+            1,
+            "search-opened reader pops back to search"
+        );
+
+        // 笔记 Tab 内部进入 → pop 不触发。
+        notes
+            .update(cx, |t, _, cx| {
+                t.push(
+                    Screen::Reader {
+                        note_id: leanote_core::Id("n2".into()),
+                        title: "T2".into(),
+                    },
+                    cx,
+                )
+            })
+            .unwrap();
+        notes.update(cx, |t, _, cx| t.pop(cx)).unwrap();
+        assert_eq!(*returns.borrow(), 1, "local reader pop stays in notes tab");
+        assert_eq!(
+            cx.update(|cx: &mut gpui_kit::App| notes.read(cx).unwrap().stack.len()),
+            1
         );
     }
 }

@@ -68,7 +68,7 @@ xcodebuild -project Leanote.xcodeproj -scheme Leanote \
 xcrun simctl boot "iPhone 17 Pro"                    # if not booted
 APP=$(ls -d ~/Library/Developer/Xcode/DerivedData/Leanote-*/Build/Products/Debug-iphonesimulator/Leanote.app)
 xcrun simctl install "iPhone 17 Pro" "$APP"
-xcrun simctl launch "iPhone 17 Pro" com.leanote.mobile
+xcrun simctl launch "iPhone 17 Pro" site.stanzhai.leanote.mobile
 xcrun simctl io "iPhone 17 Pro" screenshot /tmp/leanote.png   # smoke evidence
 ```
 
@@ -129,7 +129,7 @@ xcrun simctl ui "iPhone 17 Pro" appearance dark           # dark-mode pass
 Already-logged-in + `LEANOTE_FAKE_SERVER=1` boots only the in-process fake
 server (startup incremental sync) instead of re-login. Device data dir on
 iOS is `<container>/Library/Application Support/leanote/` (find the
-container with `xcrun simctl get_app_container <sim> com.leanote.mobile data`).
+container with `xcrun simctl get_app_container <sim> site.stanzhai.leanote.mobile data`).
 
 ## Tray
 

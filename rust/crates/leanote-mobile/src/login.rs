@@ -2,7 +2,7 @@
 //! 同步在 issue 03；这里只登录并把账户持久化进设备端 Store。
 
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::{ActiveTheme, Disableable};
 use gpui_kit::prelude::*;
@@ -18,6 +18,9 @@ pub struct LoginView {
     host: Entity<InputState>,
     email: Entity<InputState>,
     password: Entity<InputState>,
+    /// 构造期捕获：订阅/提交回调里收键盘、移焦点都经它（iOS 平台的
+    /// active_window 是 None stub，不能走 cx.active_window()）。
+    window: gpui_kit::AnyWindowHandle,
     busy: bool,
     error: Option<String>,
     _task: Option<Task<()>>,
@@ -45,15 +48,39 @@ impl LoginView {
             }
             s
         });
-        let password = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("••••••")
-                .masked(true)
-        });
+        let password = cx.new(|cx| InputState::new(window, cx).masked(true));
+        // 表单回车链（issue 16）：host→email→password→提交；每次移动焦点
+        // 换输入框（键盘保持），提交时统一收起。
+        let wh = window.window_handle();
+        cx.subscribe(&host, {
+            let email = email.clone();
+            move |_, _, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    crate::focus_input(wh, &email, cx);
+                }
+            }
+        })
+        .detach();
+        cx.subscribe(&email, {
+            let password = password.clone();
+            move |_, _, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    crate::focus_input(wh, &password, cx);
+                }
+            }
+        })
+        .detach();
+        cx.subscribe(&password, move |this, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. }) {
+                this.submit(cx);
+            }
+        })
+        .detach();
         Self {
             host,
             email,
             password,
+            window: wh,
             busy: false,
             error: None,
             _task: None,
@@ -84,6 +111,9 @@ impl LoginView {
         if self.busy {
             return;
         }
+        // 提交即收键盘（issue 16）：无论按钮还是密码框回车进入，焦点
+        // 离开输入框；失败回错误提示时键盘不再压在界面上。
+        crate::blur_active_input(self.window, cx);
         self.busy = true;
         self.error = None;
         cx.notify();
@@ -171,5 +201,63 @@ impl Render for LoginView {
             .justify_center()
             .bg(cx.theme().background)
             .child(form)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::Focusable;
+    use gpui_kit::TestAppContext;
+
+    /// 回归（issue 16）：回车链 host→email→password→提交；提交后无输入框
+    /// 保持焦点（真机上随 FocusLost 收起系统键盘）。
+    #[gpui_kit::test]
+    fn enter_chains_fields_and_submits(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let view = cx.add_window(|window, cx| LoginView::new(None, window, cx));
+        let press = |e: &Entity<InputState>, cx: &mut gpui_kit::App| {
+            e.update(cx, |_, cx| {
+                cx.emit(InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                })
+            });
+        };
+        let (host, email, password) = cx.update(|cx: &mut gpui_kit::App| {
+            view.read(cx)
+                .map(|v| (v.host.clone(), v.email.clone(), v.password.clone()))
+                .unwrap()
+        });
+
+        // host 回车 → 焦点到 email。
+        cx.update(|cx: &mut gpui_kit::App| press(&host, cx));
+        cx.run_until_parked();
+        view.update(cx, |v, window, cx| {
+            let h = v.email.focus_handle(cx);
+            assert!(h.is_focused(window), "enter on host focuses email");
+        })
+        .unwrap();
+
+        // email 回车 → 焦点到 password。
+        cx.update(|cx: &mut gpui_kit::App| press(&email, cx));
+        cx.run_until_parked();
+        view.update(cx, |v, window, cx| {
+            let h = v.password.focus_handle(cx);
+            assert!(h.is_focused(window), "enter on email focuses password");
+        })
+        .unwrap();
+
+        // password 回车 → 提交（busy）且无输入框再持有焦点（键盘收起路径）。
+        cx.update(|cx: &mut gpui_kit::App| press(&password, cx));
+        cx.run_until_parked();
+        view.update(cx, |v, window, cx| {
+            assert!(
+                v.busy || v.error.is_some(),
+                "enter on password submits (parked: login failed fast with empty fields)"
+            );
+            let h = v.password.focus_handle(cx);
+            assert!(!h.is_focused(window), "submit blurs the input");
+        })
+        .unwrap();
     }
 }

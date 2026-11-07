@@ -176,7 +176,11 @@ impl Render for SettingsTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let safe = window.insets().safe_area;
         let lang = self.prefs.lang.clone();
-        let trunks = crate::theme::theme_trunks();
+        let trunks = crate::theme::theme_trunks(match self.prefs.appearance.as_str() {
+            "light" => Some(false),
+            "dark" => Some(true),
+            _ => None,
+        });
 
         let mut col = gpui_kit::base::v_flex().w_full();
         col = col.child(
@@ -207,6 +211,21 @@ impl Render for SettingsTab {
                     cx,
                     cx.listener(move |this, _ev, _window, cx| {
                         this.prefs.appearance = id.to_string();
+                        // 主题列表随外观自适应：不支持新外观的主题回落
+                        // Default，下拉惰性重建（下一帧带过滤后的列表）。
+                        let mode = match id {
+                            "light" => Some(false),
+                            "dark" => Some(true),
+                            _ => None,
+                        };
+                        let current: SharedString = match this.prefs.ui_theme.as_str() {
+                            "" | "Navop" => "Default".into(),
+                            other => other.into(),
+                        };
+                        if !crate::theme::theme_trunks(mode).contains(&current) {
+                            this.prefs.ui_theme.clear();
+                        }
+                        this.theme_select = None;
                         cx.emit(SettingsEvent::PrefsChanged(this.prefs.clone()));
                         cx.notify();
                     }),
@@ -226,7 +245,8 @@ impl Render for SettingsTab {
             let ix = trunks
                 .iter()
                 .position(|n| *n == current)
-                .map(IndexPath::new);
+                .map(IndexPath::new)
+                .or_else(|| trunks.first().map(|_| IndexPath::new(0)));
             let state =
                 cx.new(|cx| SelectState::new(SearchableVec::new(trunks.clone()), ix, window, cx));
             cx.subscribe(&state, |this, _, ev, cx| {

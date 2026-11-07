@@ -153,7 +153,11 @@ pub fn apply(prefs: &MobilePrefs, window: Option<&mut Window>, cx: &mut App) {
         theme.light_theme = light;
         theme.dark_theme = dark;
         // 缩放：kit Root 每帧从 theme.font_size 重订窗口 rem（桌面 issue 24 同款）。
-        theme.font_size = gpui_kit::px(14. * zoom);
+        // 基准 16px（桌面是 14px）：移动端复用桌面基准时行标题仅 13px、次级
+        // 10.5px，真机实测过小；16 使全 UI 按 rem 等比放大——行标题 15.2 /
+        // 次级 12 / Tab 标签 10.4px，对齐 iOS 字号阶梯（subheadline/caption）。
+        // 界面间距全是 px()，不随基准变；zoom 档位（100/110/120%）仍在此之上。
+        theme.font_size = gpui_kit::px(16. * zoom);
     });
     let mode = match prefs.appearance.as_str() {
         "light" => ThemeMode::Light,
@@ -201,11 +205,15 @@ fn apply_accent(accent: &str, cx: &mut App) {
     }
 }
 
-/// 主题族干列表（选择器用，桌面 choices() 同款）：按 BUNDLED 文件序
+/// 主题族干列表（选择器用，桌面 choices_for() 同款）：按 BUNDLED 文件序
 /// （默认对第一）；成对 "X Light"/"X Dark" 合并为一行、默认对显示
 /// "Default"；单模主题（Matrix、Tokyo Moon…）原名列出。注册表
 /// themes() 是 HashMap（每次启动乱序），不能作顺序来源。
-pub fn theme_trunks() -> Vec<gpui_kit::SharedString> {
+///
+/// 按外观自适应过滤：`None`（跟随系统）只列同时支持深浅的主题（成对
+/// 主题）；`Some(false/true)` 额外列出该模式的单模主题，不支持当前
+/// 外观的主题不出现在列表里。
+pub fn theme_trunks(mode: Option<bool>) -> Vec<gpui_kit::SharedString> {
     static ENTRIES: std::sync::LazyLock<Vec<(String, bool)>> = std::sync::LazyLock::new(|| {
         let mut v = Vec::new();
         for source in BUNDLED {
@@ -237,6 +245,14 @@ pub fn theme_trunks() -> Vec<gpui_kit::SharedString> {
         let paired = !sibling.is_empty() && has(&sibling);
         if paired && *dark {
             continue;
+        }
+        // 外观过滤：跟随系统只保留成对主题；单模主题仅服务所属模式。
+        if !paired {
+            match mode {
+                None => continue,
+                Some(want_dark) if want_dark != *dark => continue,
+                _ => {}
+            }
         }
         let label = if paired {
             if stem == "Navop" {
@@ -277,7 +293,8 @@ mod tests {
             assert!(themes.contains_key("Navop Light"), "navop.json registered");
             assert!(themes.contains_key("Navop Dark"));
         });
-        let trunks = theme_trunks();
+        // 深色视角 = 全部成对主题 + 深色单模（Matrix、Tokyo Moon）。
+        let trunks = theme_trunks(Some(true));
         assert_eq!(
             trunks.first().map(|t| t.to_string()),
             Some("Default".into()),
@@ -295,6 +312,26 @@ mod tests {
         // 单模主题原名列出（无 Light/Dark 配对）。
         assert!(trunks.iter().any(|t| *t == "Matrix"));
         assert!(trunks.iter().any(|t| *t == "Tokyo Moon"));
+    }
+
+    /// 外观自适应过滤：跟随系统只留成对主题（深浅双支持）；浅/深只
+    /// 各自加本模式的单模主题。
+    #[test]
+    fn trunk_list_filters_by_appearance() {
+        let follow = theme_trunks(None);
+        let light = theme_trunks(Some(false));
+        let dark = theme_trunks(Some(true));
+        // 成对主题三种外观都在。
+        for list in [&follow, &light, &dark] {
+            assert!(list.iter().any(|t| *t == "Default"));
+            assert!(list.iter().any(|t| *t == "Gruvbox"));
+        }
+        // 单模主题只在所属模式出现；跟随系统不出现。
+        assert!(dark.iter().any(|t| *t == "Matrix"));
+        assert!(!light.iter().any(|t| *t == "Matrix"));
+        assert!(!follow.iter().any(|t| *t == "Matrix"));
+        // 过滤是全量的子集。
+        assert!(follow.len() <= light.len() && follow.len() <= dark.len());
     }
 
     /// 回归：选择器把 Navop 对落盘为显示名 "Default"，而 kit 自带一对
@@ -369,6 +406,24 @@ mod tests {
                 theme_primary,
                 "back to follow restores the theme's own primary"
             );
+        });
+    }
+
+    /// 回归（issue 14）：移动端 rem 基准必须是 16px，不是桌面的 14px。
+    /// 界面全部文字按 rem 表达，基准回退桌面值 = 整个 UI 字号悄悄变小。
+    #[gpui_kit::test]
+    fn mobile_rem_base_is_16_not_desktop_14(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx: &mut App| apply(&MobilePrefs::default(), None, cx));
+        cx.update(|cx: &mut App| {
+            assert_eq!(Theme::global(cx).font_size, gpui_kit::px(16.));
+        });
+        // zoom 档位在基准之上乘算，不替换基准。
+        let mut p = MobilePrefs::default();
+        p.zoom = 1.2;
+        cx.update(|cx: &mut App| apply(&p, None, cx));
+        cx.update(|cx: &mut App| {
+            assert_eq!(Theme::global(cx).font_size, gpui_kit::px(16. * 1.2));
         });
     }
 }

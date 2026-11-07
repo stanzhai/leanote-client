@@ -15,7 +15,7 @@
 /* Begin PBXFileReference section */
 		1A2EBE9A057E1F7CF12C7EDB /* Leanote.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Leanote.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		285A51859C07E3573B9D48C8 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
-		6E68EE812CE3D0ECFD83FC6B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Assets.xcassets; sourceTree = SOURCE_ROOT; };
+		6E68EE812CE3D0ECFD83FC6B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		825109322C4212CCDF148B08 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -294,7 +294,7 @@
 					"-framework SystemConfiguration",
 					"-ObjC",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.leanote.mobile;
+				PRODUCT_BUNDLE_IDENTIFIER = site.stanzhai.leanote.mobile;
 				PRODUCT_NAME = Leanote;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = Embedding.h;
@@ -334,7 +334,7 @@
 					"-framework SystemConfiguration",
 					"-ObjC",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.leanote.mobile;
+				PRODUCT_BUNDLE_IDENTIFIER = site.stanzhai.leanote.mobile;
 				PRODUCT_NAME = Leanote;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = Embedding.h;

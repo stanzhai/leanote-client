@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/leanote-core", "crates/leanote-cli", "crates/leanote-http", "crates/leanote-app", "crates/leanote-mobile", "fake-server"]
+# leanote: path deps under the workspace dir auto-join the workspace; their
+# examples (e.g. gpui-pre's pattern.rs needs the zed-internal gpui_platform
+# crate) don't compile standalone. Keep them as deps only.
+exclude = ["vendor/gpui-pre", "vendor/gpui-pre-mobile"]
 
 [workspace.package]
 edition = "2021"

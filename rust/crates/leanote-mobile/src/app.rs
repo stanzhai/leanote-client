@@ -302,6 +302,13 @@ impl MobileApp {
             &notes,
             |this, _, event: &crate::notes_tab::NotesEvent, cx| match event {
                 crate::notes_tab::NotesEvent::RefreshRequested => this.start_incr_sync(cx, false),
+                // 搜索进入的阅读屏返回 → 回到搜索列表。
+                crate::notes_tab::NotesEvent::ReturnToSearch => {
+                    let _ = this.shell.update(cx, |s, cx| {
+                        s.tab = TabId::Search;
+                        cx.notify();
+                    });
+                }
             },
         )
         .detach();

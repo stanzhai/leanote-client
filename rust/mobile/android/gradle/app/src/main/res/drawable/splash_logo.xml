@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Splash icon: app logo + "Leanote" wordmark below. Kept within ~108dp
+     (the splash icon container size on API 31+; compat scales the same).
+     Used as windowSplashScreenAnimatedIcon on all API levels. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:drawable="@mipmap/ic_launcher"
+        android:gravity="center"
+        android:width="56dp"
+        android:height="56dp" />
+    <item
+        android:drawable="@drawable/splash_wordmark"
+        android:gravity="center"
+        android:top="40dp" />
+</layer-list>

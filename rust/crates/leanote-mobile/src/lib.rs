@@ -17,6 +17,26 @@ pub fn platform_ok() -> &'static str {
     "gpui-mobile"
 }
 
+use gpui_kit::Focusable;
+
+/// 收起系统键盘 = 焦点离开当前文本输入：iOS 端随 FocusLost 自动
+/// hide_keyboard（vendor/gpui-pre-mobile/src/ios/window.rs）。InputEvent
+/// 订阅回调拿不到 Window，用构造期捕获的窗口句柄转一手——不能用
+/// `cx.active_window()`：iOS 平台是返回 None 的 stub（issue 16）。
+pub(crate) fn blur_active_input(w: gpui_kit::AnyWindowHandle, cx: &mut gpui_kit::App) {
+    let _ = w.update(cx, |_, window, cx| window.blur(cx));
+}
+
+/// 表单回车链：焦点移到下一个输入框（登录 host→email→password）。
+pub(crate) fn focus_input(
+    w: gpui_kit::AnyWindowHandle,
+    next: &gpui_kit::Entity<gpui_kit::component::input::InputState>,
+    cx: &mut gpui_kit::App,
+) {
+    let handle = next.read(cx).focus_handle(cx);
+    let _ = w.update(cx, |_, window, cx| window.focus(&handle, cx));
+}
+
 // ── Android 入口（issue 10）─────────────────────────────────────────────────
 
 #[cfg(target_os = "android")]

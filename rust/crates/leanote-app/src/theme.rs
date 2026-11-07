@@ -4,8 +4,8 @@
 //! system; this module only carries the token values.
 
 pub use crate::theme_registry::{
-    border, choices, foreground, glass_base, material, muted_foreground, register, resolved_name,
-    select, theme_radii, MODE_DARK,
+    border, choices_for, foreground, glass_base, material, muted_foreground, register,
+    resolved_name, select, MODE_DARK,
 };
 use gpui_kit::{hsla, px, Hsla, Pixels};
 
@@ -62,8 +62,7 @@ pub const ACCENTS: &[(&str, u32)] = &[
 
 /// u32::MAX = follow the theme's primary (the default); otherwise an ACCENTS hex
 /// (0 is NOT the sentinel — the black swatch is 0x000000).
-static CURRENT_ACCENT: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(u32::MAX);
+static CURRENT_ACCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Set the accent by swatch id. "" / unknown ids clear the override and
 /// follow the theme. Callers re-apply the theme afterwards so derived

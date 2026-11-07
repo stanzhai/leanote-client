@@ -61,7 +61,7 @@
          visible until NATIVE_INITIALIZED is true via JNI. -->
     <style name="GpuiSplashTheme" parent="Theme.SplashScreen">
         <item name="windowSplashScreenBackground">@color/gpui_surface</item>
-        <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/splash_logo</item>
         <item name="postSplashScreenTheme">@style/GpuiTheme</item>
     </style>
 

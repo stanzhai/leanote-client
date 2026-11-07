@@ -1,6 +1,6 @@
 name: Leanote
 options:
-  bundleIdPrefix: com.leanote
+  bundleIdPrefix: site.stanzhai.leanote
   deploymentTarget:
     iOS: "16.0"
   createIntermediateGroups: true
@@ -25,12 +25,12 @@ targets:
       - path: LaunchScreen.storyboard
         type: file
         buildPhase: resources
+      # .xcassets 必须由 actool 编译（Assets.car + Info.plist 图标键）；
+      # type: folder 会退化成原样拷贝，主屏图标不生效（issue 18）。
       - path: Assets.xcassets
-        type: folder
-        buildPhase: resources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.leanote.mobile
+        PRODUCT_BUNDLE_IDENTIFIER: site.stanzhai.leanote.mobile
         PRODUCT_NAME: Leanote
         INFOPLIST_FILE: Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

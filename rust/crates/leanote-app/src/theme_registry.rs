@@ -203,6 +203,38 @@ pub fn choices() -> &'static [&'static str] {
     &CHOICES
 }
 
+/// Picker choices filtered by the appearance pref: `None` (Follow) lists
+/// only themes serving BOTH modes (pairs); `Some(dark)` lists pairs plus
+/// single-mode themes of that mode. Unsupported themes never surface.
+pub fn choices_for(mode: Option<bool>) -> Vec<&'static str> {
+    // The default pair lists under its label "Default"; resolve the stem.
+    fn stem_of(choice: &str) -> &str {
+        if choice == "Default" {
+            "Navop"
+        } else {
+            choice
+        }
+    }
+    let serves = |choice: &str, dark: bool| {
+        let variant = format!(
+            "{} {}",
+            stem_of(choice),
+            if dark { "Dark" } else { "Light" }
+        );
+        ENTRIES
+            .iter()
+            .any(|e| e.dark == dark && (e.name == stem_of(choice) || e.name == variant))
+    };
+    choices()
+        .iter()
+        .copied()
+        .filter(|c| match mode {
+            None => serves(c, false) && serves(c, true),
+            Some(d) => serves(c, d),
+        })
+        .collect()
+}
+
 /// Register every bundled theme with the kit's `ThemeRegistry` so kit
 /// widgets paint the same JSON. Call once at boot.
 pub fn register(cx: &mut gpui_kit::App) {
@@ -346,6 +378,28 @@ mod tests {
         assert_eq!(resolved_name(false), DEFAULT_LIGHT);
         assert_eq!(resolved_name(true), DEFAULT_DARK);
         select("Default"); // restore global default for other tests
+    }
+
+    /// Adaptive picker list: Follow lists only themes serving BOTH modes
+    /// (pairs); Light/Dark add that mode's singles. Unsupported themes
+    /// never surface.
+    #[test]
+    fn choices_filter_by_appearance() {
+        let follow = choices_for(None);
+        let light = choices_for(Some(false));
+        let dark = choices_for(Some(true));
+        for list in [&follow, &light, &dark] {
+            assert!(list.contains(&"Default"));
+            assert!(list.contains(&"Gruvbox"));
+        }
+        // Matrix is dark-only; Catppuccin Latte light-only.
+        assert!(!follow.contains(&"Matrix"));
+        assert!(!light.contains(&"Matrix"));
+        assert!(dark.contains(&"Matrix"));
+        assert!(light.contains(&"Catppuccin Latte"));
+        assert!(!dark.contains(&"Catppuccin Latte"));
+        assert!(!follow.contains(&"Catppuccin Latte"));
+        assert!(follow.len() <= light.len() && follow.len() <= dark.len());
     }
 
     /// The glass pref only touches the alpha channel of the sidebar.

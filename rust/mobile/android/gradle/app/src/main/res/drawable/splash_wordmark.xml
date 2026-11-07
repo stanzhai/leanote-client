@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "Leanote" wordmark as stroke paths (no bundled font needed).
+     Used below the app icon on the splash screen. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="110dp"
+    android:height="22dp"
+    android:viewportWidth="200"
+    android:viewportHeight="44">
+    <group
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round">
+        <!-- L -->
+        <path android:pathData="M10,8 V36 H26" />
+        <!-- e -->
+        <path android:pathData="M34,22 H52" />
+        <path android:pathData="M52,25 A9,9 0 1 0 52,27" />
+        <!-- a -->
+        <path android:pathData="M77,27 A9,9 0 1 0 76.9,27" />
+        <path android:pathData="M77,17 V36" />
+        <!-- n -->
+        <path android:pathData="M88,36 V24 A9,9 0 0 1 106,24 V36" />
+        <!-- o -->
+        <path android:pathData="M115,27 A9,9 0 1 0 133,27 A9,9 0 1 0 115,27" />
+        <!-- t -->
+        <path android:pathData="M148,14 V31 A6,6 0 0 0 160,31" />
+        <path android:pathData="M142,18 H156" />
+        <!-- e -->
+        <path android:pathData="M168,22 H186" />
+        <path android:pathData="M186,25 A9,9 0 1 0 186,27" />
+    </group>
+</vector>

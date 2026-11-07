@@ -30,15 +30,24 @@ impl SearchTab {
         // Dev 冒烟：LEANOTE_SEARCH=关键词 预填并即搜（模拟器无法键入）。
         let prefill = std::env::var("LEANOTE_SEARCH").ok();
         let input = cx.new(|cx| {
-            let mut s = InputState::new(window, cx).placeholder(crate::i18n::t("search_placeholder"));
+            let mut s =
+                InputState::new(window, cx).placeholder(crate::i18n::t("search_placeholder"));
             if let Some(q) = &prefill {
                 s = s.default_value(q);
             }
             s
         });
-        cx.subscribe(&input, |this, _, ev: &InputEvent, cx| {
+        let wh = window.window_handle();
+        cx.subscribe(&input, move |this, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
                 this.schedule(cx);
+            }
+            // 回车 = 定稿：丢弃残留防抖立即搜 + 收键盘（issue 16：
+            // 焦点离开输入框，iOS 随 FocusLost 收起系统键盘）。
+            if matches!(ev, InputEvent::PressEnter { .. }) {
+                this._task = None;
+                this.run(cx);
+                crate::blur_active_input(wh, cx);
             }
         })
         .detach();
@@ -154,7 +163,9 @@ impl Render for SearchTab {
                 col = col.child(Self::row(
                     hit,
                     cx,
-                    cx.listener(move |_, _ev, _window, cx| {
+                    cx.listener(move |_, _ev, window, cx| {
+                        // 跳阅读屏前收键盘（issue 16）。
+                        window.blur(cx);
                         cx.emit(SearchEvent::OpenNote {
                             note_id: id.clone(),
                             title: t.clone(),
@@ -179,4 +190,46 @@ impl Render for SearchTab {
 
 fn px_(v: f32) -> gpui_kit::Pixels {
     gpui_kit::px(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::TestAppContext;
+
+    /// 回归（issue 16）：回车 = 立即定稿搜索（丢弃防抖、hits 同步就绪），
+    /// 并把焦点移出输入框（真机上随 FocusLost 收起系统键盘）。
+    #[gpui_kit::test]
+    fn enter_finalizes_search_immediately(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = std::env::temp_dir().join(format!("lt-search-enter-{}", std::process::id()));
+        let store = Store::open(dir.clone(), "u1".into()).unwrap();
+        store
+            .add_note(leanote_core::NewNote {
+                title: "渲染管线".into(),
+                content: "hello".into(),
+                tags: vec![],
+                notebook_title: "AI札".into(),
+                is_markdown: true,
+            })
+            .unwrap();
+        let tab = cx.add_window(|window, cx| SearchTab::new(window, cx));
+        tab.update(cx, |t, window, cx| {
+            t.set_store(std::sync::Arc::new(std::sync::Mutex::new(store)), cx);
+            // set_value 不发 Change（无防抖任务），hits 只能来自回车路径。
+            t.input.update(cx, |s, cx| s.set_value("渲染", window, cx));
+            assert!(t.hits.is_empty(), "before enter: debounce not fired");
+            t.input.update(cx, |_, cx| {
+                cx.emit(InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                })
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let hits = cx.update(|cx: &mut gpui_kit::App| tab.read(cx).unwrap().hits.len());
+        assert_eq!(hits, 1, "enter runs the search synchronously");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

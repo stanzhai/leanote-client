@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.leanote.mobile"
+    namespace = "site.stanzhai.leanote.mobile"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.leanote.mobile"
+        applicationId = "site.stanzhai.leanote.mobile"
         minSdk = 26
         targetSdk = 34
         versionCode = 1

@@ -2,7 +2,7 @@
 //! three-pane shell (ADR-0003). Ticket 09: selectable nav + filtered list +
 //! read-only Markdown reader, star toggle, trash actions.
 
-use crate::browse::{self, DropTarget, NavNode};
+use crate::browse::{self, DropTarget};
 use crate::conflict_bar;
 use crate::i18n::{self, Lang};
 use crate::theme::{self, Material};
@@ -34,6 +34,7 @@ use gpui_kit::{
     px, rems, AnyElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, SharedString,
     Task, UniformListScrollHandle, Window, WindowControlArea,
 };
+use leanote_core::nav::{notebook_nodes, NavNode};
 use leanote_core::sync::{Api, NoProgress, SyncProgress, SyncStats};
 use std::sync::{Arc, Mutex};
 
@@ -796,7 +797,7 @@ impl AppShell {
                         .into_iter()
                         .map(|(id, c)| (id.to_string(), c))
                         .collect();
-                    browse::notebook_nodes(
+                    notebook_nodes(
                         &nbs.iter()
                             .map(|nb| {
                                 (
@@ -1166,6 +1167,20 @@ impl AppShell {
             return;
         }
         p.appearance = target;
+        // Adaptive theme list: a single-mode theme that can't serve the
+        // picked appearance (e.g. Matrix under Light) resets to the default
+        // pair so the picker never shows an unsupported selection.
+        let mode = match target {
+            crate::prefs::AppearancePref::Follow => None,
+            crate::prefs::AppearancePref::Light => Some(false),
+            crate::prefs::AppearancePref::Dark => Some(true),
+        };
+        let mut theme_reset = false;
+        if !theme::choices_for(mode).contains(&p.ui_theme.as_str()) {
+            p.ui_theme.clear();
+            theme::select("");
+            theme_reset = true;
+        }
         p.save(&dir);
         // Panes read window.appearance(); drive it from the theme choice so
         // Light/Dark repaint the whole app (issue 19 #26). Applied BEFORE the
@@ -1197,6 +1212,12 @@ impl AppShell {
             };
             theme.mode = mode;
         });
+        // A reset pick (unsupported under the new appearance) must also
+        // refresh the registered light/dark configs — the mode switch above
+        // re-applies whatever was registered by the LAST pick.
+        if theme_reset {
+            Self::reapply_theme_config(cx);
+        }
         gpui_kit::component::Theme::update(cx, move |theme| {
             crate::apply_wake_theme(theme, &font, &editor_size, zoom);
         });
@@ -4271,17 +4292,19 @@ impl AppShell {
         let shell = cx.entity();
         // ADR-0014: theme picker entity must exist BEFORE the dialog
         // closure borrows cx — entity creation can't happen inside it.
-        // One picker: paired themes collapse to their stem ("Gruvbox"),
-        // and the choice auto-matches the appearance mode.
-        let items: Vec<SharedString> = theme::choices()
+        // Adaptive list: Follow lists only pairs (both modes); Light/Dark
+        // add that mode's single-mode themes.
+        let p0 = crate::prefs::Prefs::load(&self.data_dir);
+        let mode = match p0.appearance {
+            crate::prefs::AppearancePref::Follow => None,
+            crate::prefs::AppearancePref::Light => Some(false),
+            crate::prefs::AppearancePref::Dark => Some(true),
+        };
+        let items: Vec<SharedString> = theme::choices_for(mode)
             .iter()
             .map(|c| SharedString::from(*c))
             .collect();
-        let p0 = crate::prefs::Prefs::load(&self.data_dir);
-        let sel = theme::choices()
-            .iter()
-            .position(|c| *c == p0.ui_theme)
-            .unwrap_or(0);
+        let sel = items.iter().position(|c| *c == p0.ui_theme).unwrap_or(0);
         let theme_state = cx.new(|cx| {
             ComboboxState::<SearchableVec<SharedString>>::new(
                 SearchableVec::new(items.clone()),
@@ -4351,9 +4374,37 @@ impl AppShell {
                                 },
                                 {
                                     let shell = shell_c.clone();
-                                    move |ix, _window, cx| {
+                                    let theme_state = theme_state.clone();
+                                    move |ix, window, cx| {
                                         shell.update(cx, |this, cx| {
                                             this.set_appearance(ix, cx);
+                                        });
+                                        // Adaptive list: re-filter the theme
+                                        // picker for the new appearance and
+                                        // re-point the selection (an
+                                        // unsupported pick was reset to the
+                                        // default by set_appearance).
+                                        let p = crate::prefs::Prefs::load(&shell.read(cx).data_dir);
+                                        let mode = match p.appearance {
+                                            crate::prefs::AppearancePref::Follow => None,
+                                            crate::prefs::AppearancePref::Light => Some(false),
+                                            crate::prefs::AppearancePref::Dark => Some(true),
+                                        };
+                                        let items: Vec<SharedString> = theme::choices_for(mode)
+                                            .iter()
+                                            .map(|c| SharedString::from(*c))
+                                            .collect();
+                                        let sel = items
+                                            .iter()
+                                            .position(|c| *c == p.ui_theme)
+                                            .unwrap_or(0);
+                                        theme_state.update(cx, |state, cx| {
+                                            state.set_items(SearchableVec::new(items), window, cx);
+                                            state.set_selected_indices(
+                                                vec![IndexPath::default().row(sel)],
+                                                window,
+                                                cx,
+                                            );
                                         });
                                     }
                                 },
