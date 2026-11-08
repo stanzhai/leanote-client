@@ -1,6 +1,6 @@
 # Issue 10: Android 跟进（iOS v1 通过后启动）
 
-状态:代码完成(2026-11-04；模拟器走查受阻——本机 emulator 崩溃，真机验证待做)
+状态:代码完成(2026-11-04)；模拟器走查通过(2026-11-08，修复渲染/数据目录/kit init 三处后登录页正常渲染)
 
 ## 需求
 
@@ -20,9 +20,16 @@
 - `cargo ndk -t arm64-v8a -P 26 build --lib -p leanote-mobile` → `libleanote_mobile.so` 产出；
 - `./gradlew assembleDebug` → **BUILD SUCCESSFUL**，`app-debug.apk` 产出；
 - Android target `cargo check` 双向绿（issue 01 起）。
-- **模拟器运行验证（受阻，基础设施级）**：AVD（android-34 google_apis arm64）+ emulator 37.2.13 在本机（macOS 27）启动后 ~60s 稳定崩溃——`Failed to restore previous context: 12297`（宿主 GL 层错误，**未安装任何应用即崩**，三次复现：windowed/swiftshader/guest 组合全灭）。非本 app 问题。APK 曾在其中一次成功 `adb install`（Success）后模拟器随即崩溃，未及启动截图。
-  - 真机验证路径（自用 v1 本来就是真机侧载）：`adb install rust/mobile/android/gradle/app/build/outputs/apk/debug/app-debug.apk`（1.5GB debug 包；release 构建走 `mobile/android/build.sh --release` 显著缩小）。
+- **模拟器运行验证（2026-11-08 通过）**：AVD android-34 google_apis arm64 + emulator 37.2.13（`-gpu host`，本机 M2 Max）。曾卡 splash 三层原因，均已修：
+  1. GL 回退被拒：模拟器 host 翻译器仅 GLES 3.0（无 vertex storage、compute 限值 0），gpui-pre-wgpu 固定请求 `downlevel_defaults()`（storage=4/compute=65535）必败 → vendor gpui-pre-wgpu：无 `VERTEX_STORAGE` downlevel flag 时用 `downlevel_webgl2_defaults()`，`uses_webgl_instance_data()` 同 flag 判定（原 wasm-only）。
+  2. `app_data_dir()` 在 Android panic（无 HOME）→ `LEANOTE_DATA_DIR` env 覆盖，android_main 从 `AndroidApp::internal_data_path()` 注入。
+  3. Android 入口漏 `gpui_kit::init(cx)`（iOS 有）→ ThemeRegistry panic。
+  验证：`init_done=true`、无 panic、截图登录页（服务器/邮箱/密码/登录）完整渲染。注意：模拟器 Vulkan 不可用（MoltenVK device lost / SwiftShader pipeline hang），实际走 GL；真机 Vulkan 待验。
+  安装坑：1.4G debug 包需 `llvm-strip --strip-debug` 两枚 .so，否则 2.7G 装不进；连装失败先 `adb uninstall` + `adb reboot`（PM staging 泄漏）。
+  - 真机验证路径（自用 v1 本来就是真机侧载）：`adb install rust/mobile/android/gradle/app/build/outputs/apk/debug/app-debug.apk`（strip 后 1.4G；release 构建走 `mobile/android/build.sh --release` 显著缩小）。
 
 ## Comments
 
 - APK 签名：debug 签名可直接侧载；正式自用签名（APK 自签）待真机首装时补。
+- 2026-11-08 后续：顶栏与状态栏重叠（笔记本切换/详情返回键点不到）——Android 窗口未实现 `PlatformWindow::insets()`（upstream 默认 0，iOS 有同款 leanote 补丁），app `.pt(safe.top)` 全为 0。vendor/gpui-pre-mobile android/window.rs 补 insets()（`safe_area_insets_logical()`），模拟器截图验证内容下移至状态栏之下。upstream gpui-mobile 同样缺此实现，升级 re-vendor 时保留。
+- 2026-11-08 后续 2：模拟器 macOS 物理键盘不能输入——① AVD `config.ini` `hw.keyboard=no` 默认（命令行 avdmanager 建的），改 yes 重启模拟器；② gpui-pre-mobile Android 键事件只发裸 KeyDown，gpui 编辑器插入文字仅走 input handler（IME 路径），裸 KeyDown 永不插入（iOS `handle_text_input` 一直先走 handler）。vendor 补：可打印字符 DOWN 直接 `replace_text_in_range` 进聚焦输入框，控制键保持 KeyDown。注意 if-let 判别式里的 `RefCell::borrow_mut()` 在 2021 edition 活到块尾——take 要先拆出来，双 borrow 直接 panic（已踩）。re-vendor 保留。

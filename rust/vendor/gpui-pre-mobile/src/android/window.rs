@@ -1498,6 +1498,23 @@ impl HasDisplayHandle for AndroidPlatformWindow {
 }
 
 impl PlatformWindow for AndroidPlatformWindow {
+    /// leanote: route the platform-reported safe-area insets through the
+    /// trait so `Window::insets()` reports real values (upstream leaves the
+    /// default zeros) — app bars/contents then pad below the status bar and
+    /// above the gesture nav area, same as the iOS window (see ios/window.rs).
+    fn insets(&self) -> gpui::WindowInsets {
+        let insets = self.window.safe_area_insets_logical();
+        gpui::WindowInsets {
+            safe_area: gpui::Edges {
+                top: gpui::px(insets.top),
+                bottom: gpui::px(insets.bottom),
+                left: gpui::px(insets.left),
+                right: gpui::px(insets.right),
+            },
+            ..Default::default()
+        }
+    }
+
     fn bounds(&self) -> gpui::Bounds<gpui::Pixels> {
         let state = self.window.state.lock();
         let w = state.width as f32 / state.scale_factor;
@@ -1792,20 +1809,63 @@ impl PlatformWindow for AndroidPlatformWindow {
         // ── Key events → PlatformInput ───────────────────────────────────
         {
             let cb = Arc::clone(&input_cb);
+            // Same main-thread-only justification as `on_active_status_change`
+            // below: key events are only ever delivered on the event-loop
+            // thread, so the non-Send Rc slot is safe to capture.
+            struct SendRc<T>(Rc<T>);
+            unsafe impl<T> Send for SendRc<T> {}
+            impl<T> SendRc<T> {
+                fn get(&self) -> &T {
+                    &self.0
+                }
+            }
+            let input_handler_slot = SendRc(Rc::clone(&self.input_handler));
             self.window.on_key_event(move |key_event| {
                 use crate::android::keyboard::{
                     android_key_to_keystroke, AKEY_EVENT_ACTION_DOWN, AKEY_EVENT_ACTION_UP,
                 };
 
-                // On KeyDown, dispatch text through the global callback so
-                // custom TextInput components (PENDING_TEXT) receive it.
                 if key_event.action == AKEY_EVENT_ACTION_DOWN {
+                    // leanote: hardware-keyboard printable characters go
+                    // straight into the focused input's handler — gpui's
+                    // editor inserts text only via the input handler (the
+                    // IME path); a bare KeyDown never inserts (mirrors iOS
+                    // `handle_text_input`). Control keys (backspace, arrows,
+                    // home/end) keep the legacy dispatch + KeyDown route so
+                    // editor key bindings handle them.
+                    let printable = char::from_u32(key_event.unicode_char)
+                        .filter(|c| !c.is_control() && key_event.unicode_char != 0);
+                    if let Some(c) = printable {
+                        let handler = input_handler_slot.get().borrow_mut().take();
+                        if let Some(mut handler) = handler {
+                            let text = c.to_string();
+                            handler.replace_text_in_range(None, &text);
+                            let mut slot = input_handler_slot.get().borrow_mut();
+                            if slot.is_none() {
+                                *slot = Some(handler);
+                            }
+                            return;
+                        }
+                    }
+
+                    // On KeyDown, dispatch text through the global callback so
+                    // custom TextInput components (PENDING_TEXT) receive it.
                     match key_event.key_code {
-                        67 => crate::dispatch_text_input("\x08"), // KEYCODE_DEL (backspace)
-                        21 => crate::dispatch_text_input("\x1b[D"), // DPAD_LEFT
-                        22 => crate::dispatch_text_input("\x1b[C"), // DPAD_RIGHT
-                        122 => crate::dispatch_text_input("\x1b[H"), // MOVE_HOME
-                        123 => crate::dispatch_text_input("\x1b[F"), // MOVE_END
+                        67 => {
+                            crate::dispatch_text_input("\x08");
+                        } // KEYCODE_DEL (backspace)
+                        21 => {
+                            crate::dispatch_text_input("\x1b[D");
+                        } // DPAD_LEFT
+                        22 => {
+                            crate::dispatch_text_input("\x1b[C");
+                        } // DPAD_RIGHT
+                        122 => {
+                            crate::dispatch_text_input("\x1b[H");
+                        } // MOVE_HOME
+                        123 => {
+                            crate::dispatch_text_input("\x1b[F");
+                        } // MOVE_END
                         _ => {
                             if key_event.unicode_char != 0 {
                                 if let Some(c) = char::from_u32(key_event.unicode_char) {
@@ -1813,7 +1873,6 @@ impl PlatformWindow for AndroidPlatformWindow {
                                     crate::dispatch_text_input(&s);
                                 }
                             }
-                            false
                         }
                     };
                 }

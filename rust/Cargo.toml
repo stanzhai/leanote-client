@@ -31,3 +31,10 @@ gpui-base = { path = "vendor/gpui-base" }
 # startup. Re-vendor on wgpu upgrade (29.0.4 → check upstream fixed). See
 # .scratch/mobile/issues/12.
 wgpu-hal = { path = "vendor/wgpu-hal" }
+# leanote: vendored with two changes — ① device limits: ES 3.0 GL adapters
+# (Android emulator host-GPU translator; no storage buffers, compute limits 0)
+# get downlevel_webgl2_defaults() so request_device stops rejecting them;
+# ② uses_webgl_instance_data() is capability-based (no storage buffers) so
+# native ES 3.0 GL uses the uint-texture instance transport, not just WebGL2.
+# Re-vendor on gpui-pre-wgpu upgrade. See ADR-0005.
+gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }

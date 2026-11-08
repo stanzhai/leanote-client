@@ -195,7 +195,16 @@ pub(crate) const NOTES_LIVE_BASE: &str =
 /// is a fresh app that succeeds the Electron one; the Electron NeDB store
 /// under the same macOS dir is legacy and never touched — different files,
 /// `leanote.db` vs `nedb55/`). No migration from the old `leanote-rust` dir.
+/// Android has no HOME/XDG env; the mobile entry injects the app-internal
+/// files dir here (from `AndroidApp::internal_data_path()`) before core init.
+pub const DATA_DIR_ENV: &str = "LEANOTE_DATA_DIR";
+
 pub fn app_data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(DATA_DIR_ENV) {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("leanote");
+        }
+    }
     // Windows: %APPDATA%\leanote (HOME is usually unset there — the old
     // `var("HOME").expect()` would panic). Linux: XDG_CONFIG_HOME or
     // ~/.config. macOS: ~/Library/Application Support.

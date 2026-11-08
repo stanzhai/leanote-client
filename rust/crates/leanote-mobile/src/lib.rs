@@ -60,6 +60,12 @@ mod android {
         // Android 窗口在 MainEvent::InitWindow 后才存在：run 回调延迟到
         // surface 就绪（gpui-mobile 语义），Application 必须活在整个循环上。
         let _platform = jni::init_platform(&app);
+        // Android has no HOME; core's app_data_dir() needs the app-internal
+        // files dir injected before any core init (see leanote-core
+        // DATA_DIR_ENV).
+        if let Some(files) = app.internal_data_path() {
+            std::env::set_var("LEANOTE_DATA_DIR", files);
+        }
         let shared = match jni::shared_platform() {
             Some(s) => s,
             None => {
@@ -71,6 +77,7 @@ mod android {
         gpui::Application::with_platform(shared.into_rc())
             .with_assets(gpui_kit::assets::AllAssets)
             .run(|cx: &mut App| {
+                gpui_kit::init(cx);
                 cx.open_window(WindowOptions::default(), |window, cx| {
                     let content = cx.new(|cx| MobileApp::new(window, cx));
                     cx.new(|cx| Root::new(content, window, cx))

@@ -813,7 +813,6 @@ fn process_input_events(app: &AndroidApp) {
                                 action,
                                 meta_state as i32,
                             );
-
                             if unicode_char != 0 {
                                 log::trace!(
                                     "dispatch_key_event: code={} action={} meta={:#x} → unicode=U+{:04X}",
