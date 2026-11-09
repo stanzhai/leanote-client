@@ -59,12 +59,12 @@ cat > "$APPDIR/leanote.appdata.xml" <<EOF
 EOF
 
 if [ ! -x "$CACHE/appimagetool-$ARCH.AppImage" ]; then
-  curl -fsSL -o "$CACHE/appimagetool-$ARCH.AppImage" \
+  curl -fsSL --retry 5 --retry-all-errors -o "$CACHE/appimagetool-$ARCH.AppImage" \
     "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${ARCH}.AppImage"
   chmod +x "$CACHE/appimagetool-$ARCH.AppImage"
 fi
 if [ ! -f "$CACHE/AppRun" ]; then
-  curl -fsSL -o "$CACHE/AppRun" \
+  curl -fsSL --retry 5 --retry-all-errors -o "$CACHE/AppRun" \
     "https://github.com/AppImage/AppImageKit/releases/download/continuous/AppRun-${ARCH}"
   chmod +x "$CACHE/AppRun"
 fi
