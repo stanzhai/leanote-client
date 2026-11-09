@@ -59,7 +59,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust
           key: ${{ matrix.target }}
 
       - name: Install Linux build deps
@@ -91,15 +90,14 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
           WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
-        run: |
-          cd rust
+
           rustup target add ${{ matrix.target }}
           if [[ -n "${{ matrix.test }}" ]]; then cargo test --workspace --release; fi
           if [[ "${{ matrix.script }}" == *.ps1 ]]; then
             powershell -ExecutionPolicy Bypass -File scripts/${{ matrix.script }} \
-              -Arch ${{ matrix.arch }} -OutDir ../dist -Version "$VERSION"
+              -Arch ${{ matrix.arch }} -OutDir dist -Version "$VERSION"
           else
-            sh scripts/${{ matrix.script }} ${{ matrix.arch }} ../dist "$VERSION"
+            sh scripts/${{ matrix.script }} ${{ matrix.arch }} dist "$VERSION"
           fi
 
       - name: Upload artifacts

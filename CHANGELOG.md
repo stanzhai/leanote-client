@@ -2,7 +2,8 @@
 
 
 
-## Unreleased
+## 3.1.14（2026-11-09）
+- **重构：仓库目录扁平化，`rust/` 提升为项目根**——纯 Rust 仓库（Electron/JS 代码已全部移除）。`Cargo.toml`、`crates/`、`fake-server/`、`mobile/`、`packaging/`、`scripts/`、`vendor/` 移到根目录；CI 工作流、打包脚本、`.gitignore`、js_parity 测试的 fixtures 路径同步更新；根 README 以原 rust/README 为基础重写。行为无变化，`cargo test --workspace` 全绿。
 - **修复：单模主题（Matrix、Kibble、Jellybeans、Harper、Fahrenheit、Catppuccin 系列等）在设置里选了不生效**：设置对话框的主题下拉订阅闭包把 `Confirm` 载荷拿去**对话框打开时捕获的旧 items 列表**里查位置再取值——而外观行就在主题行上方，对话框内切外观（如 跟随系统/浅色 → 深色）会按新外观热更新下拉列表（新增 Matrix 等深色单模主题），之后选中的载荷在新列表、闭包却查旧列表 → `position()` 落空 → **pick 静默丢弃**，主题停留在上一个。成对主题（Gruvbox 等）标签在所有过滤列表里都有所以幸免——这正是只有单模主题（全部深色单模 + 浅色 Catppuccin Latte/Aurora Light）踩坑的原因。修复：载荷本身就是选项名，直接 `set_ui_theme(name)`，删掉多余映射（移动端本就直接用值，无此 bug）。回归测试 `boot_and_switch_single_mode_theme` 钉住单模主题的启动解析与单模间切换。
 - **修复：Android 模拟器 macOS 物理键盘无法输入文字（issue 10）**：两个前提 + 一个断点。前提：AVD `hw.keyboard = no` 默认关闭宿主键盘转发（已改 yes），模拟器需重启生效。断点：硬件键事件到达 gpui 后只以 KeyDown 派发，而 gpui 编辑器插入文字仅走 input handler（IME 路径），裸 KeyDown 永不插入（iOS 侧 `handle_text_input` 一直先走 handler）。vendored gpui-pre-mobile Android 键事件闭包补齐：可打印字符（非控制符）DOWN 时直接 `replace_text_in_range` 进聚焦输入框，无 handler 再回退 KeyDown；退格/方向/Home/End 等控制键保持 KeyDown 路由由编辑器键绑定处理。验证：模拟器 + macOS 键盘（AppleScript keystroke 端到端）输入 "hi" 正确落入登录邮箱框、光标跟随；软键盘 IME 路径未动。
 - **修复：Android 顶栏与状态栏重叠导致无法点击（笔记本切换、详情页返回键）**：vendored gpui-pre-mobile 的 Android 窗口未把 `safe_area_insets` 接进 `PlatformWindow::insets()`（iOS 侧有 leanote 同款补丁，Android upstream 留默认 0）——app 各屏 `.pt(safe.top)` 全部拿到 0，顶栏画进系统状态栏区域被系统手势区挡住。Android 窗口补 `insets()` 实现（`safe_area_insets_logical()` 换算逻辑像素），布局管线与 iOS 同源。

@@ -1,179 +1,233 @@
-# Leanote Desktop App
-
-蚂蚁笔记客户端。默认markdown + vim编辑模式，Native高性能客户端。
+# Leanote
 
 ![](./preview.png)
 
-## Rust 重写版（GPUI）
+Leanote 笔记桌面客户端 + 移动端 + 本地 HTTP/MCP API，纯 Rust 实现（GPUI 桌面端、SQLite 本地存储、leanote 云同步引擎）。
 
-本仓库含一套完整的 Rust 重写（`rust/`）：SQLite 存储、leanote 同步引擎、本地 HTTP/MCP（127.0.0.1:8912）、三栏 GPUI 桌面端与命令行工具，与 Electron 版线协议、CLI 字节输出、MCP 行为对拍一致。详见 `rust/README.md`。
+Workspace layout:
 
-### 开发与运行
+- `crates/leanote-core` — SQLite store, sync engine, conflicts, html2md
+- `crates/leanote-cli` — `leanote` binary (add/list/show/search/edit/sync/serve)
+- `crates/leanote-http` — local `/api/*` + MCP server on 127.0.0.1:8912
+- `crates/leanote-app` — GPUI desktop shell (login, three-pane, editor, tray)
+- `crates/leanote-reader` — shared reading pipeline (markdown/HTML→md, image
+  resolve, Mermaid inline SVG) used by desktop and mobile (ADR-0011)
+- `crates/leanote-mobile` — iOS/Android read-mostly shell on vendored
+  `gpui-pre-mobile` (ADR-0013; see `.scratch/mobile/`)
+- `fake-server` — programmable leanote server for dev/tests
 
-```sh
-cd rust
-cargo build --release            # 产出 target/release/Leanote（GUI）与 leanote（CLI）
-cargo test                       # 全工作区测试（218 个）
-./target/release/Leanote         # 直接运行桌面端
-
-# 冒烟（假服务器 + 自动登录，无需真实账号）：
-LEANOTE_DATA=/tmp/smoke LEANOTE_FAKE_SERVER=1 LEANOTE_FAKE_AUTOSUBMIT=1 ./target/release/Leanote
-```
-
-数据目录：`~/Library/Application Support/leanote/`（win `%APPDATA%\leanote`、linux `~/.config/leanote`，可用 `LEANOTE_DATA` 覆盖）；与 Electron 遗留 NeDB（`nedb55/`）同目录共存但永不互读写（ADR-0008）。日志：`<数据目录>/logs/app.log`；`LEANOTE_MCP_DEBUG=1` 时追加 `~/leanote_mcp.log`（与 JS 版一致）。
-
-导出：笔记右键菜单 / 标题栏 ⋯ 菜单 →「导出为…」二级子菜单（Markdown / HTML / PDF / Word），全部本地转换（PDF 用内嵌 typst，Word 用 knit-md-docx 纯 Rust 链路）；另有全库 `.leanote` JSON 备份。保存面板记住上次导出目录（首次 `~/Downloads`）。窗口拖拽：导航头、阅读条、编辑条与编辑器标题行空白处均可拖动窗口（win HTCAPTION / linux start_window_move / mac AppKit）。
-
-### 打包
+## Build
 
 ```sh
-sh rust/scripts/package-macos.sh aarch64            # 本机架构；x86_64 同理
-sh rust/scripts/package-linux.sh x86_64             # 需 dpkg-deb + patchelf
-powershell rust/scripts/package-windows.ps1 -Arch x64   # 需 makensis (NSIS)
+cargo build --release          # all binaries → target/release/{leanote,Leanote}
+cargo test                     # workspace tests
 ```
 
-产出 `dist/Leanote_<ver>_<os>_<arch>.{dmg,AppImage,deb,exe,zip}`。GUI 二进制名 `Leanote`，CLI 随包（mac `.app` 内为 `leanote-cli`，win 在 `bin\leanote.exe` 可选加 PATH，linux `/usr/bin/leanote`）。图标源 `build/icon.png`，经 `rust/scripts/gen-icons.sh` 再生成入库。
+Data dir: `~/Library/Application Support/leanote/` (macOS), `%APPDATA%\leanote`
+(Windows), `~/.config/leanote` (Linux, honors `XDG_CONFIG_HOME`). Override with
+`LEANOTE_DATA`. The legacy Electron NeDB files (`nedb55/`) may live in the
+same macOS dir; they are never read or written (ADR-0008).
+Logs: `<data dir>/logs/app.log` (crashes, sync errors, HTTP server errors;
+size-capped rotation). `LEANOTE_MCP_DEBUG=1` additionally appends to
+`~/leanote_mcp.log`.
 
-推 `v*` tag 触发 `.github/workflows/release.yml`：6 目标（mac/win/linux × x64/arm64）并行构建，产物自动附到 GitHub Release。
+## Packaging
 
-验收脚本：`sh rust/scripts/acceptance-macos.sh`（CLI/HTTP/MCP/日志/打包产物，15 项）。
-
-### 发布签名（消除 Gatekeeper「已损坏」/ SmartScreen 拦截）
-
-不配置时 mac 为 ad-hoc 签名、win 未签名，产物从 Releases 下载后分别被 Gatekeeper（「已损坏，应移到废纸篓」）和 SmartScreen（「Windows 已保护你的电脑」）拦截。在 repo Settings → Secrets and variables → Actions 配好下列 secrets 后，下一个 `v*` tag 自动走正式签名 + 公证（详见 `docs/adr/0012`）；未配置则照旧发无签名版。
-
-**macOS（需 Apple Developer Program，$99/年）：**
-
-通过执行`.scratch/mac-signing/wizard.sh`完成以下处理配置。
-
-1. 在 developer.apple.com 后台创建 `Developer ID Application` 证书并安装到钥匙串；
-2. 钥匙串访问中把证书 + 私钥导出为 `.p12`（设密码），`base64 -i cert.p12 | pbcopy`；
-3. 在 appleid.apple.com 创建 App 专用密码（公证用）；
-4. 配 5 个 Secrets：
-
-| Secret | 值 |
-|---|---|
-| `MACOS_CERT_P12_BASE64` | p12 的 base64 |
-| `MACOS_CERT_PASSWORD` | p12 导出密码 |
-| `APPLE_ID` | Apple ID 邮箱 |
-| `APPLE_APP_SPECIFIC_PASSWORD` | App 专用密码 |
-| `APPLE_TEAM_ID` | 10 位 Team ID（会员后台 Membership 页） |
-
-自查（本地验证 secret 内容，不必跑 CI）：`printf '%s' "$MACOS_CERT_P12_BASE64" | base64 --decode | openssl pkcs12 -info -passin pass:'导出密码' -noout && echo OK`。
-
-**Windows（需代码签名证书）：**
-
-购买 OV/EV 证书并导出含私钥的 `.pfx`，base64 用 PowerShell：`[Convert]::ToBase64String([IO.File]::ReadAllBytes('cert.pfx'))`，配 2 个 Secrets：`WINDOWS_CERT_PFX_BASE64`、`WINDOWS_CERT_PASSWORD`。
-
-签名生效后 mac 首次启动显示「已从互联网下载」属预期（公证版正常提示）；Windows SmartScreen 信誉随下载量积累，EV 证书即时。（Azure Trusted Signing $9.99/月不走 PFX 路径，选用需改 `package-windows.ps1` 的签名调用。）
-
-### CLI 与 MCP 对拍
+Per-platform scripts (CI runs the same ones; see `.github/workflows/release.yml`):
 
 ```sh
-LEANOTE_PORT=8913 bash rust/crates/leanote-cli/compare-with-js.sh . rust/target/debug/leanote   # JS/Rust CLI 逐字节对比（56/56）
-LEANOTE_RUST_MCP=1 node tests/test_mcp_server.js                    # 未修改的 JS 测试跑 Rust MCP
-LEANOTE_RUST_MCP=1 node tests/test_mcp_sse.js
-LEANOTE_RUST_MCP=1 node tests/test_mcp_stateless.js
+scripts/package-macos.sh <aarch64|x86_64> [output-dir] [version]   # .app + .dmg
+scripts/package-linux.sh <x86_64|aarch64> [output-dir] [version]   # AppImage + .deb
+scripts/package-windows.ps1 -Arch <x64|arm64> [-OutDir …] [-Version …]  # NSIS + zip
+```
+Artifacts are named `Leanote_<version>_<os>_<arch>.<ext>`. The GUI binary is
+`Leanote` everywhere; the CLI ships alongside as `leanote-cli` (inside the
+macOS .app — APFS/NTFS are case-insensitive so it can't be `leanote`),
+`bin\leanote.exe` (Windows, optional PATH section in NSIS), and `/usr/bin/leanote`
+(Linux). Icons are generated from `logo/icon-black-white.png` by
+`scripts/gen-icons.sh` and committed under `packaging/` so CI needs no
+graphics toolchain.
+
+## Mobile (iOS / Android)
+
+Read-mostly companion app on the same gpui stack (`gpui-pre-mobile` vendored
+under `vendor/`, retargeted to our vendored gpui-pre 0.3.9 — ADR-0013).
+Host projects live in `mobile/{ios,android}`; the shared UI/data crates are
+`leanote-mobile` + `leanote-core` + `leanote-reader`.
+
+### iOS (simulator)
+
+Prereqs: Xcode (agree the license: `sudo xcodebuild -license`), XcodeGen
+(`brew install xcodegen`). If `xcode-select` still points at
+CommandLineTools (no iOS SDK), the Xcode project's prebuild script feeds
+SDKROOT/CC explicitly — otherwise `sudo xcode-select -s /Applications/Xcode.app`
+is the clean fix.
+
+```sh
+cd mobile/ios
+xcodegen generate                                   # once, and after project.yml edits
+xcodebuild -project Leanote.xcodeproj -scheme Leanote \
+  -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
+# or just open Leanote.xcodeproj in Xcode and hit Run
+xcrun simctl boot "iPhone 17 Pro"                    # if not booted
+APP=$(ls -d ~/Library/Developer/Xcode/DerivedData/Leanote-*/Build/Products/Debug-iphonesimulator/Leanote.app)
+xcrun simctl install "iPhone 17 Pro" "$APP"
+xcrun simctl launch "iPhone 17 Pro" site.stanzhai.leanote.mobile
+xcrun simctl io "iPhone 17 Pro" screenshot /tmp/leanote.png   # smoke evidence
 ```
 
-## Package
+Device/TestFlight: the project pre-wires `DEVELOPMENT_TEAM` — sign in to
+Xcode → Accounts, archive for `-sdk iphoneos`, upload via Organizer
+(steps in `.scratch/mobile/issues/09-ios-v1-acceptance.md`).
 
-```shell
-nvm use v18
-npm run build
+### Android
+
+Prereqs: Android SDK + NDK (`ANDROID_NDK_HOME`), `cargo install cargo-ndk`.
+The API level matters: **`-P 26`** (= minSdk) — the cargo-ndk default 21
+fails linking `libnativewindow`.
+
+```sh
+mobile/android/build.sh                # Rust .so + debug APK, one shot
+# manual:
+cargo ndk -t arm64-v8a -P 26 -o mobile/android/gradle/app/src/main/jniLibs \
+  build --lib -p leanote-mobile
+cd mobile/android/gradle && ./gradlew assembleDebug
+adb install app/build/outputs/apk/debug/app-debug.apk  # sideload (self-use v1)
 ```
 
-## Command Line Interface
+### Cross-checks (what CI runs — `.github/workflows/mobile-check.yml`)
 
-Leanote 桌面客户端启动后会自动安装 `leanote` 命令行工具，无需系统安装 Node.js。
+```sh
+# iOS target (needs Xcode; if xcode-select is CLT, set the env as below)
+SDK=/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk
+TC=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin
+SDKROOT=$SDK CC_aarch64_apple_ios=$TC/clang PATH="$TC:$PATH" \
+  cargo check -p leanote-mobile --target aarch64-apple-ios
 
-```bash
-# 添加笔记
-leanote -t "标题" -c "# Markdown 内容" -g "标签1,标签2"
-leanote add -t "标题" -c "内容" -n "AI札" -g "test"
-
-# 通过管道传入内容
-echo "# Hello" | leanote -t "管道测试"
-
-# 列出最近笔记
-leanote list                  # 最近的 20 条
-leanote list -n "AI札"        # 按笔记本过滤
-leanote list -g "work"        # 按标签过滤
-leanote list -v -N 5          # 显示内容预览，限定 5 条
-
-# 查看笔记完整内容（支持 ID 前缀匹配）
-leanote show a1b2c3d4
-
-# 搜索笔记（匹配标题、内容、标签，按相关度排序）
-leanote search "关键字"
-leanote search "meeting" -N 10
-
-# 编辑笔记
-leanote edit a1b2c3d4 -t "新标题"
-leanote edit a1b2c3d4 -g "urgent,important"   # 替换标签
-leanote edit a1b2c3d4 -n "其他笔记本"          # 移动笔记
-echo "# 新内容" | leanote edit a1b2c3d4 -c -  # 管道更新内容
+# Android target (needs NDK)
+N=$HOME/Library/Android/sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/darwin-x86_64/bin
+CC_aarch64_linux_android=$N/aarch64-linux-android24-clang \
+CXX_aarch64_linux_android=$N/aarch64-linux-android24-clang++ \
+AR_aarch64_linux_android=$N/llvm-ar \
+  cargo check -p leanote-mobile --target aarch64-linux-android
 ```
 
-## MCP Server
+### Tests & dev hooks
 
-Leanote 桌面客户端启动后会在本地开启 **MCP Server**（Model Context Protocol，Streamable HTTP），让 AI 智能体（Claude Desktop、Cursor 等）通过标准协议管理笔记。
-
-- 端点：`http://127.0.0.1:8912/mcp`（仅绑定本机回环 127.0.0.1，需 app 在运行）
-- 与 CLI 文件 I/O 模式一致：直接读写本地 NeDB 文件，写入的笔记带同步标记（`IsDirty`），app 下次加载/同步时生效
-
-### 工具
-
-| 工具 | 说明 |
-|---|---|
-| `list_notebooks` | 列出所有笔记本及笔记数量 |
-| `list_tags` | 列出所有标签 |
-| `add_note` | 新建 Markdown 笔记（`title` / `content` / `tags` / `notebook`，默认笔记本 "AI札"，不存在则自动创建） |
-| `list_notes` | 列出最近笔记，可按 `notebook` / `tag` 过滤 |
-| `get_note` | 按 ID（或前缀）查看笔记完整内容 |
-| `search_notes` | 按关键字搜索（标题 / 正文 / 标签），按相关度排序 |
-| `update_note` | 更新笔记（`title` / `content` / `tags` / `notebook`） |
-| `delete_note` | 移到回收站 |
-
-### 智能体配置
-
-在 Claude Desktop / Cursor 等的 MCP 配置中加入（Streamable HTTP）：
-
-```json
-{
-  "mcpServers": {
-    "leanote": { "url": "http://127.0.0.1:8912/mcp" }
-  }
-}
+```sh
+cargo test                                        # whole workspace (desktop + reader + core)
+cargo test -p leanote-reader -p leanote-mobile    # shared pipeline / mobile units
 ```
 
-### 调试
+Simulator smoke without typing (simctl has no tap/keyboard): launch with
+env prefixed `SIMCTL_CHILD_` —
 
-```bash
-npx @modelcontextprotocol/inspector
-# Transport 选 Streamable HTTP，URL 填 http://127.0.0.1:8912/mcp
+```sh
+SIMCTL_CHILD_LEANOTE_FAKE_SERVER=1 xcrun simctl launch …  # in-process fake server + auto login (full sync)
+SIMCTL_CHILD_LEANOTE_INITIAL_TAB=search|settings …        # open on a given tab
+SIMCTL_CHILD_LEANOTE_INITIAL_SCREEN=notebooks|tags|reader:<noteId> …  # notes-tab deep link
+SIMCTL_CHILD_LEANOTE_SEARCH=关键词 …                       # prefill + run a search
+xcrun simctl ui "iPhone 17 Pro" appearance dark           # dark-mode pass
 ```
 
-仓库内附冒烟测试：`node tests/test_mcp_server.js`（需本机已有 Leanote 数据）。
+Already-logged-in + `LEANOTE_FAKE_SERVER=1` boots only the in-process fake
+server (startup incremental sync) instead of re-login. Device data dir on
+iOS is `<container>/Library/Application Support/leanote/` (find the
+container with `xcrun simctl get_app_container <sim> site.stanzhai.leanote.mobile data`).
 
-## LICENSE
+## Tray
 
-[LICENSE](https://github.com/leanote/desktop-app/blob/master/LICENSE)
+macOS-first, via `tray-icon` (gpui-kit ships no tray API): icon + menu
+显示/退出, left-click shows the main window, 退出 is a true quit. Closing
+the last window quits on Win/Linux (gpui `QuitMode::Default`); on macOS the
+app stays resident with its dock icon (platform default) — use the tray
+退出 to quit.
 
-```
-LEANOTE - NOT JUST A NOTEPAD!
+## Keyboard & UI (issue 17)
 
-Copyright by the contributors.
+- **⌘K / ⌘⇧P (Ctrl+Shift+P)** — three-section quick panel: quick actions
+  (new note / sync now / export backup / toggle Vim), recents (top 6, empty
+  query), and debounced search. Bare keys always go to the focused element;
+  only modifier combos open the panel. IME composition never triggers it.
+- **Default editing state** — selecting a Markdown note opens it in source
+  edit mode (preview is a toggle, not the default). The title row is pinned
+  at the top of the pane (editable in source, read-only in preview). Edits
+  mark dirty after a debounce; unchanged notes never write or sync. ⌘S saves
+  immediately.
+- **Vim mode** — normal/insert/visual layers (motions `h j k l w b 0 $ gg G`,
+  operators `d c y`, `x dd yy p u`, `i a o O`, `v V`, `:w :q`, esc), a
+  toolbar toggle, and a `-- NORMAL --` status line. The preference persists
+  locally. ⌘K also exposes a quick toggle.
+- **Bottom-left cluster** — sync (cloud icon with state), settings (gear →
+  centered dialog: appearance follow/light/dark, editor palette, language,
+  Vim default, account info + logout), username (menu with logout →
+  confirmation dialog). Settings persist as local JSON.
 
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 2 of the License, or
-(at your option) any later version.
+## Export (issue 18/21)
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+Note context menu / title-bar ⋯ menu → 导出为… submenu: Markdown, HTML,
+PDF, Word. All run locally (no server round-trip): PDF via embedded typst,
+`.docx` via knit-md-docx (pulldown-cmark + docx-rs — headings, emphasis,
+links, images, lists, task lists, code blocks, quotes, GFM tables,
+footnotes; rich-text notes go through the same HTML→Markdown bridge as
+PDF). The save panel starts in the remembered export directory
+(`~/Downloads` first time) and remembers the chosen dir in `prefs.json`.
+Library-wide backup: `.leanote` JSON, same shape as the JS export plugin.
 
-Leanote destop app is licensed under the GPL v2.
-```
+## Window drag & caption buttons
+
+Drag regions: the nav header's empty strip, reader strip (28px), and editor
+strip (10px). Windows maps them to OS-native HTCAPTION
+(`window_control_area(Drag)`); Linux and macOS move via `start_window_move`
+listeners instead. A Drag region must never contain interactive children:
+on Windows every pixel of it answers NCHITTEST with HTCAPTION, which is how
+the editor title-row toolbar buttons died before this rule.
+
+The editor title row (including the note-title input) drags the window via
+press-and-move listeners with a 4px threshold: a click still places the
+caret and works the buttons, a drag moves the window. Windows has no
+`start_window_move`, so the handoff is `ReleaseCapture` +
+`WM_NCLBUTTONDOWN(HTCAPTION)` posted asynchronously (`PostMessageW` — a
+synchronous `SendMessageW` nests DefWindowProc's modal move loop inside
+gpui's in-flight mouse dispatch and blows the main thread's stack, exit
+code 0xC0000409; `main.rs win_dpi_resync::start_window_drag`);
+macOS/Linux keep `start_window_move`. Drag-selection inside the title input
+yields to the window drag (explicit product ruling).
+
+Min/max/close (Windows/Linux) are self-drawn in a root-level overlay flush
+to the window's top-right corner — present in every phase, including
+login/syncing where the nav is hidden — and each button `occlude()`s itself
+so the drag strips beneath cannot shadow it in the NCHITTEST stack
+(ADR-0011, amended 2026-10-31). macOS keeps native traffic lights.
+
+Windows/Linux nav header: the app icon + the "Leanote" name sit at the drag
+region's left end; macOS keeps the traffic-light inset with no name (issue
+20 Q7). The icon is a full-bleed LANCZOS downscale of the 1690px logo
+master — opaque black square, white ant glyph, grayscale anti-aliased edges
+(no thresholding; the binary-alpha rounds produced visible jaggies at
+taskbar sizes). `gen-icons.sh` emits both the exe's `packaging/icon.ico`
+and `assets/app-icon.png` from the same frames, byte-identical at 128px,
+so the taskbar icon and the in-app header icon always match.
+
+## Windows main-thread stack
+
+`main()` runs the whole app on a worker thread with a 64 MB stack on Windows
+(`main.rs`). The MSVC default 1 MB main stack sits within ~10% of the debug
+build's editor render depth (title row + tag chips + slash panel are gpui
+element subtrees built recursively); restoring a note at boot overflowed it
+(exit 0xC0000409). Stack pages commit on demand, so the reserve costs nothing
+until used.
+
+## Windows high-DPI viewport resync
+
+On some high-DPI Windows desktops (observed: 175%, DPI context flips
+96 ↔ monitor DPI during window creation), `gpui-pre-windows` records the
+client device size as the LOGICAL size — the layout viewport ends up
+`scale`-times larger than the visible window: the right portion of the UI
+painted outside the swapchain and was unreachable by the mouse (the
+original "toolbar buttons don't respond" report). `main.rs`
+`win_dpi_resync` measures the live client with Win32 after startup and,
+on mismatch, forces a WM_SIZE (±2px SetWindowPos, physical size
+unchanged) so the backend recomputes logical = device / scale; the
+close-time geometry save then switches to device pixels to keep the
+window at the same on-screen size across relaunches (ADR-0011).

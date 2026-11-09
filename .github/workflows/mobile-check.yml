@@ -4,9 +4,9 @@ name: mobile-check
 # iOS check 需 Xcode SDK（macos runner 原生满足）；Android check 需 NDK。
 on:
   push:
-    paths: ["rust/**", ".github/workflows/mobile-check.yml"]
+    paths: ["crates/**", "fake-server/**", "mobile/**", "scripts/**", "Cargo.*", ".github/workflows/mobile-check.yml"]
   pull_request:
-    paths: ["rust/**", ".github/workflows/mobile-check.yml"]
+    paths: ["crates/**", "fake-server/**", "mobile/**", "scripts/**", "Cargo.*", ".github/workflows/mobile-check.yml"]
 
 jobs:
   ios:
@@ -14,7 +14,7 @@ jobs:
     runs-on: macos-latest
     defaults:
       run:
-        working-directory: rust
+        working-directory: .
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-24.04
     defaults:
       run:
-        working-directory: rust
+        working-directory: .
     env:
       ANDROID_NDK_VERSION: "28.2.13676358"
     steps:
