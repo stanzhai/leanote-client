@@ -118,10 +118,13 @@ pub fn markdown_view(
     dark: bool,
     accent: gpui_kit::Hsla,
 ) -> TextView {
-    crate::mermaid::install_full(TextView::markdown(id, src), dark, None)
-        .style(markdown_view_style(accent))
-        .scrollable(true)
-        .on_link_click(|url, _ev, _window, cx| cx.open_url(url))
+    crate::math::install(
+        crate::mermaid::install_full(TextView::markdown(id, src), dark, None),
+        dark,
+    )
+    .style(markdown_view_style(accent))
+    .scrollable(true)
+    .on_link_click(|url, _ev, _window, cx| cx.open_url(url))
 }
 
 #[cfg(test)]

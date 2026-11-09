@@ -15,4 +15,4 @@
 
 **Blocked by:** 21
 
-**Status:** open
+**Status:** closed（Mermaid 于 3.1.0 落地，方案 merman；LaTeX 于 2026-11-09 落地：`leanote-reader/src/math.rs`，mitex→typst→typst-svg→gpui SVG，与 Mermaid 同一 TextView 插件扩展点——候选 A/B 否决，实为 C 的全功能变体。$…$ 行内 / $$…$$ 块级、明暗配色、失败回退源码+错误行，覆盖全部预览面与移动端；4 单测 + 公式 SVG 目检（∂ 符号、分数、求和上下限正确）。）

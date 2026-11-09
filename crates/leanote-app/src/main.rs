@@ -11,6 +11,8 @@ mod fonts;
 mod history_dialog;
 mod i18n;
 mod markdown_input;
+#[cfg(test)]
+mod math_preview_tests;
 mod pdf;
 mod prefs;
 mod search_overlay;

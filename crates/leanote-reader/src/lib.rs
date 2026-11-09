@@ -2,6 +2,7 @@
 //! `leanote://` 图片解析）→ kit `TextView` + Mermaid 内联 SVG。
 //! 由桌面 leanote-app 与移动端 leanote-mobile 共用（ADR-0011、issue 05）。
 
+pub mod math;
 pub mod mermaid;
 mod reader;
 
