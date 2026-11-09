@@ -23,7 +23,7 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $Triple = if ($Arch -eq 'x64') { 'x86_64-pc-windows-msvc' } else { 'aarch64-pc-windows-msvc' }
 
 Write-Host "==> cargo build --release --target $Triple"
-Push-Location (Join-Path $Root 'rust')
+Push-Location $Root
 & cargo build --release --workspace --target $Triple
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 Pop-Location

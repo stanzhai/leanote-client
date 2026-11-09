@@ -24,7 +24,7 @@ APP="$OUT/$APP_NAME.app"
 DMG="$OUT/Leanote_${VERSION}_macos_${ARCH}.dmg"
 
 echo "==> cargo build --release --target $TARGET"
-(cd "$ROOT/rust" && cargo build --release --workspace --target "$TARGET")
+(cd "$ROOT" && cargo build --release --workspace --target "$TARGET")
 
 BIN_DIR="$ROOT/target/$TARGET/release"
 echo "==> assembling $APP"

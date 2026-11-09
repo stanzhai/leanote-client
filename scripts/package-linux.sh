@@ -19,7 +19,7 @@ CACHE="$ROOT/target/appimagetool"
 mkdir -p "$CACHE"
 
 echo "==> cargo build --release"
-(cd "$ROOT/rust" && cargo build --release --workspace)
+(cd "$ROOT" && cargo build --release --workspace)
 
 BIN_DIR="$ROOT/target/release"
 
