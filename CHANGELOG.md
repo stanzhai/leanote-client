@@ -2,6 +2,11 @@
 
 
 
+## 3.1.16（2026-11-09）
+
+- **修复：导出/另存为记住的目录比所选目录高一级**：3.1.2 的目录记忆存在双重取父 bug——两个调用点传入的已是所选文件的**目录**（`path.parent()`），`remember_export_dir` 内部又 `parent()` 一次，prefs 里实际存的是该目录的上一级。现按调用方语义原样存储。顺带修复 Windows 家目录：`home_dir()` 此前只读 `HOME`（Windows 不设该变量，回落 temp 目录），补 `USERPROFILE` 兜底。
+
+
 ## 3.1.14（2026-11-09）
 - **重构：仓库目录扁平化，`rust/` 提升为项目根**——纯 Rust 仓库（Electron/JS 代码已全部移除）。`Cargo.toml`、`crates/`、`fake-server/`、`mobile/`、`packaging/`、`scripts/`、`vendor/` 移到根目录；CI 工作流、打包脚本、`.gitignore`、js_parity 测试的 fixtures 路径同步更新；根 README 以原 rust/README 为基础重写。行为无变化，`cargo test --workspace` 全绿。
 - **修复：单模主题（Matrix、Kibble、Jellybeans、Harper、Fahrenheit、Catppuccin 系列等）在设置里选了不生效**：设置对话框的主题下拉订阅闭包把 `Confirm` 载荷拿去**对话框打开时捕获的旧 items 列表**里查位置再取值——而外观行就在主题行上方，对话框内切外观（如 跟随系统/浅色 → 深色）会按新外观热更新下拉列表（新增 Matrix 等深色单模主题），之后选中的载荷在新列表、闭包却查旧列表 → `position()` 落空 → **pick 静默丢弃**，主题停留在上一个。成对主题（Gruvbox 等）标签在所有过滤列表里都有所以幸免——这正是只有单模主题（全部深色单模 + 浅色 Catppuccin Latte/Aurora Light）踩坑的原因。修复：载荷本身就是选项名，直接 `set_ui_theme(name)`，删掉多余映射（移动端本就直接用值，无此 bug）。回归测试 `boot_and_switch_single_mode_theme` 钉住单模主题的启动解析与单模间切换。

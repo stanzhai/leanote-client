@@ -917,7 +917,7 @@ impl AppShell {
                 self.selected_ids.retain(|n| n != &id);
                 // `selected` drives the row highlight; keep it pointing
                 // at a row that is actually in the selection.
-                if self.selected.as_deref() == Some(&id) {
+                if self.selected.as_ref() == Some(&id) {
                     self.selected = self.selected_ids.first().cloned();
                 }
             } else {
@@ -1984,14 +1984,14 @@ impl AppShell {
     }
 
     /// Persist `dir` as the next save/export panel start directory.
-    fn remember_export_dir(&mut self, path: &std::path::Path) {
-        if let Some(dir) = path.parent() {
-            let mut p = crate::prefs::Prefs::load(&self.data_dir);
-            let d = dir.display().to_string();
-            if d != p.export_dir {
-                p.export_dir = d;
-                p.save(&self.data_dir);
-            }
+    /// Callers pass the directory containing the chosen file (already
+    /// `path.parent()`), so store it verbatim.
+    fn remember_export_dir(&mut self, dir: &std::path::Path) {
+        let mut p = crate::prefs::Prefs::load(&self.data_dir);
+        let d = dir.display().to_string();
+        if d != p.export_dir {
+            p.export_dir = d;
+            p.save(&self.data_dir);
         }
     }
 
@@ -2074,9 +2074,10 @@ impl AppShell {
     }
 }
 
-/// Save-panel default directory (std only).
+/// Save-panel default directory (std only; Windows sets USERPROFILE, not HOME).
 fn home_dir() -> std::path::PathBuf {
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
 }
@@ -8438,7 +8439,7 @@ fn markdown_view_style() -> TextViewStyle {
     leanote_reader::markdown_view_style(crate::theme::accent())
 }
 
-/// Mermaid + 图片右键菜单（桌面版把 AppShell 菜单接进共享渲染管线）。
+/// Mermaid + LaTeX 公式 + 图片右键菜单（桌面版把 AppShell 菜单接进共享渲染管线）。
 fn mermaid_view(
     view: gpui_kit::component::text::TextView,
     dark: bool,
@@ -8455,7 +8456,10 @@ fn mermaid_view(
             },
         ) as leanote_reader::mermaid::ImageMenuHandler
     });
-    leanote_reader::mermaid::install_full(view, dark, menu)
+    leanote_reader::math::install(
+        leanote_reader::mermaid::install_full(view, dark, menu),
+        dark,
+    )
 }
 
 /// Suggested `(stem, extension)` for saving `url`'s image.
