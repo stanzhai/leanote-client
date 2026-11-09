@@ -58,13 +58,18 @@ cat > "$APPDIR/leanote.appdata.xml" <<EOF
 </component>
 EOF
 
+fetch() { # retry hard: GitHub release CDN throws long-ish 504 windows
+  curl -fsSL --retry 10 --retry-all-errors --retry-delay 15 -o "$@" || {
+    code=$?; rm -f "$1"; exit $code; }
+}
+
 if [ ! -x "$CACHE/appimagetool-$ARCH.AppImage" ]; then
-  curl -fsSL --retry 5 --retry-all-errors -o "$CACHE/appimagetool-$ARCH.AppImage" \
+  fetch "$CACHE/appimagetool-$ARCH.AppImage" \
     "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${ARCH}.AppImage"
   chmod +x "$CACHE/appimagetool-$ARCH.AppImage"
 fi
 if [ ! -f "$CACHE/AppRun" ]; then
-  curl -fsSL --retry 5 --retry-all-errors -o "$CACHE/AppRun" \
+  fetch "$CACHE/AppRun" \
     "https://github.com/AppImage/AppImageKit/releases/download/continuous/AppRun-${ARCH}"
   chmod +x "$CACHE/AppRun"
 fi
