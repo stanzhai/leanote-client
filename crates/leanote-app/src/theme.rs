@@ -43,6 +43,18 @@ pub fn spacing(n: i32) -> Pixels {
 /// Tiered radii (ADR-0003): panel 12 / selection 8.
 pub const RADIUS_PANEL: f32 = 12.;
 pub const RADIUS_SELECTION: f32 = 8.;
+/// Motion (issue 41): the one timing for app transitions — nav/note-list
+/// hover + selection fades and the reader's note-switch fade. 120ms
+/// ease-out: fast enough to never read as lag, present enough to register.
+/// Honors the system Reduce Motion preference (kit init reads it; every
+/// kit animation snaps to its end state under it).
+pub const MOTION_MS: u64 = 120;
+
+/// The shared transition policy for every hover/selection fade.
+pub fn motion() -> gpui_kit::base::motion::Transition {
+    gpui_kit::base::motion::Transition::new(std::time::Duration::from_millis(MOTION_MS))
+        .ease(gpui_kit::base::animation::ease_out_cubic)
+}
 
 /// User-selectable accent overrides, matching the macOS accent swatches
 /// (System Settings → Appearance): blue/purple/pink/red/orange/yellow/

@@ -7,6 +7,7 @@ use crate::conflict_bar;
 use crate::i18n::{self, Lang};
 use crate::theme::{self, Material};
 use gpui_kit::assets::IconName as AssetIcon;
+use gpui_kit::base::motion;
 use gpui_kit::base::Scrollbar;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::combobox::{Combobox, ComboboxEvent, ComboboxState};
@@ -20,6 +21,7 @@ use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::resizable_panel;
 use gpui_kit::component::searchable_list::SearchableVec;
+use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::TextView;
@@ -259,6 +261,13 @@ pub struct AppShell {
     /// None = no valid target. Lives on the shell: rows are rebuilt every
     /// frame, so nothing can live in the row closures.
     notebook_drag_target: Option<crate::browse::DropTarget>,
+    // --- Issue 41 motion pass ---
+    /// Nav row under the pointer (drives the hover fade). Hover lives on
+    /// the shell for the same reason notebook_drag_target does: rows are
+    /// rebuilt every frame, nothing can live in the row closures.
+    hover_nav: Option<String>,
+    /// Note-list row under the pointer, same lifecycle.
+    hover_note: Option<leanote_core::Id>,
 }
 
 /// Right-pane edit mode (issues 10+17): title + source editor with syntax
@@ -367,6 +376,8 @@ impl AppShell {
             pending_sync: false,
             vim_enabled: prefs.vim_default,
             notebook_drag_target: None,
+            hover_nav: None,
+            hover_note: None,
             data_dir,
             host,
             email,
@@ -865,6 +876,19 @@ impl AppShell {
         cx: &mut gpui_kit::Context<Self>,
     ) {
         self.apply_selection(id, gpui_kit::Modifiers::default(), window, cx);
+    }
+
+    /// Issue 41: hover-slot update shared by the nav and note rows.
+    /// Enter claims the slot; leave frees it only if this row still owns
+    /// it (another row may have claimed it since the leave event).
+    fn hover_slot<V: PartialEq + Clone>(cur: &Option<V>, id: &V, on: bool) -> Option<V> {
+        if on {
+            Some(id.clone())
+        } else if cur.as_ref() == Some(id) {
+            None
+        } else {
+            cur.clone()
+        }
     }
 
     /// Feature 3: plain click = single select; ⇧ = range from anchor
@@ -2411,13 +2435,32 @@ fn note_list_row(
     fg: gpui_kit::Hsla,
     sel_fg: gpui_kit::Hsla,
     muted: gpui_kit::Hsla,
+    hovered: bool,
+    hover_bg: gpui_kit::Hsla,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
 ) -> impl IntoElement + use<> {
     let shell = shell.clone();
+    let shell_hover = shell.clone();
     let shell_menu = shell.clone();
     let id = n.note_id.clone();
     let id_menu = n.note_id.clone();
     let row_fg = if is_sel { sel_fg } else { fg };
     let row_muted = if is_sel { sel_fg } else { muted };
+    // Issue 41: one bg transition channel per row — accent when selected,
+    // else the kit's list-hover tint with its alpha doing the fade (lerps
+    // stay in-family instead of sliding through transparent black).
+    let row_bg = motion::transition(
+        (format!("note-{}", n.note_id), "bg"),
+        if is_sel {
+            theme::accent()
+        } else {
+            hover_bg.opacity(if hovered { 1. } else { 0. })
+        },
+        theme::motion(),
+        window,
+        cx,
+    );
     gpui_kit::base::v_flex()
         .id(n.note_id.to_string())
         .h(theme::ui(NOTE_ROW_H))
@@ -2432,12 +2475,25 @@ fn note_list_row(
         .gap(px(1.))
         .px(px(5.))
         .rounded(px(theme::RADIUS_SELECTION))
-        .when(is_sel, |el| el.bg(theme::accent()))
+        .bg(row_bg)
         .on_click(move |ev: &gpui_kit::ClickEvent, window, cx| {
             let mods = ev.modifiers();
             let _ = shell.update(cx, |this: &mut AppShell, cx| {
                 this.apply_selection(id.clone(), mods, window, cx)
             });
+        })
+        .on_hover({
+            let shell = shell_hover;
+            let id = n.note_id.clone();
+            move |on: &bool, _window, cx| {
+                let _ = shell.update(cx, |this, cx| {
+                    let next = AppShell::hover_slot(&this.hover_note, &id, *on);
+                    if next != this.hover_note {
+                        this.hover_note = next;
+                        cx.notify();
+                    }
+                });
+            }
         })
         .context_menu({
             let shell = shell_menu;
@@ -2850,18 +2906,25 @@ impl Render for AppShell {
                     )));
             }
             Phase::Syncing { lines, done, total } => {
+                // Issue 41: skeleton shell — the real three-pane layout
+                // with bone rows while first-login full sync runs, so the
+                // app reads as "content arriving" instead of a spinner
+                // void; the right pane keeps the live progress card. This
+                // is the only wait a skeleton can ever cover — list reads
+                // are synchronous SQLite.
+                let glass = crate::prefs::Prefs::load(&self.data_dir).glass;
                 body = body
                     .child(
                         resizable_panel()
                             .size(px(widths.left.unwrap_or(LEFT_W)))
                             .size_range(px(LEFT_RANGE.0)..px(LEFT_RANGE.1))
-                            .visible(false),
+                            .child(nav_skeleton(dark, &glass)),
                     )
                     .child(
                         resizable_panel()
                             .size(px(widths.mid.unwrap_or(MID_W)))
                             .size_range(px(MID_RANGE.0)..px(MID_RANGE.1))
-                            .visible(false),
+                            .child(list_skeleton(dark)),
                     )
                     .child(resizable_panel().child(render_syncing(dark, lines, *done, *total, &t)));
             }
@@ -3502,6 +3565,83 @@ fn render_syncing(
         .into_element()
 }
 
+/// Issue 41: nav-shaped bones for the sync phase — three fixed pills, a
+/// group-header stub, tree pills — under the traffic-light lane.
+fn nav_skeleton(dark: bool, glass: &str) -> impl IntoElement {
+    let pill = |w: f32| {
+        Skeleton::new()
+            .h(theme::ui(28.))
+            .w(theme::ui(w))
+            .rounded(px(theme::RADIUS_SELECTION))
+    };
+    gpui_kit::base::v_flex()
+        .size_full()
+        .bg(theme::glass_base(dark, glass))
+        .debug_selector(|| "nav-skeleton".into())
+        .pt(px(TITLEBAR_H))
+        .px_3()
+        .gap_2()
+        .child(pill(170.))
+        .child(pill(170.))
+        .child(pill(170.))
+        .child(
+            Skeleton::new()
+                .mt_2()
+                .h(theme::ui(8.))
+                .w(theme::ui(56.))
+                .rounded(px(2.)),
+        )
+        .child(pill(140.))
+        .child(pill(160.))
+        .child(pill(120.))
+        .child(pill(150.))
+}
+
+/// Issue 41: note-list bones — title + meta + excerpt lines at the real
+/// 65px row pitch.
+fn list_skeleton(dark: bool) -> impl IntoElement {
+    let row = || {
+        gpui_kit::base::v_flex()
+            .h(theme::ui(NOTE_ROW_H))
+            .w_full()
+            .justify_center()
+            .gap(px(3.))
+            .px(px(5.))
+            .child(
+                gpui_kit::base::h_flex()
+                    .gap_2()
+                    .child(Skeleton::new().h(theme::ui(14.)).flex_1().rounded(px(4.)))
+                    .child(
+                        Skeleton::new()
+                            .h(theme::ui(10.))
+                            .w(theme::ui(12.))
+                            .rounded(px(2.)),
+                    ),
+            )
+            .child(
+                Skeleton::new()
+                    .h(theme::ui(11.))
+                    .w(theme::ui(96.))
+                    .rounded(px(3.)),
+            )
+            .child(
+                Skeleton::new()
+                    .h(theme::ui(11.))
+                    .w(theme::ui(168.))
+                    .rounded(px(3.)),
+            )
+    };
+    let mut list = gpui_kit::base::v_flex()
+        .size_full()
+        .bg(theme::material(Material::List, dark))
+        .debug_selector(|| "list-skeleton".into())
+        .pt(px(10.));
+    for _ in 0..8 {
+        list = list.child(row());
+    }
+    list
+}
+
 /// Post-sync summary card: counts + optional content-failure warning +
 /// "Start now" button that flips Phase::SyncDone → Shell.
 fn render_sync_done(
@@ -3571,6 +3711,9 @@ fn nav_row(
     // the component IconName subset lacks it.
     icon: Option<AssetIcon>,
     selected: bool,
+    hovered: bool,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
     let fg = theme::foreground(dark);
     let sel_fg = theme::accent_foreground();
@@ -3580,6 +3723,7 @@ fn nav_row(
     // per nesting level (user ruling Q2).
     let indent = px(8. + 12. * node.depth as f32);
     let shell = shell.clone();
+    let shell_hover = shell.clone();
     let sel: NavSelection = match kind {
         "notebook" => NavSelection::Notebook(node.id.clone()),
         "tag" => NavSelection::Tag(node.id.clone()),
@@ -3588,6 +3732,20 @@ fn nav_row(
         "recent" => NavSelection::Recent,
         _ => NavSelection::Recent,
     };
+    // Issue 41: one bg transition channel per row — selected accent, else
+    // the kit's list-hover tint with its alpha doing the fade (see
+    // note_list_row).
+    let row_bg = motion::transition(
+        (format!("nav-{}", node.id), "bg"),
+        if selected {
+            theme::accent()
+        } else {
+            cx.theme().list_hover.opacity(if hovered { 1. } else { 0. })
+        },
+        theme::motion(),
+        window,
+        cx,
+    );
     let mut row = gpui_kit::base::h_flex()
         .id(node.id.clone())
         .w_full()
@@ -3596,11 +3754,24 @@ fn nav_row(
         .pr_2()
         .h_8()
         .rounded(px(theme::RADIUS_SELECTION))
-        .when(selected, |el| el.bg(theme::accent()))
+        .bg(row_bg)
         .on_click(move |_ev, _window, cx| {
             let _ = shell.update(cx, |this: &mut AppShell, cx| {
                 this.select_nav(sel.clone(), cx)
             });
+        })
+        .on_hover({
+            let shell = shell_hover;
+            let id = node.id.clone();
+            move |on: &bool, _window, cx| {
+                let _ = shell.update(cx, |this, cx| {
+                    let next = AppShell::hover_slot(&this.hover_nav, &id, *on);
+                    if next != this.hover_nav {
+                        this.hover_nav = next;
+                        cx.notify();
+                    }
+                });
+            }
         });
     if let Some(icon) = icon {
         row = row.child(Icon::new(icon).small().text_color(if selected {
@@ -3738,6 +3909,9 @@ impl AppShell {
             "fixed",
             Some(AssetIcon::BookOpen),
             self.nav == NavSelection::Recent,
+            self.hover_nav.as_deref() == Some("all"),
+            window,
+            &mut *cx,
         );
         let starred_row = nav_row(
             &shell,
@@ -3746,6 +3920,9 @@ impl AppShell {
             "starred",
             Some(AssetIcon::Star),
             self.nav == NavSelection::Starred,
+            self.hover_nav.as_deref() == Some("starred"),
+            window,
+            &mut *cx,
         );
         let trash_row = nav_row(
             &shell,
@@ -3754,6 +3931,9 @@ impl AppShell {
             "trash",
             Some(AssetIcon::Trash), // issue 23 #3: trash-can glyph
             self.nav == NavSelection::Trash,
+            self.hover_nav.as_deref() == Some("trash"),
+            window,
+            &mut *cx,
         );
 
         // Glass lives ONLY here (user round 3): nav paints Material::Base
@@ -3810,6 +3990,7 @@ impl AppShell {
             let nav_sel = self.nav.clone();
             let shell_ul = shell.clone();
             let scroll = self.notebooks_scroll.clone();
+            let hover_nav = self.hover_nav.clone();
             nav = nav.child(
                 gpui_kit::div()
                     .id("notebooks-vlist")
@@ -3873,7 +4054,7 @@ impl AppShell {
                         },
                     ))
                     .child(
-                        gpui_kit::uniform_list("notebooks-ul", n, move |range, _window, _cx| {
+                        gpui_kit::uniform_list("notebooks-ul", n, move |range, window, cx| {
                             range
                                 .map(|ix| {
                                     let Some(node) = notebook_nodes.get(ix) else {
@@ -3887,6 +4068,9 @@ impl AppShell {
                                         "notebook",
                                         Some(AssetIcon::FolderClosed),
                                         is_sel,
+                                        hover_nav.as_deref() == Some(node.id.as_str()),
+                                        window,
+                                        cx,
                                     )
                                     .on_drag(
                                         NotebookDrag {
@@ -4034,6 +4218,7 @@ impl AppShell {
             let shell_ul = shell.clone();
             let n = tag_nodes.len() + usize::from(edit_row.borrow().is_some());
             let scroll = self.tags_scroll.clone();
+            let hover_nav = self.hover_nav.clone();
             nav = nav.child(
                 gpui_kit::div()
                     .id("tags-vlist")
@@ -4044,7 +4229,7 @@ impl AppShell {
                     .min_h_0()
                     .overflow_hidden()
                     .child(
-                        gpui_kit::uniform_list("tags-ul", n, move |range, _window, _cx| {
+                        gpui_kit::uniform_list("tags-ul", n, move |range, window, cx| {
                             range
                                 .map(|ix| {
                                     let Some(node) = tag_nodes.get(ix) else {
@@ -4054,44 +4239,54 @@ impl AppShell {
                                             .unwrap_or_else(|| gpui_kit::div().into_any_element());
                                     };
                                     let is_sel = nav_sel == NavSelection::Tag(node.id.clone());
-                                    nav_row(&shell_ul, dark, node, "tag", None, is_sel)
-                                        .context_menu({
-                                            let shell = shell_ul.clone();
-                                            let tag = node.id.clone();
-                                            move |menu, _window, _cx| {
-                                                let shell_ren = shell.clone();
-                                                let shell_del = shell.clone();
-                                                let tag_ren = tag.clone();
-                                                let tag_del = tag.clone();
-                                                menu.item(
-                                                    PopupMenuItem::new(i18n::t(
-                                                        lang,
-                                                        i18n::Key::RenameTag,
-                                                    ))
-                                                    .on_click(move |_ev, window, cx| {
-                                                        let _ = shell_ren.update(cx, |this, cx| {
-                                                            this.begin_rename_tag(
-                                                                tag_ren.clone(),
-                                                                window,
-                                                                cx,
-                                                            )
-                                                        });
-                                                    }),
-                                                )
-                                                .item(
-                                                    PopupMenuItem::new(i18n::t(
-                                                        lang,
-                                                        i18n::Key::DeleteTag,
-                                                    ))
-                                                    .on_click(move |_ev, _window, cx| {
-                                                        let _ = shell_del.update(cx, |this, cx| {
-                                                            this.delete_tag_nav(tag_del.clone(), cx)
-                                                        });
-                                                    }),
-                                                )
-                                            }
-                                        })
-                                        .into_any_element()
+                                    nav_row(
+                                        &shell_ul,
+                                        dark,
+                                        node,
+                                        "tag",
+                                        None,
+                                        is_sel,
+                                        hover_nav.as_deref() == Some(node.id.as_str()),
+                                        window,
+                                        cx,
+                                    )
+                                    .context_menu({
+                                        let shell = shell_ul.clone();
+                                        let tag = node.id.clone();
+                                        move |menu, _window, _cx| {
+                                            let shell_ren = shell.clone();
+                                            let shell_del = shell.clone();
+                                            let tag_ren = tag.clone();
+                                            let tag_del = tag.clone();
+                                            menu.item(
+                                                PopupMenuItem::new(i18n::t(
+                                                    lang,
+                                                    i18n::Key::RenameTag,
+                                                ))
+                                                .on_click(move |_ev, window, cx| {
+                                                    let _ = shell_ren.update(cx, |this, cx| {
+                                                        this.begin_rename_tag(
+                                                            tag_ren.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    });
+                                                }),
+                                            )
+                                            .item(
+                                                PopupMenuItem::new(i18n::t(
+                                                    lang,
+                                                    i18n::Key::DeleteTag,
+                                                ))
+                                                .on_click(move |_ev, _window, cx| {
+                                                    let _ = shell_del.update(cx, |this, cx| {
+                                                        this.delete_tag_nav(tag_del.clone(), cx)
+                                                    });
+                                                }),
+                                            )
+                                        }
+                                    })
+                                    .into_any_element()
                                 })
                                 .collect()
                         })
@@ -5475,6 +5670,7 @@ impl AppShell {
             let shell = cx.weak_entity();
             let notes_for_list = notes.clone();
             let scroll = self.notes_scroll.clone();
+            let hover_note = self.hover_note.clone();
             let list_view = gpui_kit::div()
                 .id("notes-vlist")
                 .relative()
@@ -5484,7 +5680,7 @@ impl AppShell {
                     gpui_kit::uniform_list(
                         "notes-ul",
                         notes_for_list.len(),
-                        move |range, _window, _cx| {
+                        move |range, window, cx| {
                             range
                                 .map(|ix| {
                                     let n = &notes_for_list[ix];
@@ -5512,6 +5708,10 @@ impl AppShell {
                                         fg,
                                         sel_fg,
                                         muted,
+                                        hover_note.as_ref() == Some(&n.note_id),
+                                        cx.theme().list_hover,
+                                        window,
+                                        cx,
                                     )
                                 })
                                 .collect::<Vec<_>>()
@@ -7924,6 +8124,79 @@ mod tests {
         assert!(
             left >= gpui_kit::px(48.) && right >= gpui_kit::px(48.),
             "side margins must stay generous, left={left:?} right={right:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue 41: the hover slot — enter claims it, a stale leave from
+    /// another row must not clear the current owner.
+    #[test]
+    fn hover_slot_enter_claims_and_leave_frees_only_owner() {
+        let a = leanote_core::Id("a".into());
+        let b = leanote_core::Id("b".into());
+        assert_eq!(AppShell::hover_slot(&None, &a, true), Some(a.clone()));
+        assert_eq!(
+            AppShell::hover_slot(&Some(a.clone()), &b, false),
+            Some(a.clone())
+        );
+        assert_eq!(AppShell::hover_slot(&Some(a.clone()), &a, false), None);
+    }
+
+    /// Issue 41: first-login full sync renders the real three-pane shell
+    /// with skeleton nav/list panes, not the collapsed spinner-only body.
+    #[gpui_kit::test]
+    fn syncing_phase_renders_skeleton_panes(cx: &mut gpui_kit::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("leanote-skel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        cx.update(gpui_kit::init);
+        let mut shell_entity: Option<gpui_kit::Entity<AppShell>> = None;
+        let window = cx
+            .update(|cx| {
+                cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+                    let shell = cx.new(|cx| {
+                        AppShell::new(
+                            window,
+                            cx,
+                            dir.clone(),
+                            crate::i18n::Lang::En,
+                            true,
+                            Some("user1".into()),
+                            None,
+                            None,
+                        )
+                    });
+                    shell_entity = Some(shell.clone());
+                    shell
+                })
+            })
+            .unwrap();
+        let shell = shell_entity.unwrap();
+        shell.update(cx, |s, _| {
+            s.phase = Phase::Syncing {
+                lines: vec![],
+                done: 0,
+                total: 0,
+            };
+        });
+        let mut cx = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui_kit::size(gpui_kit::px(1200.), gpui_kit::px(800.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let nav = cx.debug_bounds("nav-skeleton").expect("nav skeleton pane");
+        let list = cx
+            .debug_bounds("list-skeleton")
+            .expect("list skeleton pane");
+        assert!(
+            nav.size.width > gpui_kit::px(100.) && list.size.width > gpui_kit::px(100.),
+            "sync panes must be visible, nav={:?} list={:?}",
+            nav.size,
+            list.size
+        );
+        assert!(
+            nav.origin.x < list.origin.x,
+            "panes must sit side by side, nav={:?} list={:?}",
+            nav.origin,
+            list.origin
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

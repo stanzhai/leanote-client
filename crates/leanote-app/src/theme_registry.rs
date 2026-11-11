@@ -306,9 +306,9 @@ pub fn theme_radii(dark: bool) -> (Option<f32>, Option<f32>) {
 pub fn glass_alphas(id: &str) -> (f32, f32) {
     match id {
         "off" => (1.0, 1.0),
-        "weak" => (0.88, 0.62),
-        "strong" => (0.62, 0.30),
-        _ => (0.75, 0.46), // medium
+        "weak" => (0.88, 0.82),
+        "strong" => (0.62, 0.55),
+        _ => (0.75, 0.68), // medium
     }
 }
 
