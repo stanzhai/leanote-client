@@ -16,3 +16,6 @@ mobile/android/gradle/app/build/
 mobile/android/gradle/app/src/main/jniLibs/
 mobile/android/gradle/mobile/
 mobile/android/gradle/.gradle/
+mobile/android/gradle/.project
+mobile/android/gradle/app/.project
+mobile/android/gradle/app/bin/

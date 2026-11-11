@@ -4,5 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/gradle"
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Library/Android/sdk/ndk/28.2.13676358}"
+rm -rf app/build/intermediates/merged_native_libs \
+       app/build/intermediates/merged_jni_libs \
+       app/build/intermediates/stripped_native_libs
 ./gradlew $([ "${1:-}" = "--release" ] && echo buildRustRelease || echo buildRustDebug) assembleDebug
 echo "APK: $(pwd)/app/build/outputs/apk/debug/app-debug.apk"

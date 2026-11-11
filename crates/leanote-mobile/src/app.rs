@@ -499,51 +499,69 @@ impl Render for TabShell {
                 None => self.placeholder(t("not_synced"), cx).into_any_element(),
             },
         };
-        // iOS 惯例 Tab 栏：图标 + 小字号标签，选中着 primary、未选 muted，
-        // 顶缘发丝线；不用整格底色块。高度内容驱动（固定 h 会把 pb 计入、
-        // 内容区被压到 22px，图标越过上边线）。
+        // iOS 26/27 悬浮 Tab 栏：脱离屏缘的圆角长条 + 玻璃质感（半透明
+        // 胶囊 + 发丝描边 + 投影），图标 + 小字号标签，选中着 primary、
+        // 未选 muted。gpui-pre 0.3.9 无 backdrop blur，磨砂用半透明底色
+        // 近似——框架支持背景模糊后升级（ponytail: 无真模糊，文字从
+        // 胶囊下滚过时是清晰的）。
+        // 玻璃底色：浅色近白不透明磨砂（白页上半透明白不可见），深色用
+        // 白色薄雾提亮胶囊（iOS 深色玻璃比背景亮）。
+        let glass = if cx.theme().is_dark() {
+            gpui_kit::white().opacity(0.10)
+        } else {
+            gpui_kit::white().opacity(0.92)
+        };
         let bar = div()
-            .flex()
             .w_full()
-            .pb(safe_bottom)
-            .bg(cx.theme().sidebar)
-            .border_t_1()
-            .border_color(cx.theme().border.opacity(0.6))
-            .children([TabId::Notes, TabId::Search, TabId::Settings].map(|id| {
-                let selected = self.tab == id;
-                // accent 是浅蓝容器色（accent.background），选中 tint 用 primary。
-                let color = if selected {
-                    cx.theme().primary
-                } else {
-                    cx.theme().muted_foreground
-                };
-                let icon = match id {
-                    TabId::Notes => IconName::FileText,
-                    TabId::Search => IconName::Search,
-                    TabId::Settings => IconName::Settings,
-                };
+            // 悬浮：底部留 safe area + 8px 间隙，两侧 16px 不贴边。
+            .pb(safe_bottom + px(8.))
+            .px_4()
+            .pt(px(4.))
+            .flex()
+            .child(
                 div()
-                    .id(SharedString::new(format!("tab-{}", id.label())))
                     .flex_1()
                     .flex()
-                    .flex_col()
-                    .items_center()
-                    // 固定 cell 高 + 垂直居中：图标/标签在可视栏内居中，
-                    // 底部只留 safe area 背景（不留内容空白）。
-                    .h(px(52.))
-                    .justify_center()
-                    .gap(px(2.))
-                    .child(Icon::new(icon).size(px(22.)).text_color(color))
-                    .child(
-                        Label::new(id.label())
-                            .text_size(rems(0.65))
-                            .text_color(color),
-                    )
-                    .on_click(cx.listener(move |this, _ev, _window, cx| {
-                        this.tab = id;
-                        cx.notify();
-                    }))
-            }));
+                    .h(px(60.))
+                    .rounded_full()
+                    .bg(glass)
+                    .border_1()
+                    .border_color(cx.theme().border.opacity(0.5))
+                    .shadow_lg()
+                    .children([TabId::Notes, TabId::Search, TabId::Settings].map(|id| {
+                        let selected = self.tab == id;
+                        // accent 是浅蓝容器色（accent.background），选中 tint 用 primary。
+                        let color = if selected {
+                            cx.theme().primary
+                        } else {
+                            cx.theme().muted_foreground
+                        };
+                        let icon = match id {
+                            TabId::Notes => IconName::FileText,
+                            TabId::Search => IconName::Search,
+                            TabId::Settings => IconName::Settings,
+                        };
+                        div()
+                            .id(SharedString::new(format!("tab-{}", id.label())))
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(2.))
+                            .child(Icon::new(icon).size(px(22.)).text_color(color))
+                            .child(
+                                Label::new(id.label())
+                                    .text_size(rems(0.65))
+                                    .text_color(color),
+                            )
+                            .on_click(cx.listener(move |this, _ev, _window, cx| {
+                                this.tab = id;
+                                cx.notify();
+                            }))
+                    })),
+            );
+
 
         // 阅读屏全屏沉浸：隐藏 Tab 栏，内容落到 safe bottom 之上。
         let chrome_hidden = self.tab == TabId::Notes

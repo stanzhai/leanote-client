@@ -25,7 +25,10 @@ tasks.register<Exec>("buildRustDebug") {
         "cargo", "ndk",
         "-t", "arm64-v8a",
         "-P", "26",
-        "-o", "mobile/android/gradle/app/src/main/jniLibs",
+        // workingDir = gradle 根（mobile/android/gradle）；-o 相对此处，
+        // 此前写成 repo 根相对路径，产物落到嵌套的不存在目录、APK 打进
+        // 旧 .so（修复：从此目录到 jniLibs 的正确相对路径）。
+        "-o", "app/src/main/jniLibs",
         "build", "--lib", "-p", "leanote-mobile",
     )
 }

@@ -7,6 +7,9 @@ plugins {
 android {
     namespace = "site.stanzhai.leanote.mobile"
     compileSdk = 34
+    // AGP 靠 ndkVersion 找 llvm-strip；不设则 “Unable to strip”，1.4GB
+    // 的 debug .so 原样进 APK（模拟器装不下：INSUFFICIENT_STORAGE）。
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "site.stanzhai.leanote.mobile"

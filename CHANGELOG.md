@@ -1,6 +1,10 @@
 # 更新日志 / Changelog
 
 
+## 3.1.18（2026-11-11）
+
+- **移动端：底部 Tab 栏改 iOS 26/27 悬浮玻璃胶囊（issue 20）**：全宽 sidebar 底色栏 → 脱离屏缘的圆角长条悬浮胶囊（`pb(safe_bottom+8)` 底隙 + 两侧 16px 留边 + `rounded_full` + 发丝描边 + 投影），浅色近实白磨砂 / 深色白色薄雾（`white@0.10`，iOS 深色玻璃比背景亮），选中 primary / 未选 muted 不变。gpui-pre 0.3.9 无 backdrop blur，磨砂为半透明近似（代码内 `ponytail:` 注释标了升级路径）。iOS / Android 模拟器截图 + 像素复核（深色胶囊 ≈42 vs 页面 19 与公式吻合）。
+- **修复：Android `build.sh` 一直在 APK 里打进旧 Rust 库（issue 20，用户报告"阅读屏底部还有内容"的根因）**：三层叠加——① 根 `build.gradle.kts` 的 `buildRustDebug` `-o` 用了相对 repo 根的路径，workingDir 却是 `gradle/`，新 .so 落进自动创建的嵌套垃圾目录、jniLibs 永远是旧库；② cargo 覆盖写 .so 不触发 gradle native merge 重跑（UP-TO-DATE 旧库），`build.sh` 现先清三个 native 中间产物目录；③ 未设 `ndkVersion` → "Unable to strip" → 1.4GB 未剥离 debug .so 进 APK（1.78GB，模拟器装不下），设 `28.2.13676358` 后剥到 204MB。验证：APK 内 .so 哈希 == 新构建哈希；真触摸走查阅读屏底部无栏（仅系统手势条）、根屏悬浮胶囊渲染正常。阅读屏隐藏 Tab 栏逻辑本身无 bug（iOS 深链像素级验证在案）。
 
 ## 3.1.16（2026-11-09）
 
