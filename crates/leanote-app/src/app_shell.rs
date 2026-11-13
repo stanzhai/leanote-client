@@ -438,11 +438,8 @@ impl AppShell {
                 .is_some();
             if exists {
                 shell.selected = Some(id);
-                // Open the editor right away (issue 17): without this the
-                // restored note showed no editor column until the user
-                // re-clicked the note, so vim keys (and the status line)
-                // never appeared after launch.
-                shell.start_editing(window, cx);
+                // Restore in the rendered preview, matching a plain click.
+                shell.start_editing(window, cx, false);
             }
         }
         // Park focus on the root so app-scope actions (⌘K/⌘S/⌘N/⌘,)
@@ -966,8 +963,10 @@ impl AppShell {
         self.converted_note = None;
         self.close_editor();
         self.invalidate_lists();
-        // Issue 17 Q2/Q8: a live markdown note opens straight in the editor.
-        self.start_editing(window, cx);
+        // A plain click opens the note in the editor's rendered preview
+        // (identical to the editor's own preview toggle); double-click on
+        // the row opens the markdown source.
+        self.start_editing(window, cx, false);
         cx.notify();
     }
 
@@ -979,8 +978,14 @@ impl AppShell {
     /// from the store; all editing (incl. IME composition) stays inside the
     /// kit's editor state — this code never mutates the buffer on key events.
     /// InputEvent::Change marks the buffer dirty and schedules the debounced
-    /// auto-save (issue 17 Q8).
-    fn start_editing(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+    /// auto-save (issue 17 Q8). `source: false` opens in the same rendered
+    /// preview the editor's toggle shows (default for a plain click).
+    fn start_editing(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui_kit::Context<Self>,
+        source: bool,
+    ) {
         let Some(id) = self.selected.clone() else {
             return;
         };
@@ -1019,9 +1024,13 @@ impl AppShell {
         .detach();
         // Empty title = freshly created note: focus lands on the title so
         // the first keystroke names it; existing notes keep focus in the
-        // body (vim grammar + typing land in the content).
-        let focus_title = note.title.is_empty();
-        if focus_title {
+        // body (vim grammar + typing land in the content). Opening in
+        // preview parks focus on the root (the editor isn't rendered, and
+        // an unrendered focus handle breaks key dispatch).
+        let focus_title = note.title.is_empty() && source;
+        if !source {
+            window.focus(&self.root_focus.clone(), cx);
+        } else if focus_title {
             title.update(cx, |state, cx| state.focus(window, cx));
         } else {
             content.update(cx, |state, cx| state.focus(window, cx));
@@ -1043,7 +1052,7 @@ impl AppShell {
             content,
             saved_content: note.content,
             dirty: false,
-            preview: false,
+            preview: !source,
             saved_flash: false,
             tags: note.tags,
             updated_time: note.updated_time,
@@ -1591,7 +1600,7 @@ impl AppShell {
         self.close_editor();
         self.invalidate_lists();
         cx.notify();
-        self.start_editing(window, cx);
+        self.start_editing(window, cx, true);
     }
     /// History-dialog restore: local rows restore title+content via the
     /// history id; server-sourced versions carry content only (the server
@@ -1623,7 +1632,7 @@ impl AppShell {
             self.close_editor();
             self.selected = Some(note_id.clone());
             self.invalidate_lists();
-            self.start_editing(window, cx); // reopen seeded with restored content
+            self.start_editing(window, cx, true); // reopen seeded with restored content
         }
     }
 
@@ -2478,8 +2487,13 @@ fn note_list_row(
         .bg(row_bg)
         .on_click(move |ev: &gpui_kit::ClickEvent, window, cx| {
             let mods = ev.modifiers();
+            let dbl = ev.click_count() >= 2;
             let _ = shell.update(cx, |this: &mut AppShell, cx| {
-                this.apply_selection(id.clone(), mods, window, cx)
+                this.apply_selection(id.clone(), mods, window, cx);
+                // Single click previews; double-click opens the editor.
+                if dbl {
+                    this.start_editing(window, cx, true);
+                }
             });
         })
         .on_hover({
@@ -6146,9 +6160,18 @@ impl AppShell {
                     .ghost()
                     .small()
                     .tooltip(t(toggle_key))
-                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                    .on_click(cx.listener(|this, _ev, window, cx| {
                         if let Some(ed) = &mut this.editing {
                             ed.preview = !ed.preview;
+                            // Follow focus: source → editor body, preview →
+                            // root (the editor stops rendering).
+                            if ed.preview {
+                                window.focus(&this.root_focus.clone(), cx);
+                            } else {
+                                let handle =
+                                    gpui_kit::Focusable::focus_handle(ed.content.read(cx), cx);
+                                window.focus(&handle, cx);
+                            }
                         }
                         cx.notify();
                     })),
@@ -7087,6 +7110,11 @@ mod tests {
         window
             .update(cx, |shell, window, cx| {
                 shell.select_note(note_id.clone(), window, cx);
+                // Single click opens the editor's rendered preview.
+                assert!(shell
+                    .editing
+                    .as_ref()
+                    .is_some_and(|ed| ed.preview && ed.note_id == note_id));
                 let n = shell
                     .store()
                     .unwrap()
@@ -7189,10 +7217,11 @@ mod tests {
         let shell_entity = shell_entity.unwrap();
         let note_id = note.note_id.clone();
 
-        // Select the note → start_editing → editor column exists + focused.
+        // Select + open the editor (as a double-click on the row does).
         window
             .update(cx, |shell, window, cx| {
                 shell.select_note(note_id, window, cx);
+                shell.start_editing(window, cx, true);
             })
             .unwrap();
         cx.run_until_parked();
@@ -7327,6 +7356,7 @@ mod tests {
         window
             .update(cx, |shell, window, cx| {
                 shell.select_note(note_id, window, cx);
+                shell.start_editing(window, cx, true);
                 if shell.vim_enabled {
                     shell.vim_enabled = false;
                     shell.vim.reset();
@@ -7417,6 +7447,7 @@ mod tests {
         window
             .update(cx, |shell, window, cx| {
                 shell.select_note(note_id, window, cx);
+                shell.start_editing(window, cx, true);
             })
             .unwrap();
         cx.run_until_parked();
@@ -7743,6 +7774,7 @@ mod tests {
         window
             .update(cx, |shell, window, cx| {
                 shell.select_note(note_id, window, cx);
+                shell.start_editing(window, cx, true);
             })
             .unwrap();
         cx.run_until_parked();
@@ -7868,6 +7900,7 @@ mod tests {
         window
             .update(cx, |shell, window, cx| {
                 shell.select_note(note_id, window, cx);
+                shell.start_editing(window, cx, true);
                 // prefs default has vim on; turn it off for this test so
                 // insert assists are active from the first keystroke.
                 if shell.vim_enabled {
@@ -8379,6 +8412,7 @@ mod tests {
         window
             .update(cx, |shell, window, cx| {
                 shell.select_note(note_id, window, cx);
+                shell.start_editing(window, cx, true);
             })
             .unwrap();
         cx.run_until_parked();
