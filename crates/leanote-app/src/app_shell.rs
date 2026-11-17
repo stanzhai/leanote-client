@@ -161,6 +161,17 @@ fn nav_from_key(kind: &str, id: &str) -> Option<NavSelection> {
     }
 }
 
+/// ADR-0015: the four embedding settings inputs, created once when the
+/// settings dialog opens (they must outlive the dialog's per-frame
+/// rebuilds, like the theme ComboboxState entity).
+#[derive(Clone)]
+struct EmbedInputs {
+    base: gpui_kit::Entity<InputState>,
+    key: gpui_kit::Entity<InputState>,
+    model: gpui_kit::Entity<InputState>,
+    dim: gpui_kit::Entity<InputState>,
+}
+
 pub struct AppShell {
     phase: Phase,
     lang: Lang,
@@ -188,6 +199,16 @@ pub struct AppShell {
     /// the DB but the notify never fired, so an open reader stayed stale
     /// until the user switched notes.
     sync_task: Option<Task<()>>,
+    /// ADR-0015: embedding index state — last test-connection result
+    /// (Ok = vector dim), rebuild progress (done, total), and a busy
+    /// flag shared by rebuild + the incremental indexer.
+    embed_test: Option<Result<u32, String>>,
+    embed_testing: bool,
+    reindex_progress: Option<(usize, usize)>,
+    index_busy: bool,
+    /// Incremental indexer future — own slot so `_task` writes (autosave
+    /// timers, exports) never cancel an in-flight embed pass.
+    index_task: Option<Task<()>>,
     // --- Ticket 09 browse state ---
     nav: NavSelection,
     notebooks_open: bool,
@@ -384,6 +405,11 @@ impl AppShell {
             password,
             _task: None,
             sync_task: None,
+            embed_test: None,
+            embed_testing: false,
+            reindex_progress: None,
+            index_busy: false,
+            index_task: None,
             nav: prefs
                 .nav
                 .selection
@@ -571,6 +597,8 @@ impl AppShell {
                             content_failures: stats.content_failures.len(),
                         }));
                         shell.invalidate_lists();
+                        // ADR-0015: first full sync → embed everything new.
+                        shell.kick_embedding_indexer(cx);
                     }
                     Err(e) => {
                         leanote_core::logging::log("sync", &e);
@@ -615,6 +643,8 @@ impl AppShell {
                 match &result {
                     Ok(_) => {
                         shell.sync_status = Some(Ok("sync ok".into()));
+                        // ADR-0015: fresh server rows → embed new/changed notes.
+                        shell.kick_embedding_indexer(cx);
                     }
                     Err(e) => {
                         leanote_core::logging::log("sync", e);
@@ -661,6 +691,7 @@ impl AppShell {
                 match &result {
                     Ok(()) => {
                         shell.sync_status = Some(Ok("sync ok".into()));
+                        shell.kick_embedding_indexer(cx);
                     }
                     Err(e) => {
                         leanote_core::logging::log("sync", e);
@@ -668,6 +699,170 @@ impl AppShell {
                     }
                 }
                 shell.invalidate_lists();
+                cx.notify();
+            });
+        }));
+    }
+
+    /// ADR-0015: embedding config from prefs; None (or base/model empty)
+    /// = pure FTS5 full-text search.
+    fn embedding_cfg(&self) -> Option<leanote_core::embed::EmbeddingConfig> {
+        crate::prefs::Prefs::load(&self.data_dir)
+            .search
+            .embedding
+            .filter(|c| !c.base_url.trim().is_empty() && !c.model.trim().is_empty())
+    }
+
+    /// ADR-0015: background incremental embedding indexer — embeds notes
+    /// whose content_hash changed / embedding is missing (batches of 16
+    /// inside core). Failures are logged and retried on the next trigger
+    /// (post-sync / next debounced save); never blocks the UI.
+    fn kick_embedding_indexer(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        if self.index_busy {
+            return;
+        }
+        let Some(cfg) = self.embedding_cfg() else {
+            return;
+        };
+        self.index_busy = true;
+        let dir = self.data_dir.clone();
+        let uid = self.user_id.clone();
+        let work = cx.background_spawn(async move {
+            (|| {
+                let mut store = leanote_core::Store::open(dir, uid).map_err(|e| e.to_string())?;
+                store.embed_stale(&cfg, |_, _| {}).map_err(|e| e)
+            })()
+        });
+        self.index_task = Some(cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |shell, cx| {
+                shell.index_busy = false;
+                if let Err(e) = &result {
+                    leanote_core::logging::log("embed", e);
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// ADR-0015: persist the embedding fields from the settings dialog
+    /// (write-through, like every other settings row). Empty base/model
+    /// clears the config → FTS-only search.
+    fn set_embedding_prefs(
+        &mut self,
+        base: String,
+        key: String,
+        model: String,
+        dim: Option<u32>,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        let dir = self.data_dir.clone();
+        let mut p = crate::prefs::Prefs::load(&dir);
+        let base = base.trim().to_string();
+        let model = model.trim().to_string();
+        p.search.embedding = if base.is_empty() || model.is_empty() {
+            None
+        } else {
+            Some(leanote_core::embed::EmbeddingConfig {
+                base_url: base,
+                api_key: key,
+                model,
+                dim,
+            })
+        };
+        p.save(&dir);
+        self.kick_embedding_indexer(cx);
+        cx.notify();
+    }
+
+    /// Reads the four settings inputs and persists them (input change
+    /// handler — every keystroke writes prefs.json, same live-apply
+    /// convention as the other rows).
+    fn save_embedding_inputs(&mut self, inputs: &EmbedInputs, cx: &mut gpui_kit::Context<Self>) {
+        let base = inputs.base.read(cx).value().to_string();
+        let key = inputs.key.read(cx).value().to_string();
+        let model = inputs.model.read(cx).value().to_string();
+        let dim = inputs.dim.read(cx).value().trim().parse::<u32>().ok();
+        self.set_embedding_prefs(base, key, model, dim, cx);
+    }
+
+    /// 测试连接：background embed of one probe string; the returned
+    /// vector length IS the endpoint's dimension.
+    fn test_embedding_connection(
+        &mut self,
+        cfg: leanote_core::embed::EmbeddingConfig,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        if self.embed_testing {
+            return;
+        }
+        self.embed_testing = true;
+        self.embed_test = None;
+        cx.notify();
+        let work = cx.background_spawn(async move {
+            leanote_core::embed::embed_texts(&cfg, &["test"])
+                .map(|v| v.first().map_or(0, |f| f.len() as u32))
+                .map_err(|e| e)
+        });
+        self._task = Some(cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |shell, cx| {
+                shell.embed_testing = false;
+                shell.embed_test = Some(result);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// 重建索引（force-all）: progress streams "@done/total" ticks back
+    /// like the sync channel pattern; button disabled while running.
+    fn rebuild_embedding_index(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        if self.index_busy {
+            return;
+        }
+        let Some(cfg) = self.embedding_cfg() else {
+            return;
+        };
+        self.index_busy = true;
+        self.reindex_progress = Some((0, 0));
+        cx.notify();
+        let dir = self.data_dir.clone();
+        let uid = self.user_id.clone();
+        let (tx, rx) = smol::channel::unbounded::<String>();
+        let work = cx.background_spawn(async move {
+            (|| {
+                let mut store = leanote_core::Store::open(dir, uid).map_err(|e| e.to_string())?;
+                store
+                    .reindex_embedding(&cfg, move |done, total| {
+                        let _ = tx.try_send(format!("@{done}/{total}"));
+                    })
+                    .map(|_| ())
+                    .map_err(|e| e)
+            })()
+        });
+        self.index_task = Some(cx.spawn(async move |this, cx| {
+            let result = loop {
+                match rx.recv().await {
+                    Ok(msg) => {
+                        if let Some((d, t)) = msg.strip_prefix('@').and_then(|s| {
+                            let (d, t) = s.split_once('/')?;
+                            Some((d.parse::<usize>().ok()?, t.parse::<usize>().ok()?))
+                        }) {
+                            let _ = this.update(cx, |shell, cx| {
+                                shell.reindex_progress = Some((d, t));
+                                cx.notify();
+                            });
+                        }
+                    }
+                    Err(_) => break work.await,
+                }
+            };
+            let _ = this.update(cx, |shell, cx| {
+                shell.index_busy = false;
+                shell.reindex_progress = None;
+                if let Err(e) = &result {
+                    leanote_core::logging::log("embed", e);
+                }
                 cx.notify();
             });
         }));
@@ -1142,6 +1337,11 @@ impl AppShell {
             ed.saved_flash = true;
         }
         self.invalidate_lists();
+        // ADR-0015: debounced save landed → re-embed this note in the
+        // background (indexer early-outs when nothing is stale).
+        if changed {
+            self.kick_embedding_indexer(cx);
+        }
         cx.notify();
     }
 
@@ -1658,13 +1858,46 @@ impl AppShell {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(150))
                 .await;
-            let _ = this.update(cx, |shell, cx| {
+            // ADR-0015: hybrid search embeds the query over HTTP — that
+            // must never run in `update` (UI thread). Snapshot the params
+            // here, execute on a background thread, land rows back.
+            let params = this.update(cx, |shell, _| {
                 let q = shell.search_query.clone();
-                shell.search_rows = if crate::search_overlay::should_search(&q, false) {
-                    shell.search_store(&q)
+                if !crate::search_overlay::should_search(&q, false) {
+                    shell.search_rows.clear();
+                    None
                 } else {
-                    Vec::new()
-                };
+                    Some((q, shell.data_dir.clone(), shell.user_id.clone(), shell.embedding_cfg()))
+                }
+            });
+            let Ok(params) = params else { return };
+            let (q, dir, uid, cfg) = match params {
+                Some(p) => p,
+                None => {
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                    return;
+                }
+            };
+            let rows = cx
+                .background_spawn(async move {
+                    let Some(store) = leanote_core::Store::open(dir, uid).ok() else {
+                        return Vec::new();
+                    };
+                    let hits = match cfg {
+                        Some(cfg) => store
+                            .search_with(Some(&cfg), &q, crate::search_overlay::RESULT_LIMIT)
+                            .unwrap_or_default(),
+                        None => store
+                            .search(&q, crate::search_overlay::RESULT_LIMIT)
+                            .unwrap_or_default(),
+                    };
+                    crate::search_overlay::format_rows(&hits, |id| {
+                        store.notebook_title(id).unwrap_or_else(|_| id.to_string())
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |shell, cx| {
+                shell.search_rows = rows;
                 cx.notify();
             });
         }));
@@ -1709,18 +1942,6 @@ impl AppShell {
             })
             .collect()
     }
-    fn search_store(&self, query: &str) -> Vec<crate::search_overlay::ResultRow> {
-        let Some(store) = self.store() else {
-            return Vec::new();
-        };
-        let hits = store
-            .search(query, crate::search_overlay::RESULT_LIMIT)
-            .unwrap_or_default();
-        crate::search_overlay::format_rows(&hits, |id| {
-            store.notebook_title(id).unwrap_or_else(|_| id.to_string())
-        })
-    }
-
     /// Star is local-only: toggle_star never touches IsDirty (GLOSSARY).
     fn toggle_star(&mut self, id: leanote_core::Id, cx: &mut gpui_kit::Context<Self>) {
         if let Some(store) = self.store() {
@@ -4547,6 +4768,44 @@ impl AppShell {
         .detach();
         // Which section is selected, stable across the closure's frames.
         let section: std::rc::Rc<std::cell::Cell<usize>> = std::rc::Rc::default();
+        // ADR-0015: embedding inputs (prefilled from prefs); input changes
+        // write prefs through immediately, like every other settings row.
+        let emb = p0.search.embedding.clone().unwrap_or_default();
+        let embed_inputs = EmbedInputs {
+            base: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("https://api.openai.com/v1")
+                    .default_value(emb.base_url.as_str())
+            }),
+            key: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .masked(true)
+                    .default_value(emb.api_key.as_str())
+            }),
+            model: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("text-embedding-3-small")
+                    .default_value(emb.model.as_str())
+            }),
+            dim: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(emb.dim.map(|d| d.to_string()).unwrap_or_default())
+            }),
+        };
+        for input in [
+            &embed_inputs.base,
+            &embed_inputs.key,
+            &embed_inputs.model,
+            &embed_inputs.dim,
+        ] {
+            let inputs = embed_inputs.clone();
+            cx.subscribe(input, move |this, _, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.save_embedding_inputs(&inputs, cx);
+                }
+            })
+            .detach();
+        }
         window.open_dialog(cx, move |dialog, _window, cx| {
             let shell_c = shell.clone();
             let t = |k: i18n::Key| i18n::t(shell.read(cx).lang, k);
@@ -4873,6 +5132,108 @@ impl AppShell {
                             ),
                         ))
                 }
+                // ── 搜索 / Search (ADR-0015) ───────────────────────
+                2 => {
+                    let sh = shell.read(cx);
+                    let cfg_now = prefs.search.embedding.clone();
+                    let stats = sh.store().map(|s| s.index_stats());
+                    let stale = cfg_now.as_ref().map_or(false, |c| {
+                        sh.store().map_or(false, |s| s.embedding_index_stale(c))
+                    });
+                    let field = |label: i18n::Key, state: &gpui_kit::Entity<InputState>| {
+                        row(
+                            t(label).into(),
+                            gpui_kit::div()
+                                .w(theme::ui(220.))
+                                .child(Input::new(state).appearance(true).bordered(true))
+                                .into_any_element(),
+                        )
+                    };
+                    right = right
+                        .child(field(i18n::Key::EmbedBaseUrl, &embed_inputs.base))
+                        .child(field(i18n::Key::EmbedApiKey, &embed_inputs.key))
+                        .child(field(i18n::Key::EmbedModel, &embed_inputs.model))
+                        .child(field(i18n::Key::EmbedDim, &embed_inputs.dim))
+                        .child(
+                            gpui_kit::base::h_flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("set-embed-test")
+                                        .label(t(i18n::Key::TestConnection).to_owned())
+                                        .outline()
+                                        .disabled(sh.embed_testing || cfg_now.is_none())
+                                        .when(sh.embed_testing, |b| b.loading(true))
+                                        .on_click({
+                                            let shell = shell_c.clone();
+                                            move |_ev, _window, cx| {
+                                                let _ = shell.update(cx, |this, cx| {
+                                                    if let Some(cfg) = this.embedding_cfg() {
+                                                        this.test_embedding_connection(cfg, cx);
+                                                    }
+                                                });
+                                            }
+                                        }),
+                                )
+                                .when_some(
+                                    shell.read(cx).embed_test.clone(),
+                                    |el, res| match res {
+                                        Ok(dim) => el.child(small_label(
+                                            format!("{} · {}", t(i18n::Key::ConnOk), dim),
+                                            muted,
+                                        )),
+                                        Err(e) => el.child(small_label(
+                                            e.clone(),
+                                            gpui_kit::hsla(0. / 360., 0.78, 0.46, 1.),
+                                        )),
+                                    },
+                                ),
+                        )
+                        // 索引状态：已索引 n/m · 模型名 (+ stale warning).
+                        .child(small_label(
+                            format!(
+                                "{}: {} · {}",
+                                t(i18n::Key::IndexedLabel),
+                                stats.map_or("-".into(), |(i, n, _)| {
+                                    if n == 0 {
+                                        "-".to_string()
+                                    } else {
+                                        format!("{i}/{n}")
+                                    }
+                                }),
+                                cfg_now.as_ref().map(|c| c.model.as_str()).unwrap_or("-")
+                            ),
+                            muted,
+                        ))
+                        .when(stale, |el| {
+                            el.child(small_label(
+                                t(i18n::Key::IndexStale),
+                                gpui_kit::hsla(35. / 360., 0.9, 0.45, 1.),
+                            ))
+                        })
+                        .child(
+                            Button::new("set-embed-rebuild")
+                                .label(if shell.read(cx).reindex_progress.is_some() {
+                                    let (d, tt) = shell.read(cx).reindex_progress.unwrap_or((0, 0));
+                                    format!("{} {d}/{tt}", t(i18n::Key::RebuildingIndex))
+                                } else {
+                                    t(i18n::Key::RebuildIndex).to_owned()
+                                })
+                                .outline()
+                                .disabled(sh.index_busy || cfg_now.is_none())
+                                .on_click({
+                                    let shell = shell_c.clone();
+                                    move |_ev, _window, cx| {
+                                        let _ = shell.update(cx, |this, cx| {
+                                            this.rebuild_embedding_index(cx);
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(small_label(t(i18n::Key::SearchPrivacyNote), muted))
+                        .when(cfg_now.is_none(), |el| {
+                            el.child(small_label(t(i18n::Key::SearchFtsHint), muted))
+                        });
+                }
                 // ── 数据 / Data ────────────────────────────────────
                 _ => {
                     right = right
@@ -4935,6 +5296,7 @@ impl AppShell {
             for (ix, (label, icon)) in [
                 (i18n::Key::SectionAppearance, AssetIcon::Palette),
                 (i18n::Key::SectionEditor, AssetIcon::FileText),
+                (i18n::Key::SectionSearch, AssetIcon::Search),
                 (i18n::Key::SectionData, AssetIcon::Database),
             ]
             .into_iter()

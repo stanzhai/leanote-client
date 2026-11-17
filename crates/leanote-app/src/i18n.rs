@@ -219,6 +219,26 @@ keys! {
     SaveImageAs => ("另存为…", "Save as…"),
     ImageSaved => ("图片已保存", "Image saved"),
     ImageSaveFailed => ("图片保存失败", "Failed to save image"),
+    // ADR-0015: hybrid search settings section.
+    SectionSearch => ("搜索", "Search"),
+    EmbedBaseUrl => ("API 地址", "API base URL"),
+    EmbedApiKey => ("API Key", "API key"),
+    EmbedModel => ("模型", "Model"),
+    EmbedDim => ("维度（可选）", "Dimension (optional)"),
+    TestConnection => ("测试连接", "Test connection"),
+    ConnOk => ("连接成功", "Connected"),
+    IndexedLabel => ("已索引", "Indexed"),
+    RebuildIndex => ("重建索引", "Rebuild index"),
+    RebuildingIndex => ("重建索引中…", "Rebuilding index…"),
+    IndexStale => ("模型已变更，需重建索引", "Model changed — rebuild required"),
+    SearchPrivacyNote => (
+        "启用后笔记内容将发送至所配置的 API 地址",
+        "When enabled, note content is sent to the configured API endpoint"
+    ),
+    SearchFtsHint => (
+        "未配置时，搜索仅使用本地全文索引，功能完整可用",
+        "Without a config, search uses the local full-text index only"
+    ),
 }
 
 /// 使用帮助正文（纯文本，不经过 markdown 渲染——渲染在对话框里
@@ -452,5 +472,17 @@ mod tests {
         Key::SaveImageAs,
         Key::ImageSaved,
         Key::ImageSaveFailed,
+        Key::SectionSearch,
+        Key::EmbedBaseUrl,
+        Key::EmbedApiKey,
+        Key::EmbedModel,
+        Key::EmbedDim,
+        Key::TestConnection,
+        Key::IndexedLabel,
+        Key::RebuildIndex,
+        Key::RebuildingIndex,
+        Key::IndexStale,
+        Key::SearchPrivacyNote,
+        Key::SearchFtsHint,
     ];
 }

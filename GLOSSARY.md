@@ -38,6 +38,14 @@
 - **存储层 (Store)** — 本地持久化。Rust 版实现为 SQLite（`~/Library/Application Support/leanote/leanote.db`；win `%APPDATA%\leanote`、linux `~/.config/leanote`，可用 `LEANOTE_DATA` 覆盖），与 Electron 遗留 NeDB（同 mac 目录的 `nedb55/` 子树）永不互读写；不迁移旧缓存，重登录后全量同步重建（ADR-0002、ADR-0008）。
 - **附件 (Attachment)** — 笔记内图片/文件的服务器对象（`file/getImage`、`file/getAttach`）；本地 `attachs.db` 为下载缓存。当前语料 0 附件，Rust 版将其列为显式缺口而非隐式删除。
 
+## 搜索
+
+- **混合检索 (Hybrid search)** — 统一搜索核心的两路模式：全文索引排名 + 向量索引余弦相似度，经 RRF（Reciprocal Rank Fusion，k=60）融合；任一路缺席自动单路退化，四端（⌘K / CLI / MCP / 移动端）同一核心。未配置 Embedding 服务或其不可达时退化为纯全文检索，不报错。
+- **全文索引 (FTS index)** — notes 的 FTS5 虚表（bundled SQLite 自带 FTS5），索引文本经 bigram 预处理（中英文 run 统一双字切分 + 单字，子串语义，1~2 字/字母查询可命中），写入由 `update_fts` 在 `add_note`/`update_note`/`apply_sync_notes` 三个写入口统一维护（不用 SQL trigger：bigram 需在 Rust 侧预处理）；检索入口做廉价对账以自愈外部直写 SQLite 的漂移。取代原"全库载入内存子串匹配"。桌面与移动端共用。
+- **向量索引 (Vector index)** — sqlite-vec 虚表，仅桌面写入（Embedding 后台索引器）；移动端 v1 无此路，检索自动退化为纯全文。模型/维度记录在 search_meta，变更后须重建索引。
+- **Embedding 服务 (Embedding service)** — 用户在设置「搜索」分区配置的 OpenAI 兼容接口（BaseURL / API Key / 模型）；配置本身即主动选择，允许指向本地端点。仅桌面持有该配置。
+- **重建索引 (Reindex)** — 手动触发的全量回填（FTS + 向量），模型或维度变更后必须执行；增量索引自动进行，回填不自动。
+
 ## 布局与界面（Rust 版）
 
 - **三栏布局 (Three-pane layout)** — Wake 式信息架构：左栏导航（搜索入口 + 固定导航 + 可折叠分组）+ 中栏笔记列表 + 右栏编辑/阅读面。无顶部通栏；窗口用系统透明标题栏，仅左栏顶部让位红绿灯（44px），中/右栏内容直通窗口顶边（ADR-0003，UI 优化轮修正）。用户拖好的左/中栏宽度在窗口 resize 时保持不变，增量全部由右栏（阅读/编辑面）吸收（gpui-base resizable 定制，issue 35）。窗口控制：macOS 用系统红绿灯；Windows/Linux 走自绘客户端装饰——左栏顶行右端挂最小化/最大化/关闭三钮（Windows 11 风格线 icon，关闭钮 hover 红底），经 gpui `WindowControlArea` hitbox 接平台事件链；非 mac 顶行同排应用图标 + 应用名 + 搜索钮，macOS 顶行维持现状（红绿灯让位 + 搜索钮，无应用名，issue 20 Q7）。

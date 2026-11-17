@@ -64,6 +64,17 @@ pub struct Prefs {
     /// path (unmounted/removable) falls back to ~/Downloads too.
     #[serde(default)]
     pub export_dir: String,
+    /// ADR-0015 hybrid search: embedding endpoint config. None = pure
+    /// local FTS5 full-text search.
+    #[serde(default)]
+    pub search: SearchPrefs,
+ }
+
+/// Hybrid-search prefs (ADR-0015): `embedding` None = FTS-only search.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SearchPrefs {
+    #[serde(default)]
+    pub embedding: Option<leanote_core::embed::EmbeddingConfig>,
 }
 
 impl Default for Prefs {
@@ -82,6 +93,7 @@ impl Default for Prefs {
             editor_font_size: String::new(),
             nav: NavStatePref::default(),
             export_dir: String::new(),
+            search: SearchPrefs::default(),
         }
     }
 }
@@ -210,6 +222,14 @@ mod tests {
                 last_note: Some("note9".into()),
             },
             export_dir: "/tmp".into(),
+            search: SearchPrefs {
+                embedding: Some(leanote_core::embed::EmbeddingConfig {
+                    base_url: "https://api.openai.com/v1".into(),
+                    api_key: "sk-test".into(),
+                    model: "text-embedding-3-small".into(),
+                    dim: Some(1536),
+                }),
+            },
         };
         let dir = std::env::temp_dir().join(format!("lnprefs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

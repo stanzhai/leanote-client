@@ -628,7 +628,7 @@ impl Api {
     }
 }
 
-fn default_agent() -> Agent {
+pub(crate) fn default_agent() -> Agent {
     Agent::config_builder()
         // Keep 4xx/5xx as responses so check_status can read the server's
         // error body (Error::StatusCode would drop it).
@@ -1704,6 +1704,7 @@ impl Store {
         for row in rows {
             let server_id = str_field(row, "NoteId");
             if bool_field(row, "IsDeleted") {
+                tx.execute("DELETE FROM notes_fts WHERE note_id=?1", params![server_id])?;
                 tx.execute(
                     "DELETE FROM notes WHERE ServerNoteId=?1",
                     params![server_id],
@@ -1749,6 +1750,16 @@ impl Store {
                     go_now_ms(row.get("UpdatedTime"), now),
                     bool_field(row, "IsBlog") as i64,
                 ],
+            )?;
+            // FTS upkeep: the body arrives later via set_note_content_*
+            // (the content phase of the sync); title/tags land now.
+            crate::search::update_fts(
+                &tx,
+                &server_id,
+                &str_field(row, "Title"),
+                "",
+                &tags,
+                bool_field(row, "IsMarkdown"),
             )?;
         }
         tx.commit()
@@ -1831,6 +1842,7 @@ impl Store {
                 content.chars().take(500).collect::<String>(),
             ],
         )?;
+        crate::search::update_fts_body(&self.conn, server_note_id, content)?;
         Ok(())
     }
 
@@ -1856,6 +1868,7 @@ impl Store {
                 content.chars().take(500).collect::<String>(),
             ],
         )?;
+        crate::search::update_fts_body(&self.conn, server_note_id, content)?;
         Ok(())
     }
 

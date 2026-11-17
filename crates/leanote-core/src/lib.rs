@@ -8,10 +8,12 @@
 use std::fmt;
 use std::path::PathBuf;
 
-pub mod html2md;
-pub mod logging;
-pub mod nav;
-pub mod sync;
+pub mod embed;
+ pub mod html2md;
+ pub mod logging;
+ pub mod nav;
+pub mod search;
+ pub mod sync;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -233,6 +235,21 @@ pub fn app_data_dir() -> PathBuf {
 pub struct Store {
     pub(crate) conn: Connection,
     pub(crate) user_id: String,
+    /// sqlite-vec extension registered and loadable on this connection —
+    /// the vector search path is gated on it (mobile/build degradation).
+    pub(crate) vec_loaded: bool,
+}
+
+/// Register sqlite-vec as a SQLite auto-extension (statically linked in by
+/// the sqlite-vec crate's cc build) so every opened connection gets the
+/// vec0 module. Once-guarded; registration itself cannot fail.
+fn register_vec_extension() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
 }
 
 impl Store {
@@ -245,6 +262,7 @@ impl Store {
     pub fn open(dir: PathBuf, user_id: String) -> rusqlite::Result<Self> {
         std::fs::create_dir_all(&dir)
             .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+        register_vec_extension();
         let conn = Connection::open(dir.join(DB_FILE))?;
         // WAL: crash-safe + fast. journal_mode is persistent in the db file.
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -252,7 +270,16 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         Self::migrate(&conn)?;
-        Ok(Store { conn, user_id })
+        // Graceful vector-path gate: if the extension didn't attach for
+        // whatever reason, everything else keeps working (FTS-only).
+        let vec_loaded = conn
+            .query_row("SELECT vec_version()", [], |r| r.get::<_, String>(0))
+            .is_ok();
+        Ok(Store {
+            conn,
+            user_id,
+            vec_loaded,
+        })
     }
 
     /// Issue 20: `PRAGMA user_version` migrations. v1: legacy sync wrote
@@ -282,6 +309,34 @@ impl Store {
             // Issue 21 需求9: image attachments live locally until the
             // server upload succeeds (schema DDL is in SCHEMA above).
             conn.pragma_update(None, "user_version", 2)?;
+        }
+        if v < 3 {
+            // Hybrid search: FTS5 table + backfill of every existing note
+            // (bigram text is built in Rust — see search::update_fts).
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+                    note_id UNINDEXED, title, body, tags)",
+            )?;
+            let rows: Vec<(String, String, String, String, bool)> = {
+                let mut stmt = conn
+                    .prepare("SELECT NoteId, Title, Content, Tags, IsMarkdown<>0 FROM notes")?;
+                let v = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, i64>(4)? != 0,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                v
+            };
+            for (id, title, content, tags, is_md) in &rows {
+                crate::search::update_fts(conn, id, title, content, tags, *is_md)?;
+            }
+            conn.pragma_update(None, "user_version", 3)?;
         }
         Ok(())
     }
@@ -328,6 +383,14 @@ impl Store {
             ],
         )?;
         upsert_tags(&tx, &self.user_id, &note.tags, now)?;
+        crate::search::update_fts(
+            &tx,
+            &id.to_string(),
+            &note.title,
+            &note.content,
+            &tags_csv(&note.tags),
+            note.is_markdown,
+        )?;
         tx.commit()?;
         Ok(self.get_note(&id)?.expect("just inserted"))
     }
@@ -678,6 +741,14 @@ impl Store {
         if let Some(t) = upd.tags.clone().filter(|t| !t.is_empty()) {
             upsert_tags(&tx, &self.user_id, &t, now)?;
         }
+        crate::search::update_fts(
+            &tx,
+            &id.to_string(),
+            &title,
+            &content,
+            &tags_csv(&tags),
+            old.is_markdown,
+        )?;
         tx.commit()?;
         self.get_note(id)
     }
@@ -1272,11 +1343,11 @@ impl Store {
         Ok(changed)
     }
 
-    /// Unified search (spec §30): case-insensitive substring over
-    /// Title+Content+Tags, weights Title 3 / Tags 2 / Content 1, excerpt
-    /// window exactly as `src/leanote_cli.js` cmdSearch.
+    /// Unified search (spec §30): FTS-backed hybrid search with no
+    /// embedding config (FTS-only). Callers with a config use
+    /// [`Store::search_with`].
     pub fn search(&self, keyword: &str, limit: usize) -> rusqlite::Result<Vec<SearchHit>> {
-        Ok(search_notes(&self.list_notes()?, keyword, limit))
+        self.search_with(None, keyword, limit)
     }
 
     pub fn journal_mode(&self) -> rusqlite::Result<String> {
@@ -1319,6 +1390,9 @@ pub struct SearchHit {
     pub note: Note,
     pub score: u32,
     pub excerpt: String,
+    /// Which search paths matched: "fts" and/or "vec". Empty on hits from
+    /// the legacy in-memory `search_notes`.
+    pub matched_via: Vec<&'static str>,
 }
 
 /// Case-insensitive substring search over Title+Content+Tags.
@@ -1334,17 +1408,14 @@ pub fn search_notes(notes: &[Note], keyword: &str, limit: usize) -> Vec<SearchHi
     let kw_lower = keyword.to_lowercase();
     let mut out: Vec<SearchHit> = Vec::new();
     for n in notes {
-        let in_title = n.title.to_lowercase().contains(&kw_lower);
-        let in_content = n.content.to_lowercase().contains(&kw_lower);
-        let in_tags = n.tags.iter().any(|t| t.to_lowercase().contains(&kw_lower));
-        if !(in_title || in_content || in_tags) {
+        if hit_score(n, &kw_lower) == 0 {
             continue;
         }
-        let score = (in_title as u32) * 3 + (in_tags as u32) * 2 + (in_content as u32) * 1;
         out.push(SearchHit {
             note: n.clone(),
-            score,
+            score: hit_score(n, &kw_lower),
             excerpt: excerpt(n, keyword),
+            matched_via: Vec::new(),
         });
     }
     out.sort_by(|a, b| b.score.cmp(&a.score));
@@ -1352,10 +1423,23 @@ pub fn search_notes(notes: &[Note], keyword: &str, limit: usize) -> Vec<SearchHi
     out
 }
 
+/// Weights: Title 3, Tags 2, Content 1 (0 = no match), on a pre-lowercased
+/// keyword. Shared by the in-memory scan and the hybrid FTS path so the
+/// `score` display field stays byte-compatible.
+pub(crate) fn hit_score(n: &Note, kw_lower: &str) -> u32 {
+    let in_title = n.title.to_lowercase().contains(kw_lower);
+    let in_content = n.content.to_lowercase().contains(kw_lower);
+    let in_tags = n
+        .tags
+        .iter()
+        .any(|t| t.to_lowercase().contains(kw_lower));
+    (in_title as u32) * 3 + (in_tags as u32) * 2 + in_content as u32
+}
+
 /// JS: idx = content.toLowerCase().indexOf(kw); start = max(0, idx-30);
 /// end = min(len, idx+kw.len+50); "..." when start>0 / end<len; \n -> " ".
 /// All indices are JS UTF-16 code units, kw.len included.
-fn excerpt(n: &Note, keyword: &str) -> String {
+pub(crate) fn excerpt(n: &Note, keyword: &str) -> String {
     let cu: Vec<u16> = n.content.encode_utf16().collect();
     let lower_cu: Vec<u16> = n.content.to_lowercase().encode_utf16().collect();
     let lower_kw: Vec<u16> = keyword.to_lowercase().encode_utf16().collect();
@@ -1509,7 +1593,7 @@ fn row_to_note_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteMeta> {
     })
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -1602,6 +1686,15 @@ CREATE TABLE IF NOT EXISTS images (
     Bytes BLOB NOT NULL,
     Size INTEGER NOT NULL DEFAULT 0,
     CreatedTime INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS embeddings (
+    note_id TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS search_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_images_server ON images(ServerId);
 CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(UpdatedTime DESC);

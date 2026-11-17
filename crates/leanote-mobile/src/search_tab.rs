@@ -1,4 +1,4 @@
-//! 搜索 Tab（issue 06）：统一搜索核心（leanote-core `search_notes`，
+//! 搜索 Tab（issue 06）：统一搜索核心（leanote-core `search_hybrid`，
 //! 桌面 ⌘K 同源）+ 触屏输入框 + 结果列表，点击经事件跳笔记 Tab 阅读屏。
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -6,7 +6,8 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::prelude::*;
 use gpui_kit::{div, rems, Entity, EventEmitter, SharedString, Task, Window};
-use leanote_core::{search_notes, SearchHit, Store};
+use leanote_core::search::search_hybrid;
+use leanote_core::{SearchHit, Store};
 use std::sync::{Arc, Mutex};
 
 pub enum SearchEvent {
@@ -93,7 +94,7 @@ impl SearchTab {
             .as_ref()
             .map(|s| {
                 let s = s.lock().unwrap();
-                search_notes(&s.list_notes().unwrap_or_default(), &kw, 20)
+                search_hybrid(&s, None, &kw, 20)
             })
             .unwrap_or_default();
         cx.notify();
