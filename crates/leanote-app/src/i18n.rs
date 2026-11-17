@@ -221,10 +221,10 @@ keys! {
     ImageSaveFailed => ("图片保存失败", "Failed to save image"),
     // ADR-0015: hybrid search settings section.
     SectionSearch => ("搜索", "Search"),
-    EmbedBaseUrl => ("API 地址", "API base URL"),
-    EmbedApiKey => ("API Key", "API key"),
-    EmbedModel => ("模型", "Model"),
-    EmbedDim => ("维度（可选）", "Dimension (optional)"),
+    EmbedBaseUrl => ("OpenAI 兼容地址", "OpenAI-compatible URL"),
+    EmbedApiKey => ("API 密钥", "API key"),
+    EmbedModel => ("Embedding 模型", "Embedding model"),
+    EmbedDim => ("向量维度（可选）", "Vector dims (optional)"),
     TestConnection => ("测试连接", "Test connection"),
     ConnOk => ("连接成功", "Connected"),
     IndexedLabel => ("已索引", "Indexed"),
@@ -238,6 +238,26 @@ keys! {
     SearchFtsHint => (
         "未配置时，搜索仅使用本地全文索引，功能完整可用",
         "Without a config, search uses the local full-text index only"
+    ),
+    EmbedBaseUrlTip => (
+        "任何 OpenAI 兼容的 /embeddings 服务地址，如 https://api.openai.com/v1，也可指向本地 Ollama / LM Studio。配置后，笔记搜索升级为「语义 + 全文」混合检索。",
+        "Any OpenAI-compatible /embeddings endpoint, e.g. https://api.openai.com/v1, or a local Ollama / LM Studio URL. Once set, note search upgrades to hybrid (semantic + full-text)."
+    ),
+    EmbedApiKeyTip => (
+        "在服务商控制台创建；仅保存在本机，随请求发送至上方地址。",
+        "Create it in your provider's console; stored locally only and sent with requests to the URL above."
+    ),
+    EmbedModelTip => (
+        "向量化模型名，如 text-embedding-3-small、bge-m3。更换后需点「重建索引」。",
+        "Embedding model name, e.g. text-embedding-3-small, bge-m3. After changing it, click \"Rebuild index\"."
+    ),
+    EmbedDimTip => (
+        "通常留空，维度按服务返回自动记录；填写与服务不符的维度会导致向量检索失效。",
+        "Usually leave empty — the dimension is recorded automatically from the service. A mismatched value breaks vector retrieval."
+    ),
+    EmbedRebuildTip => (
+        "为全部笔记重新生成向量（调用所配置的服务）；更换 Embedding 模型后必须执行一次。",
+        "Regenerates vectors for every note via the configured service; required once after changing the embedding model."
     ),
 }
 
@@ -484,5 +504,10 @@ mod tests {
         Key::IndexStale,
         Key::SearchPrivacyNote,
         Key::SearchFtsHint,
+        Key::EmbedBaseUrlTip,
+        Key::EmbedApiKeyTip,
+        Key::EmbedModelTip,
+        Key::EmbedDimTip,
+        Key::EmbedRebuildTip,
     ];
 }

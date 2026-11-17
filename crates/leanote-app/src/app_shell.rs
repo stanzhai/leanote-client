@@ -1867,7 +1867,12 @@ impl AppShell {
                     shell.search_rows.clear();
                     None
                 } else {
-                    Some((q, shell.data_dir.clone(), shell.user_id.clone(), shell.embedding_cfg()))
+                    Some((
+                        q,
+                        shell.data_dir.clone(),
+                        shell.user_id.clone(),
+                        shell.embedding_cfg(),
+                    ))
                 }
             });
             let Ok(params) = params else { return };
@@ -5140,20 +5145,60 @@ impl AppShell {
                     let stale = cfg_now.as_ref().map_or(false, |c| {
                         sh.store().map_or(false, |s| s.embedding_index_stale(c))
                     });
-                    let field = |label: i18n::Key, state: &gpui_kit::Entity<InputState>| {
-                        row(
-                            t(label).into(),
-                            gpui_kit::div()
-                                .w(theme::ui(220.))
-                                .child(Input::new(state).appearance(true).bordered(true))
-                                .into_any_element(),
-                        )
-                    };
+                    // Label + "?" hint icon (hover tooltip carries the long
+                    // business copy; the row label stays short).
+                    let field =
+                        |id: &'static str,
+                         label: i18n::Key,
+                         tip: i18n::Key,
+                         state: &gpui_kit::Entity<InputState>| {
+                            gpui_kit::base::h_flex()
+                                .justify_between()
+                                .gap_3()
+                                .py_1()
+                                .child(
+                                    gpui_kit::base::h_flex()
+                                        .gap_1()
+                                        .child(Label::new(t(label)).text_size(theme::ui(13.)))
+                                        .child(
+                                            Button::new(id)
+                                                .icon(AssetIcon::CircleQuestionMark)
+                                                .ghost()
+                                                .small()
+                                                .tooltip(t(tip)),
+                                        ),
+                                )
+                                .child(
+                                    gpui_kit::div()
+                                        .w(theme::ui(220.))
+                                        .child(Input::new(state).appearance(true).bordered(true)),
+                                )
+                        };
                     right = right
-                        .child(field(i18n::Key::EmbedBaseUrl, &embed_inputs.base))
-                        .child(field(i18n::Key::EmbedApiKey, &embed_inputs.key))
-                        .child(field(i18n::Key::EmbedModel, &embed_inputs.model))
-                        .child(field(i18n::Key::EmbedDim, &embed_inputs.dim))
+                        .child(field(
+                            "set-embed-tip-base",
+                            i18n::Key::EmbedBaseUrl,
+                            i18n::Key::EmbedBaseUrlTip,
+                            &embed_inputs.base,
+                        ))
+                        .child(field(
+                            "set-embed-tip-key",
+                            i18n::Key::EmbedApiKey,
+                            i18n::Key::EmbedApiKeyTip,
+                            &embed_inputs.key,
+                        ))
+                        .child(field(
+                            "set-embed-tip-model",
+                            i18n::Key::EmbedModel,
+                            i18n::Key::EmbedModelTip,
+                            &embed_inputs.model,
+                        ))
+                        .child(field(
+                            "set-embed-tip-dim",
+                            i18n::Key::EmbedDim,
+                            i18n::Key::EmbedDimTip,
+                            &embed_inputs.dim,
+                        ))
                         .child(
                             gpui_kit::base::h_flex()
                                 .gap_2()
@@ -5219,6 +5264,7 @@ impl AppShell {
                                     t(i18n::Key::RebuildIndex).to_owned()
                                 })
                                 .outline()
+                                .tooltip(t(i18n::Key::EmbedRebuildTip))
                                 .disabled(sh.index_busy || cfg_now.is_none())
                                 .on_click({
                                     let shell = shell_c.clone();
