@@ -13,9 +13,27 @@ leanote-reader = { path = "../leanote-reader" }
 gpui-base = { version = "0.7.3" }
 leanote-fakeserver = { path = "../../fake-server" }
 gpui-kit = { version = "0.7.3", features = [
-  # Issue 21: kit's full language aggregate (34 grammars) instead of a
-  # hand-picked subset.
-  "tree-sitter-languages",
+  # Syntax-highlight subset (was: issue 21's full 35-grammar aggregate).
+  # Trimmed 2026-11-24 for release size (~10 MB); fences outside this list
+  # render as plain code blocks. Note: cypher/json grammars never existed
+  # in the kit, so nothing regressed there.
+  "tree-sitter-markdown",
+  "tree-sitter-rust",
+  "tree-sitter-javascript",
+  "tree-sitter-typescript",
+  "tree-sitter-tsx",
+  "tree-sitter-python",
+  "tree-sitter-bash",
+  "tree-sitter-c",
+  "tree-sitter-cpp",
+  "tree-sitter-go",
+  "tree-sitter-java",
+  "tree-sitter-css",
+  "tree-sitter-html",
+  "tree-sitter-yaml",
+  "tree-sitter-toml",
+  "tree-sitter-sql",
+  "tree-sitter-diff",
 ] }
 
 anyhow = "1"

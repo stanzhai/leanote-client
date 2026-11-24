@@ -1,6 +1,10 @@
 # 更新日志 / Changelog
 
 
+## Unreleased
+
+- **release 包体精简（零功能损失）**：`Leanote` 二进制 170.3 → 83.8 MB（−51%），DMG 67.5 → 41.2 MB，`leanote-cli` 7.6 → 4.9 MB。两处改动：① 工作区 `[profile.release]` 补 `strip = true` + `lto = "fat"` + `codegen-units = 1`（实测 170 → 108 MB；`opt-level` 保持默认 3 不动渲染/typst 热路径，panic 保持 unwind——gpui/wgpu 的 abort 语义未验证）。② 编辑器语法从 issue 21 的 35 语法全量聚合裁到 17 种常用语言（markdown/rust/javascript/typescript/tsx/python/bash/c/cpp/go/java/css/html/yaml/toml/sql/diff），清单外 fence 回退纯代码块着色；cypher/json 语法 kit 本就没有，无回退。验证：`package-macos.sh` aarch64 全量构建 + 隔离数据目录（`LEANOTE_DATA` + `LEANOTE_INSTANCE_PORT`）启动冒烟 12s 存活、DB/prefs 初始化正常；6 平台 CI 同一 profile 生效。
+
 ## 3.1.18（2026-11-11）
 
 - **移动端：底部 Tab 栏改 iOS 26/27 悬浮玻璃胶囊（issue 20）**：全宽 sidebar 底色栏 → 脱离屏缘的圆角长条悬浮胶囊（`pb(safe_bottom+8)` 底隙 + 两侧 16px 留边 + `rounded_full` + 发丝描边 + 投影），浅色近实白磨砂 / 深色白色薄雾（`white@0.10`，iOS 深色玻璃比背景亮），选中 primary / 未选 muted 不变。gpui-pre 0.3.9 无 backdrop blur，磨砂为半透明近似（代码内 `ponytail:` 注释标了升级路径）。iOS / Android 模拟器截图 + 像素复核（深色胶囊 ≈42 vs 页面 19 与公式吻合）。

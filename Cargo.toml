@@ -38,3 +38,11 @@ wgpu-hal = { path = "vendor/wgpu-hal" }
 # native ES 3.0 GL uses the uint-texture instance transport, not just WebGL2.
 # Re-vendor on gpui-pre-wgpu upgrade. See ADR-0005.
 gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
+
+[profile.release]
+# Release size pass (2026-11-24): 170 MB → 108 MB measured on aarch64-darwin.
+# opt-level stays default 3 (renderer/typst are CPU-sensitive); panic stays
+# unwind (gpui/wgpu panic-recovery paths unverified for abort).
+strip = true
+lto = "fat"
+codegen-units = 1
