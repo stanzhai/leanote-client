@@ -13,7 +13,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		1A2EBE9A057E1F7CF12C7EDB /* Leanote.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Leanote.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		1A2EBE9A057E1F7CF12C7EDB /* Leanote.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Leanote.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		285A51859C07E3573B9D48C8 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		6E68EE812CE3D0ECFD83FC6B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		825109322C4212CCDF148B08 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
@@ -273,25 +273,36 @@
 				DEAD_CODE_STRIPPING = NO;
 				ENABLE_DEBUG_DYLIB = NO;
 				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Leanote;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
 				"LEANOTE_STATIC_LIB[sdk=iphoneos*]" = "$(PROJECT_DIR)/../../target/aarch64-apple-ios/debug/libleanote_mobile.a";
 				"LEANOTE_STATIC_LIB[sdk=iphonesimulator*]" = "$(PROJECT_DIR)/../../target/aarch64-apple-ios-sim/debug/libleanote_mobile.a";
+				MARKETING_VERSION = 3.1.17;
 				ONLY_ACTIVE_ARCH = YES;
 				OTHER_LDFLAGS = (
 					"-force_load",
 					"$(LEANOTE_STATIC_LIB)",
 					"-lc++",
-					"-framework UIKit",
-					"-framework Metal",
-					"-framework QuartzCore",
-					"-framework CoreGraphics",
-					"-framework CoreText",
-					"-framework CoreFoundation",
-					"-framework Foundation",
-					"-framework SystemConfiguration",
+					"-framework",
+					UIKit,
+					"-framework",
+					Metal,
+					"-framework",
+					QuartzCore,
+					"-framework",
+					CoreGraphics,
+					"-framework",
+					CoreText,
+					"-framework",
+					CoreFoundation,
+					"-framework",
+					Foundation,
+					"-framework",
+					SystemConfiguration,
 					"-ObjC",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = site.stanzhai.leanote.mobile;
@@ -313,25 +324,36 @@
 				DEAD_CODE_STRIPPING = NO;
 				ENABLE_DEBUG_DYLIB = NO;
 				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Leanote;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
 				"LEANOTE_STATIC_LIB[sdk=iphoneos*]" = "$(PROJECT_DIR)/../../target/aarch64-apple-ios/release/libleanote_mobile.a";
 				"LEANOTE_STATIC_LIB[sdk=iphonesimulator*]" = "$(PROJECT_DIR)/../../target/aarch64-apple-ios-sim/release/libleanote_mobile.a";
+				MARKETING_VERSION = 3.1.17;
 				ONLY_ACTIVE_ARCH = YES;
 				OTHER_LDFLAGS = (
 					"-force_load",
 					"$(LEANOTE_STATIC_LIB)",
 					"-lc++",
-					"-framework UIKit",
-					"-framework Metal",
-					"-framework QuartzCore",
-					"-framework CoreGraphics",
-					"-framework CoreText",
-					"-framework CoreFoundation",
-					"-framework Foundation",
-					"-framework SystemConfiguration",
+					"-framework",
+					UIKit,
+					"-framework",
+					Metal,
+					"-framework",
+					QuartzCore,
+					"-framework",
+					CoreGraphics,
+					"-framework",
+					CoreText,
+					"-framework",
+					CoreFoundation,
+					"-framework",
+					Foundation,
+					"-framework",
+					SystemConfiguration,
 					"-ObjC",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = site.stanzhai.leanote.mobile;
